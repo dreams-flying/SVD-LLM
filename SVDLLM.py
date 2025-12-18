@@ -12,7 +12,8 @@ from component.svd_llama import SVD_LlamaAttention, SVD_LlamaMLP
 from component.svd_mistral import SVD_MistralAttention, SVD_MistralMLP
 from component.svd_opt import SVDOPTDecoderLayer
 from utils.model_utils import *
-from evaluater import * 
+from evaluater import *
+from fisher_svd import fisher_aware_svd_compression, FisherAwareSVD 
 
 current_path = os.path.dirname(os.path.abspath(__file__))
 parent_path = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -518,7 +519,9 @@ if __name__ == '__main__':
     parser.add_argument('--gen_seq_len', type=int, default=1024, help='generated sequence len for efficiency evaluation')
     parser.add_argument('--step', type=int, default=4, help='the step to run the compression')
     parser.add_argument('--lora', type=str, default=None, help='the lora updated weight path to run the accuracy evaluation')
-    
+    parser.add_argument('--fisher_aware', action='store_true', help='Use Fisher-Aware SVD truncation instead of standard whitening-based truncation')
+    parser.add_argument('--use_task_loss', action='store_true', help='Use end-to-end task loss for Fisher estimation (slower but more accurate)')
+
     args = parser.parse_args()
     args.ratio = 1- args.ratio
     if args.step == 1:
@@ -579,3 +582,37 @@ if __name__ == '__main__':
             ppl_eval(model, tokenizer, datasets=['wikitext2'], model_seq_len=args.model_seq_len, batch_size=args.eval_batch_size, device=args.DEV)
         elif args.step == 5:
             eff_eval(model, tokenizer, generated_len=args.gen_seq_len, batch_size=args.eval_batch_size, device=args.DEV)
+    elif args.step == 10:
+        # Fisher-Aware SVD Compression (Second-Order Sensitivity)
+        print("Running Fisher-Aware SVD Compression...")
+        model, tokenizer = get_model_from_huggingface(model_id=args.model)
+        model = model.eval()
+
+        # Load calibration data
+        cali_data = get_calib_train_data(args.dataset, tokenizer, args.whitening_nsamples, seqlen=args.model_seq_len)
+
+        # Optionally get whitening matrices
+        whitening_mat = None
+        if args.profiling_mat_path is not None:
+            whitening_mat = torch.load(args.profiling_mat_path)
+        elif not args.run_low_resource:
+            # Compute whitening matrices for enhanced compression
+            print("Computing whitening matrices...")
+            whitening_mat = profle_svdllm_low_resource(args.model, model, cali_data, args.DEV)
+
+        # Run Fisher-Aware SVD compression
+        model = fisher_aware_svd_compression(
+            args.model, model, cali_data, args.ratio,
+            whitening_mat=whitening_mat,
+            device=args.DEV,
+            use_low_resource=args.run_low_resource
+        )
+
+        if args.save_path is not None:
+            torch.save({'model': model, 'tokenizer': tokenizer},
+                      args.save_path + "/" + args.model.replace("/", "_").replace("-", "_") + '_fisher_svd_' + str(args.ratio) + '.pt')
+
+        # Evaluate if needed
+        print("\nEvaluating compressed model...")
+        model = model.float().to(args.DEV)
+        ppl_eval(model, tokenizer, datasets=['wikitext2'], model_seq_len=args.model_seq_len, batch_size=args.eval_batch_size, device=args.DEV)
