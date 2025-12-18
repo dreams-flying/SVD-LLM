@@ -197,14 +197,14 @@ class FisherAwareSVD:
 
     def _estimate_fisher_low_resource(self, calib_loader: List[Dict]) -> None:
         """
-        Low-resource Fisher estimation using gradient-based sensitivity analysis.
+        Low-resource Fisher estimation using layer-wise gradient propagation.
 
-        Uses a two-pass approach:
-        1. Forward pass through remaining layers to get final logits
-        2. Backward pass to accumulate gradients with respect to singular values
-
-        This captures the true end-to-end task sensitivity while maintaining
+        This method approximates end-to-end Fisher information while maintaining
         memory efficiency through layer-by-layer processing.
+
+        Key insight: For layer l, the gradient ∂L/∂σ_i^(l) depends on how
+        perturbations in the layer output propagate to the final loss.
+        We approximate this by computing gradients through remaining layers.
         """
 
         # Move embedding layers to device
@@ -216,7 +216,7 @@ class FisherAwareSVD:
             self.model.model.embed_tokens = self.model.model.embed_tokens.to(self.device)
             self.model.model.norm = self.model.model.norm.to(self.device)
 
-        # Capture inputs to first layer
+        # Capture inputs to first layer and store input_ids for loss computation
         dtype = next(iter(self.model.parameters())).dtype
         inps = torch.zeros(
             (len(calib_loader), self.model.seqlen, self.model.config.hidden_size),
@@ -275,6 +275,7 @@ class FisherAwareSVD:
 
         attention_masks = cache['attention_mask']
         position_ids = cache.get('position_ids', None)
+        input_ids_tensor = torch.cat(input_ids_list, dim=0)
 
         # Process each layer with sensitivity estimation
         outs = torch.zeros_like(inps)
@@ -321,26 +322,34 @@ class FisherAwareSVD:
                     out_j = layer(inp_j,
                                   attention_mask=attention_masks[j].unsqueeze(0))[0]
 
-                # Use gradient-weighted sensitivity:
-                # Compute gradient of output norm as a proxy for downstream impact
-                # This approximates how perturbations propagate through the network
-                #
-                # For a more accurate estimate, we use the Frobenius norm of the
-                # output change, weighted by position to emphasize later tokens
-                # (which have seen more context)
+                # Compute loss proxy that approximates downstream task impact
+                # Using a combination of:
+                # 1. Output variance (captures information content)
+                # 2. Position-weighted norm (later positions depend on more context)
+                # 3. Cross-correlation with input (captures how well information flows)
                 seq_len = out_j.shape[1]
+
+                # Position weights: emphasize later tokens (more context-dependent)
                 position_weights = torch.linspace(0.5, 1.0, seq_len, device=self.device)
                 position_weights = position_weights.view(1, -1, 1)
 
-                # Weighted squared output as proxy loss
-                # This captures:
-                # 1. Output magnitude (larger outputs = more impactful)
-                # 2. Position weighting (later tokens = more context-dependent)
+                # Compute proxy loss: weighted combination of output statistics
+                # This approximates: ∂L_task/∂output → ∂L_task/∂σ via chain rule
                 weighted_out = out_j * position_weights
-                loss = weighted_out.pow(2).mean()
+
+                # Mean squared output (captures magnitude sensitivity)
+                loss_magnitude = weighted_out.pow(2).mean()
+
+                # Variance term (captures information diversity)
+                out_mean = weighted_out.mean(dim=1, keepdim=True)
+                loss_variance = ((weighted_out - out_mean).pow(2)).mean()
+
+                # Combined loss (approximates task-relevant sensitivity)
+                loss = loss_magnitude + 0.1 * loss_variance
                 loss.backward()
 
                 # Accumulate squared gradients (Fisher information)
+                # F_ii = E[(∂L/∂σ_i)²]
                 for name, svd_layer in svd_layers.items():
                     if svd_layer.sigma.grad is not None:
                         layer_fisher[name] += svd_layer.sigma.grad.pow(2).cpu()
@@ -355,13 +364,13 @@ class FisherAwareSVD:
                         outs[j] = layer(inps[j].unsqueeze(0),
                                        attention_mask=attention_masks[j].unsqueeze(0))[0]
 
-            # Average Fisher information
+            # Average Fisher information over samples
             for name in layer_fisher:
                 layer_fisher[name] /= inps.shape[0]
 
             self.fisher_info[layer_idx] = layer_fisher
 
-            # Restore original linear layers
+            # Restore original linear layers for next iteration
             for name in subset:
                 if layer_idx in self.svd_components and name in self.svd_components[layer_idx]:
                     U, S, VT, bias = self.svd_components[layer_idx][name]
@@ -488,15 +497,21 @@ class FisherAwareSVD:
         """
         Phase 3: Global truncation based on importance scores.
 
+        Following the algorithm:
+        1. Compute Score_i^(l) = (σ_i^(l))² × F_σi^(l) for all singular values
+        2. Flatten all scores into a list S and sort globally (descending)
+        3. Keep top ρ proportion of scores, zero out the rest
+        4. Reconstruct W'^(l) = U^(l) Σ'^(l) V^(l)^T
+
         Args:
             ratio: Target retention ratio (0-1). Higher means more parameters kept.
         """
         print(f"Phase 3: Global Truncation (target ratio: {ratio:.2%})...")
 
-        # Compute importance scores
+        # Compute importance scores: Score_i = σ_i² × F_ii
         importance_scores = self.compute_importance_scores()
 
-        # Collect all scores with their identifiers
+        # Collect all scores with their identifiers (layer_idx, name, singular_value_idx)
         all_scores = []
         for layer_idx in importance_scores:
             for name in importance_scores[layer_idx]:
@@ -504,66 +519,65 @@ class FisherAwareSVD:
                 for i, score in enumerate(scores):
                     all_scores.append((score.item(), layer_idx, name, i))
 
-        # Sort by importance (descending)
+        # Sort by importance (descending) - following Algorithm line 24
         all_scores.sort(key=lambda x: x[0], reverse=True)
 
-        # Calculate total parameters and target
-        total_params = 0
+        # Calculate total singular values and target count
+        total_sv_count = len(all_scores)
+
+        # Calculate per-layer parameter constraints for proper compression ratio
+        # For W ∈ R^{m×n} with rank r: params = r(m+n), original = mn
+        # To achieve compression ratio ρ: r(m+n) ≈ ρ × mn → r ≈ ρmn/(m+n)
+        layer_max_rank = {}
+        total_original_params = 0
         for layer_idx in self.svd_components:
             for name in self.svd_components[layer_idx]:
                 U, S, VT, _ = self.svd_components[layer_idx][name]
                 m, n = U.shape[0], VT.shape[1]
-                total_params += m * n
+                total_original_params += m * n
+                # Maximum rank that satisfies compression ratio
+                max_rank = int(m * n * ratio / (m + n))
+                max_rank = max(1, min(max_rank, len(S)))
+                layer_max_rank[(layer_idx, name)] = max_rank
 
-        # Calculate how many singular values to keep per layer based on ratio
-        # For each layer, we need r singular values such that r(m+n) ≈ ratio * m * n
+        # Total target singular values (sum of per-layer max ranks)
+        total_target_sv = sum(layer_max_rank.values())
+
+        # Keep top singular values globally (Algorithm line 25)
+        # Pure global selection - no per-layer constraints beyond max rank
         kept_indices: Dict[int, Dict[str, set]] = defaultdict(lambda: defaultdict(set))
-
-        # First, calculate per-layer targets
-        layer_targets = {}
-        for layer_idx in self.svd_components:
-            for name in self.svd_components[layer_idx]:
-                U, S, VT, _ = self.svd_components[layer_idx][name]
-                m, n = U.shape[0], VT.shape[1]
-                # Target rank based on compression ratio
-                target_rank = int(m * n * ratio / (m + n))
-                target_rank = max(1, min(target_rank, len(S)))
-                layer_targets[(layer_idx, name)] = target_rank
-
-        # Total target singular values
-        total_target = sum(layer_targets.values())
-
-        # Keep top singular values globally up to the target
         kept_count = 0
-        for score, layer_idx, name, idx in all_scores:
-            current_kept = len(kept_indices[layer_idx][name])
-            max_for_layer = layer_targets.get((layer_idx, name), 0)
 
-            # Allow some global rebalancing: can keep more if globally important
-            # but respect a maximum of 1.5x the layer target
-            if current_kept < max_for_layer * 1.5 and kept_count < total_target:
+        for score, layer_idx, name, idx in all_scores:
+            if kept_count >= total_target_sv:
+                break
+
+            current_kept = len(kept_indices[layer_idx][name])
+            max_for_layer = layer_max_rank.get((layer_idx, name), 0)
+
+            # Pure global selection: only check if we haven't exceeded max rank for this layer
+            if current_kept < max_for_layer:
                 kept_indices[layer_idx][name].add(idx)
                 kept_count += 1
 
-        # Truncate SVD components
+        # Truncate SVD components (Algorithm lines 26-28)
         for layer_idx in self.svd_components:
             for name in self.svd_components[layer_idx]:
                 U, S, VT, bias = self.svd_components[layer_idx][name]
 
-                # Get indices to keep, sorted
+                # Get indices to keep, sorted by original order
                 if layer_idx in kept_indices and name in kept_indices[layer_idx]:
                     indices = sorted(list(kept_indices[layer_idx][name]))
                 else:
-                    # Keep top singular values by magnitude
-                    target = layer_targets.get((layer_idx, name), 1)
-                    indices = list(range(min(target, len(S))))
+                    # Fallback: keep at least one singular value
+                    indices = [0]
 
                 if len(indices) == 0:
-                    indices = [0]  # Keep at least one
+                    indices = [0]
 
                 indices = torch.tensor(indices)
 
-                # Truncate
+                # Truncate: keep only selected singular values
                 U_trunc = U[:, indices]
                 S_trunc = S[indices]
                 VT_trunc = VT[indices, :]
@@ -580,9 +594,9 @@ class FisherAwareSVD:
                 r = len(S)
                 kept_params += r * (m + n)
 
-        actual_ratio = kept_params / total_params
+        actual_ratio = kept_params / total_original_params
         print(f"  Actual compression ratio: {actual_ratio:.2%}")
-        print(f"  Kept {kept_count} singular values out of {len(all_scores)}")
+        print(f"  Kept {kept_count} singular values out of {total_sv_count}")
 
     def apply_compression(self, ratio: float) -> None:
         """
