@@ -51,12 +51,22 @@ class SVDParameterizedLinear(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # W = U @ diag(sigma) @ V^T
         # output = x @ W^T = x @ V @ diag(sigma) @ U^T
+
+        # Store original dtype for output
+        original_dtype = x.dtype
+
+        # Convert input to float32 for numerical stability and gradient computation
+        # sigma needs to be in float32 for gradient flow
+        x = x.float()
+
         out = torch.matmul(x, self.VT.T)  # x @ V
-        out = out * self.sigma  # element-wise multiply with sigma
+        out = out * self.sigma  # element-wise multiply with sigma (gradients flow through here)
         out = torch.matmul(out, self.U.T)  # @ U^T
         if self.bias is not None:
             out = out + self.bias
-        return out
+
+        # Convert back to original dtype
+        return out.to(original_dtype)
 
 
 class FisherAwareSVD:
