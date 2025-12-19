@@ -595,17 +595,26 @@ if __name__ == '__main__':
         whitening_mat = None
         if args.profiling_mat_path is not None:
             whitening_mat = torch.load(args.profiling_mat_path)
-        elif not args.run_low_resource:
+        else:
             # Compute whitening matrices for enhanced compression
             print("Computing whitening matrices...")
             whitening_mat = profle_svdllm_low_resource(args.model, model, cali_data, args.DEV)
+
+        # Determine whether to use low-resource mode
+        # Default: use low-resource (proxy loss) for memory efficiency
+        # Use --use_task_loss to enable full cross-entropy loss (requires more GPU memory)
+        use_low_resource = not args.use_task_loss
+        if use_low_resource:
+            print("Using low-resource mode (proxy loss). Add --use_task_loss for cross-entropy loss.")
+        else:
+            print("Using full mode (cross-entropy loss). This requires significant GPU memory.")
 
         # Run Fisher-Aware SVD compression
         model = fisher_aware_svd_compression(
             args.model, model, cali_data, args.ratio,
             whitening_mat=whitening_mat,
             device=args.DEV,
-            use_low_resource=args.run_low_resource
+            use_low_resource=use_low_resource
         )
 
         if args.save_path is not None:

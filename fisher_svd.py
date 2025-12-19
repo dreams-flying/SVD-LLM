@@ -397,22 +397,21 @@ class FisherAwareSVD:
         """
         Full Fisher estimation using end-to-end backpropagation with true task loss.
 
-        This method computes the exact Fisher information by:
-        1. Replacing all linear layers with SVD-parameterized versions
-        2. Running forward pass to compute cross-entropy loss
-        3. Backpropagating to get gradients w.r.t. all singular values
-        4. Accumulating squared gradients as Fisher information
-
-        This is the most accurate method but requires more GPU memory.
+        Memory-efficient implementation using gradient checkpointing.
         """
 
         print("  Using end-to-end task loss (cross-entropy) for Fisher estimation...")
+        print("  Note: Using gradient checkpointing to reduce memory usage...")
 
         # Replace all layers with SVD-parameterized versions
         self._replace_with_svd_layers()
 
         self.model = self.model.to(self.device)
-        self.model.train()  # Enable gradient computation
+        self.model.train()
+
+        # Enable gradient checkpointing to save memory
+        if hasattr(self.model, 'gradient_checkpointing_enable'):
+            self.model.gradient_checkpointing_enable()
 
         # Initialize Fisher accumulators
         for layer_idx in range(len(self.layers)):
@@ -434,33 +433,51 @@ class FisherAwareSVD:
             # Zero gradients
             self.model.zero_grad()
 
-            # Forward pass with cross-entropy loss
-            # Use labels = input_ids for language modeling
-            outputs = self.model(**batch, labels=batch['input_ids'])
-            loss = outputs.loss
-            total_loss += loss.item()
+            try:
+                # Forward pass with cross-entropy loss
+                outputs = self.model(**batch, labels=batch['input_ids'])
+                loss = outputs.loss
+                total_loss += loss.item()
 
-            # Backward pass
-            loss.backward()
+                # Backward pass
+                loss.backward()
 
-            # Accumulate squared gradients (Fisher information)
-            for layer_idx in range(len(self.layers)):
-                layer = self.layers[layer_idx]
-                subset = find_layers(layer)
-                for name in subset:
-                    if isinstance(subset[name], SVDParameterizedLinear):
-                        if subset[name].sigma.grad is not None:
-                            self.fisher_info[layer_idx][name] += subset[name].sigma.grad.pow(2).cpu()
+                # Accumulate squared gradients (Fisher information)
+                for layer_idx in range(len(self.layers)):
+                    layer = self.layers[layer_idx]
+                    subset = find_layers(layer)
+                    for name in subset:
+                        if isinstance(subset[name], SVDParameterizedLinear):
+                            if subset[name].sigma.grad is not None:
+                                self.fisher_info[layer_idx][name] += subset[name].sigma.grad.pow(2).cpu()
 
-            num_samples += 1
+                num_samples += 1
+
+            except RuntimeError as e:
+                if "out of memory" in str(e):
+                    print(f"  Warning: OOM at sample {num_samples}, skipping...")
+                    torch.cuda.empty_cache()
+                    continue
+                else:
+                    raise e
+
+            # Clear cache after each batch
+            torch.cuda.empty_cache()
 
         # Average Fisher information
-        for layer_idx in self.fisher_info:
-            for name in self.fisher_info[layer_idx]:
-                self.fisher_info[layer_idx][name] /= num_samples
+        if num_samples > 0:
+            for layer_idx in self.fisher_info:
+                for name in self.fisher_info[layer_idx]:
+                    self.fisher_info[layer_idx][name] /= num_samples
 
-        avg_loss = total_loss / num_samples
-        print(f"  Average calibration loss: {avg_loss:.4f}")
+            avg_loss = total_loss / num_samples
+            print(f"  Average calibration loss: {avg_loss:.4f}")
+        else:
+            print("  Warning: No samples processed. Please use --run_low_resource mode.")
+
+        # Disable gradient checkpointing
+        if hasattr(self.model, 'gradient_checkpointing_disable'):
+            self.model.gradient_checkpointing_disable()
 
         # Restore original model
         self._restore_original_layers()
