@@ -197,20 +197,20 @@ class FisherAwareSVD:
 
     def _estimate_fisher_low_resource(self, calib_loader: List[Dict]) -> None:
         """
-        Low-resource Fisher estimation using true cross-entropy loss.
+        Low-resource Fisher estimation using proxy loss.
 
-        This method computes Fisher information by:
-        1. For each layer l, replace with SVD-parameterized version
-        2. Forward through remaining layers to get logits
-        3. Compute cross-entropy loss and backpropagate
-        4. Accumulate squared gradients as Fisher information
+        This method approximates Fisher information using a proxy loss based on
+        output statistics, which is more memory-efficient than full cross-entropy.
 
-        Memory efficient: processes one layer at a time while still using true task loss.
+        The proxy loss captures:
+        1. Output magnitude (sensitivity to perturbations)
+        2. Output variance (information diversity)
+        3. Position weighting (later tokens are more context-dependent)
         """
 
-        print("  Using layer-wise estimation with cross-entropy loss...")
+        print("  Using layer-wise estimation with proxy loss...")
 
-        # Move all components to device for end-to-end forward pass
+        # Move embedding layers to device
         if "opt" in self.model_name:
             self.model.model.decoder.embed_tokens = self.model.model.decoder.embed_tokens.to(self.device)
             self.model.model.decoder.final_layer_norm = self.model.model.decoder.final_layer_norm.to(self.device)
@@ -219,17 +219,12 @@ class FisherAwareSVD:
             self.model.model.embed_tokens = self.model.model.embed_tokens.to(self.device)
             self.model.model.norm = self.model.model.norm.to(self.device)
 
-        # Also need lm_head for loss computation
-        if hasattr(self.model, 'lm_head'):
-            self.model.lm_head = self.model.lm_head.to(self.device)
-
-        # Capture inputs to first layer and store input_ids for loss computation
+        # Capture inputs to first layer
         dtype = next(iter(self.model.parameters())).dtype
         inps = torch.zeros(
             (len(calib_loader), self.model.seqlen, self.model.config.hidden_size),
             dtype=dtype, device=self.device
         )
-        input_ids_list = []
         cache = {'i': 0, 'attention_mask': None, 'position_ids': None}
 
         class Catcher(nn.Module):
@@ -261,7 +256,6 @@ class FisherAwareSVD:
         for batch in calib_loader:
             try:
                 batch = {k: v.to(self.device) for k, v in batch.items()}
-                input_ids_list.append(batch['input_ids'].cpu())
                 self.model(**batch)
             except ValueError:
                 pass
@@ -278,19 +272,13 @@ class FisherAwareSVD:
             self.model.model.embed_tokens = self.model.model.embed_tokens.cpu()
             self.model.model.norm = self.model.model.norm.cpu()
 
-        if hasattr(self.model, 'lm_head'):
-            self.model.lm_head = self.model.lm_head.cpu()
-
         torch.cuda.empty_cache()
 
         attention_masks = cache['attention_mask']
         position_ids = cache.get('position_ids', None)
-        input_ids_tensor = torch.cat(input_ids_list, dim=0)
 
         # Process each layer with sensitivity estimation
         outs = torch.zeros_like(inps)
-        total_loss = 0.0
-        num_forward = 0
 
         for layer_idx in tqdm(range(len(self.layers))):
             layer = self.layers[layer_idx].to(self.device)
@@ -317,71 +305,42 @@ class FisherAwareSVD:
                     svd_layers[name] = svd_layer
                     self._set_module_by_name(layer, name, svd_layer)
 
-            # Move remaining layers and lm_head to device for forward pass
-            remaining_layers_on_device = []
-            for k in range(layer_idx + 1, len(self.layers)):
-                self.layers[k] = self.layers[k].to(self.device)
-                remaining_layers_on_device.append(k)
-
-            if "opt" in self.model_name:
-                self.model.model.decoder.final_layer_norm = self.model.model.decoder.final_layer_norm.to(self.device)
-            else:
-                self.model.model.norm = self.model.model.norm.to(self.device)
-
-            if hasattr(self.model, 'lm_head'):
-                self.model.lm_head = self.model.lm_head.to(self.device)
-
-            # Process each sample
+            # Process each sample to accumulate Fisher information
             for j in range(inps.shape[0]):
                 # Zero gradients
                 for svd_layer in svd_layers.values():
                     if svd_layer.sigma.grad is not None:
                         svd_layer.sigma.grad.zero_()
 
-                # Forward pass through current layer
-                inp_j = inps[j].unsqueeze(0).clone()
+                # Forward pass through this layer
+                inp_j = inps[j].unsqueeze(0).clone().requires_grad_(True)
                 if position_ids is not None and "opt" not in self.model_name:
-                    hidden = layer(inp_j,
-                                   attention_mask=attention_masks[j].unsqueeze(0),
-                                   position_ids=position_ids[j].unsqueeze(0))[0]
+                    out_j = layer(inp_j,
+                                  attention_mask=attention_masks[j].unsqueeze(0),
+                                  position_ids=position_ids[j].unsqueeze(0))[0]
                 else:
-                    hidden = layer(inp_j,
-                                   attention_mask=attention_masks[j].unsqueeze(0))[0]
+                    out_j = layer(inp_j,
+                                  attention_mask=attention_masks[j].unsqueeze(0))[0]
 
-                # Forward through remaining layers
-                for k in range(layer_idx + 1, len(self.layers)):
-                    if position_ids is not None and "opt" not in self.model_name:
-                        hidden = self.layers[k](hidden,
-                                                attention_mask=attention_masks[j].unsqueeze(0),
-                                                position_ids=position_ids[j].unsqueeze(0))[0]
-                    else:
-                        hidden = self.layers[k](hidden,
-                                                attention_mask=attention_masks[j].unsqueeze(0))[0]
+                # Compute proxy loss that approximates downstream task impact
+                seq_len = out_j.shape[1]
 
-                # Apply final layer norm
-                if "opt" in self.model_name:
-                    hidden = self.model.model.decoder.final_layer_norm(hidden)
-                else:
-                    hidden = self.model.model.norm(hidden)
+                # Position weights: emphasize later tokens (more context-dependent)
+                position_weights = torch.linspace(0.5, 1.0, seq_len, device=self.device)
+                position_weights = position_weights.view(1, -1, 1)
 
-                # Compute logits and cross-entropy loss
-                if hasattr(self.model, 'lm_head'):
-                    logits = self.model.lm_head(hidden)
-                else:
-                    logits = hidden
+                # Weighted output
+                weighted_out = out_j * position_weights
 
-                # Compute cross-entropy loss (Algorithm: L ← CrossEntropy(M(x)))
-                labels = input_ids_tensor[j].unsqueeze(0).to(self.device)
-                shift_logits = logits[..., :-1, :].contiguous()
-                shift_labels = labels[..., 1:].contiguous()
+                # Mean squared output (captures magnitude sensitivity)
+                loss_magnitude = weighted_out.pow(2).mean()
 
-                loss_fct = nn.CrossEntropyLoss()
-                loss = loss_fct(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
+                # Variance term (captures information diversity)
+                out_mean = weighted_out.mean(dim=1, keepdim=True)
+                loss_variance = ((weighted_out - out_mean).pow(2)).mean()
 
-                total_loss += loss.item()
-                num_forward += 1
-
-                # Backward pass to get gradients w.r.t. sigma
+                # Combined proxy loss
+                loss = loss_magnitude + 0.1 * loss_variance
                 loss.backward()
 
                 # Accumulate squared gradients (Fisher information)
@@ -406,18 +365,6 @@ class FisherAwareSVD:
 
             self.fisher_info[layer_idx] = layer_fisher
 
-            # Move remaining layers back to CPU
-            for k in remaining_layers_on_device:
-                self.layers[k] = self.layers[k].cpu()
-
-            if "opt" in self.model_name:
-                self.model.model.decoder.final_layer_norm = self.model.model.decoder.final_layer_norm.cpu()
-            else:
-                self.model.model.norm = self.model.model.norm.cpu()
-
-            if hasattr(self.model, 'lm_head'):
-                self.model.lm_head = self.model.lm_head.cpu()
-
             # Restore original linear layers for next iteration
             for name in subset:
                 if layer_idx in self.svd_components and name in self.svd_components[layer_idx]:
@@ -434,8 +381,6 @@ class FisherAwareSVD:
             inps = outs.clone()
             torch.cuda.empty_cache()
 
-        avg_loss = total_loss / num_forward if num_forward > 0 else 0
-        print(f"  Average cross-entropy loss: {avg_loss:.4f}")
         print(f"  Estimated Fisher information for {len(self.layers)} layers")
 
     def _estimate_fisher_full(self, calib_loader: List[Dict]) -> None:
