@@ -689,6 +689,8 @@ class FisherAwareSVD:
             Dictionary of importance scores per layer and sublayer
         """
         importance_scores = {}
+        fisher_used = 0
+        fisher_fallback = 0
 
         for layer_idx in self.svd_components:
             layer_scores = {}
@@ -699,13 +701,16 @@ class FisherAwareSVD:
                     F = self.fisher_info[layer_idx][name]
                     # Score_i = σ_i² × F_ii
                     scores = S.pow(2) * F
+                    fisher_used += 1
                 else:
                     # Fallback to magnitude-based scoring
                     scores = S.pow(2)
+                    fisher_fallback += 1
 
                 layer_scores[name] = scores
             importance_scores[layer_idx] = layer_scores
 
+        print(f"  Importance scores: {fisher_used} with Fisher, {fisher_fallback} fallback to magnitude")
         return importance_scores
 
     def phase3_global_truncation(self, ratio: float) -> None:
@@ -776,9 +781,11 @@ class FisherAwareSVD:
                 kept_count += 1
 
         # Truncate SVD components (Algorithm lines 26-28)
+        truncation_samples = []  # For debug output
         for layer_idx in self.svd_components:
             for name in self.svd_components[layer_idx]:
                 U, S, VT, bias = self.svd_components[layer_idx][name]
+                original_rank = len(S)
 
                 # Get indices to keep, sorted by original order
                 if layer_idx in kept_indices and name in kept_indices[layer_idx]:
@@ -791,6 +798,11 @@ class FisherAwareSVD:
                     indices = [0]
 
                 indices = torch.tensor(indices)
+                new_rank = len(indices)
+
+                # Store sample for debug
+                if len(truncation_samples) < 3:
+                    truncation_samples.append(f"Layer {layer_idx} {name}: {original_rank} -> {new_rank}")
 
                 # Truncate: keep only selected singular values
                 U_trunc = U[:, indices]
@@ -798,6 +810,11 @@ class FisherAwareSVD:
                 VT_trunc = VT[indices, :]
 
                 self.svd_components[layer_idx][name] = (U_trunc, S_trunc, VT_trunc, bias)
+
+        # Print truncation samples
+        print("  Truncation examples:")
+        for sample in truncation_samples:
+            print(f"    {sample}")
 
         # Calculate actual compression ratio achieved
         kept_params = 0
@@ -827,12 +844,25 @@ class FisherAwareSVD:
 
         # First, compute actual ranks for each layer to determine per-layer ratios
         layer_ranks = {}
+        total_original_params = 0
+        total_compressed_params = 0
+
         for layer_idx in self.svd_components:
             layer_ranks[layer_idx] = {}
             for name in self.svd_components[layer_idx]:
                 U, S, VT, bias = self.svd_components[layer_idx][name]
-                layer_ranks[layer_idx][name] = len(S)
+                actual_rank = len(S)
+                layer_ranks[layer_idx][name] = actual_rank
+                m, n = U.shape[0], VT.shape[1]
+                total_original_params += m * n
+                total_compressed_params += actual_rank * (m + n)
 
+        # Print compression summary
+        print(f"  Original params: {total_original_params:,}")
+        print(f"  Compressed params: {total_compressed_params:,}")
+        print(f"  Compression ratio: {total_compressed_params / total_original_params:.2%}")
+
+        replaced_count = 0
         for layer_idx in tqdm(range(len(self.layers))):
             layer = self.layers[layer_idx]
             subset = find_layers(layer)
@@ -849,9 +879,14 @@ class FisherAwareSVD:
 
                 U, S, VT, bias = self.svd_components[layer_idx][name]
                 actual_rank = len(S)
+                original_rank = min(U.shape[0], VT.shape[1])
 
                 if actual_rank == 0:
                     continue
+
+                # Debug: print first layer's compression
+                if layer_idx == 0 and replaced_count < 2:
+                    print(f"  Layer {layer_idx} {name}: rank {original_rank} -> {actual_rank}")
 
                 # Compute U' = U @ sqrt(Sigma) and V' = sqrt(Sigma) @ VT
                 sqrt_sigma = torch.sqrt(S)
@@ -872,10 +907,11 @@ class FisherAwareSVD:
 
                 # Replace in model using a wrapper or direct replacement
                 self._replace_linear_with_svd(layer, name, u_proj, v_proj, layer_idx)
+                replaced_count += 1
 
             torch.cuda.empty_cache()
 
-        print("  Compression applied successfully")
+        print(f"  Replaced {replaced_count} linear layers with SVD factorization")
 
     def _replace_linear_with_svd(self, layer, name: str, u_proj: nn.Linear,
                                   v_proj: nn.Linear, layer_idx: int) -> None:
