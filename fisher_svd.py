@@ -152,9 +152,14 @@ class FisherAwareSVD:
 
     def _replace_with_svd_layers(self) -> None:
         """Replace original linear layers with SVD-parameterized layers."""
+        # Store references to SVD layers for later access
+        self.svd_layer_refs = {}
+
         for layer_idx in range(len(self.layers)):
             layer = self.layers[layer_idx]
             subset = find_layers(layer)
+
+            self.svd_layer_refs[layer_idx] = {}
 
             for name, module in subset.items():
                 if layer_idx in self.svd_components and name in self.svd_components[layer_idx]:
@@ -166,6 +171,9 @@ class FisherAwareSVD:
                         bias.to(self.device) if bias is not None else None
                     )
 
+                    # Store reference for Fisher estimation
+                    self.svd_layer_refs[layer_idx][name] = svd_layer
+
                     # Replace the layer
                     self._set_module_by_name(layer, name, svd_layer)
 
@@ -173,9 +181,12 @@ class FisherAwareSVD:
         """Restore original linear layers from SVD components."""
         for layer_idx in range(len(self.layers)):
             layer = self.layers[layer_idx]
-            subset = find_layers(layer)
 
-            for name in subset.keys():
+            # Use stored references instead of find_layers
+            if layer_idx not in self.svd_layer_refs:
+                continue
+
+            for name in self.svd_layer_refs[layer_idx].keys():
                 if layer_idx in self.svd_components and name in self.svd_components[layer_idx]:
                     U, S, VT, bias = self.svd_components[layer_idx][name]
                     # Reconstruct W = U @ diag(S) @ VT
@@ -427,14 +438,11 @@ class FisherAwareSVD:
             self.model.gradient_checkpointing_enable()
             print("  Gradient checkpointing enabled")
 
-        # Initialize Fisher accumulators
-        for layer_idx in range(len(self.layers)):
-            layer = self.layers[layer_idx]
-            subset = find_layers(layer)
+        # Initialize Fisher accumulators using stored SVD layer references
+        for layer_idx in self.svd_layer_refs:
             layer_fisher = {}
-            for name in subset:
-                if isinstance(subset[name], SVDParameterizedLinear):
-                    layer_fisher[name] = torch.zeros_like(subset[name].sigma.data, device='cpu')
+            for name, svd_layer in self.svd_layer_refs[layer_idx].items():
+                layer_fisher[name] = torch.zeros_like(svd_layer.sigma.data, device='cpu')
             self.fisher_info[layer_idx] = layer_fisher
 
         # Accumulate Fisher information
@@ -459,13 +467,11 @@ class FisherAwareSVD:
                 loss.backward()
 
                 # Accumulate squared gradients (Fisher information)
-                for layer_idx in range(len(self.layers)):
-                    layer = self.layers[layer_idx]
-                    subset = find_layers(layer)
-                    for name in subset:
-                        if isinstance(subset[name], SVDParameterizedLinear):
-                            if subset[name].sigma.grad is not None:
-                                self.fisher_info[layer_idx][name] += subset[name].sigma.grad.pow(2).cpu()
+                # Use stored SVD layer references instead of find_layers
+                for layer_idx in self.svd_layer_refs:
+                    for name, svd_layer in self.svd_layer_refs[layer_idx].items():
+                        if svd_layer.sigma.grad is not None:
+                            self.fisher_info[layer_idx][name] += svd_layer.sigma.grad.pow(2).cpu()
 
                 num_samples += 1
 
