@@ -794,106 +794,96 @@ class FisherAwareSVD:
         """
         Apply compression to the model by replacing layers with SVD-factorized versions.
 
+        Note: Since global truncation produces different ranks per layer/projection,
+        we need to create SVD modules with the actual truncated ranks, not a uniform ratio.
+
         Args:
-            ratio: Compression ratio (0-1)
+            ratio: Compression ratio (0-1) - used only for module creation reference
         """
         print("Applying compression to model...")
+
+        # First, compute actual ranks for each layer to determine per-layer ratios
+        layer_ranks = {}
+        for layer_idx in self.svd_components:
+            layer_ranks[layer_idx] = {}
+            for name in self.svd_components[layer_idx]:
+                U, S, VT, bias = self.svd_components[layer_idx][name]
+                layer_ranks[layer_idx][name] = len(S)
 
         for layer_idx in tqdm(range(len(self.layers))):
             layer = self.layers[layer_idx]
             subset = find_layers(layer)
 
-            # Create SVD-based replacement modules
-            if "llama" in self.model_name or "vicuna" in self.model_name:
-                svd_attn = SVD_LlamaAttention(config=self.model.config, ratio=ratio)
-                svd_mlp = SVD_LlamaMLP(
-                    hidden_size=layer.hidden_size,
-                    intermediate_size=self.model.config.intermediate_size,
-                    hidden_act=self.model.config.hidden_act,
-                    ratio=ratio
-                )
-            elif "mistral" in self.model_name:
-                svd_attn = SVD_MistralAttention(config=self.model.config, ratio=ratio)
-                svd_mlp = SVD_MistralMLP(config=self.model.config, ratio=ratio)
-            elif 'opt' in self.model_name:
-                svd_decoder = SVDOPTDecoderLayer(self.model.config, ratio=ratio)
+            if layer_idx not in self.svd_components:
+                continue
 
             dtype = next(iter(self.model.parameters())).dtype
 
+            # For each linear layer, create properly sized SVD factorization
             for name in subset:
-                if layer_idx not in self.svd_components or name not in self.svd_components[layer_idx]:
+                if name not in self.svd_components[layer_idx]:
                     continue
 
                 U, S, VT, bias = self.svd_components[layer_idx][name]
+                actual_rank = len(S)
 
-                # Compute U' = U @ sqrt(Sigma) and V' = sqrt(Sigma) @ V
-                sqrt_sigma = torch.sqrt(torch.diag(S))
-                svd_u = torch.matmul(U, sqrt_sigma).to(dtype)
-                svd_v = torch.matmul(sqrt_sigma, VT).to(dtype)
+                if actual_rank == 0:
+                    continue
 
-                # Assign to appropriate module
-                if 'opt' in self.model_name:
-                    if "q_proj" in name:
-                        svd_decoder.self_attn.q_u_proj.weight.data = svd_u
-                        svd_decoder.self_attn.q_v_proj.weight.data = svd_v
-                        if bias is not None:
-                            svd_decoder.self_attn.q_u_proj.bias.data = bias.to(dtype)
-                    elif "k_proj" in name:
-                        svd_decoder.self_attn.k_u_proj.weight.data = svd_u
-                        svd_decoder.self_attn.k_v_proj.weight.data = svd_v
-                        if bias is not None:
-                            svd_decoder.self_attn.k_u_proj.bias.data = bias.to(dtype)
-                    elif "v_proj" in name:
-                        svd_decoder.self_attn.v_u_proj.weight.data = svd_u
-                        svd_decoder.self_attn.v_v_proj.weight.data = svd_v
-                        if bias is not None:
-                            svd_decoder.self_attn.v_u_proj.bias.data = bias.to(dtype)
-                    elif "out_proj" in name:
-                        svd_decoder.self_attn.out_u_proj.weight.data = svd_u
-                        svd_decoder.self_attn.out_v_proj.weight.data = svd_v
-                        if bias is not None:
-                            svd_decoder.self_attn.out_u_proj.bias.data = bias.to(dtype)
-                    elif "fc1" in name:
-                        svd_decoder.fc1_u_proj.weight.data = svd_u
-                        svd_decoder.fc1_v_proj.weight.data = svd_v
-                        if bias is not None:
-                            svd_decoder.fc1_u_proj.bias.data = bias.to(dtype)
-                    elif "fc2" in name:
-                        svd_decoder.fc2_u_proj.weight.data = svd_u
-                        svd_decoder.fc2_v_proj.weight.data = svd_v
-                        if bias is not None:
-                            svd_decoder.fc2_u_proj.bias.data = bias.to(dtype)
-                        svd_decoder.self_attn_layer_norm = layer.self_attn_layer_norm
-                        svd_decoder.final_layer_norm = layer.final_layer_norm
-                        self.layers[layer_idx] = svd_decoder
-                else:
-                    if "q_proj" in name:
-                        svd_attn.q_u_proj.weight.data = svd_u
-                        svd_attn.q_v_proj.weight.data = svd_v
-                    elif "k_proj" in name:
-                        svd_attn.k_u_proj.weight.data = svd_u
-                        svd_attn.k_v_proj.weight.data = svd_v
-                    elif "v_proj" in name:
-                        svd_attn.v_u_proj.weight.data = svd_u
-                        svd_attn.v_v_proj.weight.data = svd_v
-                    elif "o_proj" in name:
-                        svd_attn.o_u_proj.weight.data = svd_u
-                        svd_attn.o_v_proj.weight.data = svd_v
-                        layer.self_attn = svd_attn
-                    elif "gate_proj" in name:
-                        svd_mlp.gate_u_proj.weight.data = svd_u
-                        svd_mlp.gate_v_proj.weight.data = svd_v
-                    elif "down_proj" in name:
-                        svd_mlp.down_u_proj.weight.data = svd_u
-                        svd_mlp.down_v_proj.weight.data = svd_v
-                    elif "up_proj" in name:
-                        svd_mlp.up_u_proj.weight.data = svd_u
-                        svd_mlp.up_v_proj.weight.data = svd_v
-                        layer.mlp = svd_mlp
+                # Compute U' = U @ sqrt(Sigma) and V' = sqrt(Sigma) @ VT
+                sqrt_sigma = torch.sqrt(S)
+                # U' shape: (out_features, rank), V' shape: (rank, in_features)
+                svd_u = (U * sqrt_sigma).to(dtype)  # Broadcasting: U * sqrt_sigma
+                svd_v = (sqrt_sigma.unsqueeze(1) * VT).to(dtype)  # sqrt_sigma @ VT
+
+                out_features, in_features = U.shape[0], VT.shape[1]
+
+                # Create new linear layers with correct sizes
+                u_proj = nn.Linear(actual_rank, out_features, bias=(bias is not None))
+                v_proj = nn.Linear(in_features, actual_rank, bias=False)
+
+                u_proj.weight.data = svd_u
+                v_proj.weight.data = svd_v
+                if bias is not None:
+                    u_proj.bias.data = bias.to(dtype)
+
+                # Replace in model using a wrapper or direct replacement
+                self._replace_linear_with_svd(layer, name, u_proj, v_proj, layer_idx)
 
             torch.cuda.empty_cache()
 
         print("  Compression applied successfully")
+
+    def _replace_linear_with_svd(self, layer, name: str, u_proj: nn.Linear,
+                                  v_proj: nn.Linear, layer_idx: int) -> None:
+        """
+        Replace a linear layer with SVD factorization (V @ U).
+
+        Args:
+            layer: The transformer layer
+            name: Name of the linear layer (e.g., "self_attn.q_proj")
+            u_proj: The U projection (rank -> out_features)
+            v_proj: The V projection (in_features -> rank)
+            layer_idx: Layer index for model-specific handling
+        """
+        # Create a simple SVD wrapper module
+        class SVDLinear(nn.Module):
+            def __init__(self, v_proj, u_proj):
+                super().__init__()
+                self.v_proj = v_proj
+                self.u_proj = u_proj
+
+            def forward(self, x):
+                return self.u_proj(self.v_proj(x))
+
+        svd_linear = SVDLinear(v_proj, u_proj)
+
+        # Navigate to the correct location and replace
+        parts = name.split('.')
+        module = layer
+        for part in parts[:-1]:
+            module = getattr(module, part)
+        setattr(module, parts[-1], svd_linear)
 
     def compress(self, calib_loader: List[Dict], ratio: float,
                  whitening_mat: Optional[Dict] = None,
