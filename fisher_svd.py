@@ -209,13 +209,13 @@ class FisherAwareSVD:
         """
         Low-resource Fisher estimation using proxy loss.
 
-        This method approximates Fisher information using a proxy loss based on
-        output statistics, which is more memory-efficient than full cross-entropy.
+        Memory-efficient approach using layer-local proxy loss that approximates
+        the sensitivity of each singular value to the overall task loss.
 
-        The proxy loss captures:
-        1. Output magnitude (sensitivity to perturbations)
-        2. Output variance (information diversity)
-        3. Position weighting (later tokens are more context-dependent)
+        Proxy loss = ||output - original_output||² + 0.1 * Var(output - original_output)
+
+        This captures how much each singular value affects the layer output,
+        which is proportional to its effect on the final task loss.
         """
 
         print("  Using layer-wise estimation with proxy loss...")
@@ -223,11 +223,9 @@ class FisherAwareSVD:
         # Move embedding layers to device
         if "opt" in self.model_name:
             self.model.model.decoder.embed_tokens = self.model.model.decoder.embed_tokens.to(self.device)
-            self.model.model.decoder.final_layer_norm = self.model.model.decoder.final_layer_norm.to(self.device)
             self.model.model.decoder.embed_positions = self.model.model.decoder.embed_positions.to(self.device)
         else:
             self.model.model.embed_tokens = self.model.model.embed_tokens.to(self.device)
-            self.model.model.norm = self.model.model.norm.to(self.device)
 
         # Capture inputs to first layer
         dtype = next(iter(self.model.parameters())).dtype
@@ -235,6 +233,7 @@ class FisherAwareSVD:
             (len(calib_loader), self.model.seqlen, self.model.config.hidden_size),
             dtype=dtype, device=self.device
         )
+        input_ids_list = []
         cache = {'i': 0, 'attention_mask': None, 'position_ids': None}
 
         class Catcher(nn.Module):
@@ -266,6 +265,7 @@ class FisherAwareSVD:
         for batch in calib_loader:
             try:
                 batch = {k: v.to(self.device) for k, v in batch.items()}
+                input_ids_list.append(batch['input_ids'].cpu())
                 self.model(**batch)
             except ValueError:
                 pass
@@ -276,23 +276,34 @@ class FisherAwareSVD:
         # Move embedding layers back to CPU
         if "opt" in self.model_name:
             self.model.model.decoder.embed_tokens = self.model.model.decoder.embed_tokens.cpu()
-            self.model.model.decoder.final_layer_norm = self.model.model.decoder.final_layer_norm.cpu()
             self.model.model.decoder.embed_positions = self.model.model.decoder.embed_positions.cpu()
         else:
             self.model.model.embed_tokens = self.model.model.embed_tokens.cpu()
-            self.model.model.norm = self.model.model.norm.cpu()
 
         torch.cuda.empty_cache()
 
         attention_masks = cache['attention_mask']
         position_ids = cache.get('position_ids', None)
 
-        # Process each layer with sensitivity estimation
+        # Process each layer with sensitivity estimation using proxy loss
         outs = torch.zeros_like(inps)
 
         for layer_idx in tqdm(range(len(self.layers))):
             layer = self.layers[layer_idx].to(self.device)
             subset = find_layers(layer)
+
+            # First, compute original outputs (without SVD parameterization)
+            original_outs = torch.zeros_like(inps)
+            with torch.no_grad():
+                for j in range(inps.shape[0]):
+                    inp_j = inps[j].unsqueeze(0)
+                    if position_ids is not None and "opt" not in self.model_name:
+                        original_outs[j] = layer(inp_j,
+                                                  attention_mask=attention_masks[j].unsqueeze(0),
+                                                  position_ids=position_ids[j].unsqueeze(0))[0]
+                    else:
+                        original_outs[j] = layer(inp_j,
+                                                  attention_mask=attention_masks[j].unsqueeze(0))[0]
 
             # Initialize Fisher accumulators for this layer
             layer_fisher = {}
@@ -315,15 +326,15 @@ class FisherAwareSVD:
                     svd_layers[name] = svd_layer
                     self._set_module_by_name(layer, name, svd_layer)
 
-            # Process each sample to accumulate Fisher information
+            # Process each sample with proxy loss
             for j in range(inps.shape[0]):
                 # Zero gradients
                 for svd_layer in svd_layers.values():
                     if svd_layer.sigma.grad is not None:
                         svd_layer.sigma.grad.zero_()
 
-                # Forward pass through this layer
-                inp_j = inps[j].unsqueeze(0).clone().requires_grad_(True)
+                # Forward pass through current layer (with grad)
+                inp_j = inps[j].unsqueeze(0)
                 if position_ids is not None and "opt" not in self.model_name:
                     out_j = layer(inp_j,
                                   attention_mask=attention_masks[j].unsqueeze(0),
@@ -332,44 +343,27 @@ class FisherAwareSVD:
                     out_j = layer(inp_j,
                                   attention_mask=attention_masks[j].unsqueeze(0))[0]
 
-                # Compute proxy loss that approximates downstream task impact
-                seq_len = out_j.shape[1]
-
-                # Position weights: emphasize later tokens (more context-dependent)
-                position_weights = torch.linspace(0.5, 1.0, seq_len, device=self.device)
-                position_weights = position_weights.view(1, -1, 1)
-
-                # Weighted output
-                weighted_out = out_j * position_weights
-
-                # Mean squared output (captures magnitude sensitivity)
-                loss_magnitude = weighted_out.pow(2).mean()
-
-                # Variance term (captures information diversity)
-                out_mean = weighted_out.mean(dim=1, keepdim=True)
-                loss_variance = ((weighted_out - out_mean).pow(2)).mean()
-
-                # Combined proxy loss
+                # Compute proxy loss: MSE between SVD output and original output
+                # Plus variance term to encourage stability
+                target = original_outs[j].unsqueeze(0).detach()
+                diff = out_j.float() - target.float()
+                loss_magnitude = (diff ** 2).mean()
+                loss_variance = diff.var()
                 loss = loss_magnitude + 0.1 * loss_variance
+
+                # Backward pass
                 loss.backward()
 
                 # Accumulate squared gradients (Fisher information)
-                # F_σ^(l) ← F_σ^(l) + (g_Σ^(l))²
                 for name, svd_layer in svd_layers.items():
                     if svd_layer.sigma.grad is not None:
                         layer_fisher[name] += svd_layer.sigma.grad.pow(2).cpu()
 
-                # Store output for next layer (without gradients)
+                # Store output for next layer
                 with torch.no_grad():
-                    if position_ids is not None and "opt" not in self.model_name:
-                        outs[j] = layer(inps[j].unsqueeze(0),
-                                        attention_mask=attention_masks[j].unsqueeze(0),
-                                        position_ids=position_ids[j].unsqueeze(0))[0]
-                    else:
-                        outs[j] = layer(inps[j].unsqueeze(0),
-                                        attention_mask=attention_masks[j].unsqueeze(0))[0]
+                    outs[j] = out_j.detach()
 
-            # Average Fisher information: F_σ^(l) ← F_σ^(l) / |D|
+            # Average Fisher information
             for name in layer_fisher:
                 layer_fisher[name] /= inps.shape[0]
 
