@@ -515,10 +515,14 @@ class FisherAwareSVD:
     def _distribute_model_across_gpus(self) -> None:
         """
         Distribute model layers across multiple GPUs for model parallelism.
+        Adds forward hooks to automatically move tensors between devices.
         """
         num_layers = len(self.layers)
         layers_per_gpu = num_layers // len(self.devices)
         extra_layers = num_layers % len(self.devices)
+
+        # Track which device each layer is on
+        self.layer_devices = {}
 
         # Move embedding layers to first GPU
         if "opt" in self.model_name:
@@ -527,15 +531,15 @@ class FisherAwareSVD:
         else:
             self.model.model.embed_tokens = self.model.model.embed_tokens.to(self.devices[0])
 
-        # Distribute transformer layers
+        # Distribute transformer layers and track devices
         layer_idx = 0
         for gpu_idx, device in enumerate(self.devices):
-            # Calculate number of layers for this GPU
             n_layers = layers_per_gpu + (1 if gpu_idx < extra_layers else 0)
 
             for _ in range(n_layers):
                 if layer_idx < num_layers:
                     self.layers[layer_idx] = self.layers[layer_idx].to(device)
+                    self.layer_devices[layer_idx] = device
                     layer_idx += 1
 
         # Move final norm and lm_head to last GPU
@@ -548,12 +552,91 @@ class FisherAwareSVD:
         if hasattr(self.model, 'lm_head'):
             self.model.lm_head = self.model.lm_head.to(last_device)
 
+        # Add forward pre-hooks to move hidden states to correct device
+        self.device_hooks = []
+
+        def make_hook(target_device):
+            def hook(module, args, kwargs):
+                # Move all tensor args to target device
+                new_args = []
+                for arg in args:
+                    if isinstance(arg, torch.Tensor):
+                        new_args.append(arg.to(target_device))
+                    else:
+                        new_args.append(arg)
+                # Move all tensor kwargs to target device
+                new_kwargs = {}
+                for k, v in kwargs.items():
+                    if isinstance(v, torch.Tensor):
+                        new_kwargs[k] = v.to(target_device)
+                    else:
+                        new_kwargs[k] = v
+                return tuple(new_args), new_kwargs
+            return hook
+
+        for idx in range(num_layers):
+            device = self.layer_devices[idx]
+            handle = self.layers[idx].register_forward_pre_hook(make_hook(device), with_kwargs=True)
+            self.device_hooks.append(handle)
+
+        # Add hook for final norm
+        def norm_hook(module, args, kwargs):
+            new_args = []
+            for arg in args:
+                if isinstance(arg, torch.Tensor):
+                    new_args.append(arg.to(last_device))
+                else:
+                    new_args.append(arg)
+            new_kwargs = {}
+            for k, v in kwargs.items():
+                if isinstance(v, torch.Tensor):
+                    new_kwargs[k] = v.to(last_device)
+                else:
+                    new_kwargs[k] = v
+            return tuple(new_args), new_kwargs
+
+        if "opt" in self.model_name:
+            handle = self.model.model.decoder.final_layer_norm.register_forward_pre_hook(norm_hook, with_kwargs=True)
+        else:
+            handle = self.model.model.norm.register_forward_pre_hook(norm_hook, with_kwargs=True)
+        self.device_hooks.append(handle)
+
+        # Add hook for lm_head
+        if hasattr(self.model, 'lm_head'):
+            def lm_head_hook(module, args, kwargs):
+                new_args = []
+                for arg in args:
+                    if isinstance(arg, torch.Tensor):
+                        new_args.append(arg.to(last_device))
+                    else:
+                        new_args.append(arg)
+                new_kwargs = {}
+                for k, v in kwargs.items():
+                    if isinstance(v, torch.Tensor):
+                        new_kwargs[k] = v.to(last_device)
+                    else:
+                        new_kwargs[k] = v
+                return tuple(new_args), new_kwargs
+            handle = self.model.lm_head.register_forward_pre_hook(lm_head_hook, with_kwargs=True)
+            self.device_hooks.append(handle)
+
         print(f"  Model distributed: {layers_per_gpu}-{layers_per_gpu + 1} layers per GPU")
+        print(f"  Added {len(self.device_hooks)} device transfer hooks")
+
+    def _remove_device_hooks(self) -> None:
+        """Remove all device transfer hooks."""
+        if hasattr(self, 'device_hooks'):
+            for handle in self.device_hooks:
+                handle.remove()
+            self.device_hooks = []
 
     def _collect_model_to_cpu(self) -> None:
         """
         Move all model components back to CPU.
         """
+        # Remove hooks first
+        self._remove_device_hooks()
+
         # Move embedding layers
         if "opt" in self.model_name:
             self.model.model.decoder.embed_tokens = self.model.model.decoder.embed_tokens.cpu()
