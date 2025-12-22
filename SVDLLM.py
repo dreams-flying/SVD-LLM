@@ -520,7 +520,9 @@ if __name__ == '__main__':
     parser.add_argument('--step', type=int, default=4, help='the step to run the compression')
     parser.add_argument('--lora', type=str, default=None, help='the lora updated weight path to run the accuracy evaluation')
     parser.add_argument('--fisher_aware', action='store_true', help='Use Fisher-Aware SVD truncation instead of standard whitening-based truncation')
-    parser.add_argument('--use_task_loss', action='store_true', help='Use end-to-end task loss for Fisher estimation (slower but more accurate)')
+    parser.add_argument('--use_task_loss', action='store_true', help='Use end-to-end task loss for Fisher estimation (default for step 10)')
+    parser.add_argument('--use_proxy_loss', action='store_true', help='Use proxy loss for Fisher estimation (memory-efficient but less accurate)')
+    parser.add_argument('--num_gpus', type=int, default=1, help='Number of GPUs for model parallelism in Fisher estimation (default: 1)')
 
     args = parser.parse_args()
     args.ratio = 1- args.ratio
@@ -601,20 +603,21 @@ if __name__ == '__main__':
             whitening_mat = profle_svdllm_low_resource(args.model, model, cali_data, args.DEV)
 
         # Determine whether to use low-resource mode
-        # Default: use low-resource (proxy loss) for memory efficiency
-        # Use --use_task_loss to enable full cross-entropy loss (requires more GPU memory)
-        use_low_resource = not args.use_task_loss
+        # Default: use full mode (cross-entropy loss) for better accuracy
+        # Use --use_proxy_loss to enable proxy loss (memory-efficient but less accurate)
+        use_low_resource = args.use_proxy_loss
         if use_low_resource:
-            print("Using low-resource mode (proxy loss). Add --use_task_loss for cross-entropy loss.")
+            print("Using proxy loss mode (memory-efficient). Remove --use_proxy_loss for cross-entropy loss.")
         else:
-            print("Using full mode (cross-entropy loss). This requires significant GPU memory.")
+            print(f"Using cross-entropy loss mode with {args.num_gpus} GPU(s).")
 
         # Run Fisher-Aware SVD compression
         model = fisher_aware_svd_compression(
             args.model, model, cali_data, args.ratio,
             whitening_mat=whitening_mat,
             device=args.DEV,
-            use_low_resource=use_low_resource
+            use_low_resource=use_low_resource,
+            num_gpus=args.num_gpus
         )
 
         if args.save_path is not None:

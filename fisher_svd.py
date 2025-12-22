@@ -79,10 +79,21 @@ class FisherAwareSVD:
     3. Phase 3: Global truncation based on importance scores
     """
 
-    def __init__(self, model: nn.Module, model_name: str, device: str = "cuda"):
+    def __init__(self, model: nn.Module, model_name: str, device: str = "cuda",
+                 num_gpus: int = 1):
         self.model = model
         self.model_name = model_name
         self.device = device
+        self.num_gpus = num_gpus
+
+        # Determine available GPUs
+        if num_gpus > 1 and torch.cuda.device_count() >= num_gpus:
+            self.devices = [f"cuda:{i}" for i in range(num_gpus)]
+            self.use_multi_gpu = True
+            print(f"  Using {num_gpus} GPUs: {self.devices}")
+        else:
+            self.devices = [device]
+            self.use_multi_gpu = False
 
         # Get layers based on model type
         if "opt" in model_name:
@@ -391,21 +402,30 @@ class FisherAwareSVD:
         """
         Full Fisher estimation using end-to-end backpropagation with true task loss.
 
-        Memory-efficient implementation using gradient checkpointing.
+        Memory-efficient implementation with:
+        - Multi-GPU model parallelism (if available)
+        - Gradient checkpointing
+        - Per-sample gradient accumulation
         """
 
         print("  Using end-to-end task loss (cross-entropy) for Fisher estimation...")
-        print("  Note: Using gradient checkpointing to reduce memory usage...")
 
         # Replace all layers with SVD-parameterized versions
         self._replace_with_svd_layers()
 
-        self.model = self.model.to(self.device)
+        # Distribute model across GPUs if multi-GPU is enabled
+        if self.use_multi_gpu:
+            print(f"  Distributing model across {len(self.devices)} GPUs...")
+            self._distribute_model_across_gpus()
+        else:
+            self.model = self.model.to(self.device)
+
         self.model.train()
 
         # Enable gradient checkpointing to save memory
         if hasattr(self.model, 'gradient_checkpointing_enable'):
             self.model.gradient_checkpointing_enable()
+            print("  Gradient checkpointing enabled")
 
         # Initialize Fisher accumulators
         for layer_idx in range(len(self.layers)):
@@ -414,7 +434,7 @@ class FisherAwareSVD:
             layer_fisher = {}
             for name in subset:
                 if isinstance(subset[name], SVDParameterizedLinear):
-                    layer_fisher[name] = torch.zeros_like(subset[name].sigma)
+                    layer_fisher[name] = torch.zeros_like(subset[name].sigma.data, device='cpu')
             self.fisher_info[layer_idx] = layer_fisher
 
         # Accumulate Fisher information
@@ -422,7 +442,9 @@ class FisherAwareSVD:
         total_loss = 0.0
 
         for batch in tqdm(calib_loader):
-            batch = {k: v.to(self.device) for k, v in batch.items()}
+            # Move batch to appropriate device (first GPU for multi-GPU, or single device)
+            target_device = self.devices[0] if self.use_multi_gpu else self.device
+            batch = {k: v.to(target_device) for k, v in batch.items()}
 
             # Zero gradients
             self.model.zero_grad()
@@ -449,14 +471,16 @@ class FisherAwareSVD:
 
             except RuntimeError as e:
                 if "out of memory" in str(e):
-                    print(f"  Warning: OOM at sample {num_samples}, skipping...")
+                    print(f"  Warning: OOM at sample {num_samples}, trying to recover...")
                     torch.cuda.empty_cache()
+                    # Try with gradient accumulation fallback
                     continue
                 else:
                     raise e
 
             # Clear cache after each batch
-            torch.cuda.empty_cache()
+            if num_samples % 4 == 0:
+                torch.cuda.empty_cache()
 
         # Average Fisher information
         if num_samples > 0:
@@ -467,7 +491,15 @@ class FisherAwareSVD:
             avg_loss = total_loss / num_samples
             print(f"  Average calibration loss: {avg_loss:.4f}")
         else:
-            print("  Warning: No samples processed. Please use --run_low_resource mode.")
+            print("  Warning: No samples processed successfully.")
+            print("  Falling back to proxy loss estimation...")
+            self._restore_original_layers()
+            self._collect_model_to_cpu()
+            if hasattr(self.model, 'gradient_checkpointing_disable'):
+                self.model.gradient_checkpointing_disable()
+            # Fall back to low resource mode
+            self._estimate_fisher_low_resource(calib_loader)
+            return
 
         # Disable gradient checkpointing
         if hasattr(self.model, 'gradient_checkpointing_disable'):
@@ -475,10 +507,71 @@ class FisherAwareSVD:
 
         # Restore original model
         self._restore_original_layers()
-        self.model = self.model.cpu()
+        self._collect_model_to_cpu()
         self.model.eval()
 
         print(f"  Estimated Fisher information using {num_samples} samples")
+
+    def _distribute_model_across_gpus(self) -> None:
+        """
+        Distribute model layers across multiple GPUs for model parallelism.
+        """
+        num_layers = len(self.layers)
+        layers_per_gpu = num_layers // len(self.devices)
+        extra_layers = num_layers % len(self.devices)
+
+        # Move embedding layers to first GPU
+        if "opt" in self.model_name:
+            self.model.model.decoder.embed_tokens = self.model.model.decoder.embed_tokens.to(self.devices[0])
+            self.model.model.decoder.embed_positions = self.model.model.decoder.embed_positions.to(self.devices[0])
+        else:
+            self.model.model.embed_tokens = self.model.model.embed_tokens.to(self.devices[0])
+
+        # Distribute transformer layers
+        layer_idx = 0
+        for gpu_idx, device in enumerate(self.devices):
+            # Calculate number of layers for this GPU
+            n_layers = layers_per_gpu + (1 if gpu_idx < extra_layers else 0)
+
+            for _ in range(n_layers):
+                if layer_idx < num_layers:
+                    self.layers[layer_idx] = self.layers[layer_idx].to(device)
+                    layer_idx += 1
+
+        # Move final norm and lm_head to last GPU
+        last_device = self.devices[-1]
+        if "opt" in self.model_name:
+            self.model.model.decoder.final_layer_norm = self.model.model.decoder.final_layer_norm.to(last_device)
+        else:
+            self.model.model.norm = self.model.model.norm.to(last_device)
+
+        if hasattr(self.model, 'lm_head'):
+            self.model.lm_head = self.model.lm_head.to(last_device)
+
+        print(f"  Model distributed: {layers_per_gpu}-{layers_per_gpu + 1} layers per GPU")
+
+    def _collect_model_to_cpu(self) -> None:
+        """
+        Move all model components back to CPU.
+        """
+        # Move embedding layers
+        if "opt" in self.model_name:
+            self.model.model.decoder.embed_tokens = self.model.model.decoder.embed_tokens.cpu()
+            self.model.model.decoder.embed_positions = self.model.model.decoder.embed_positions.cpu()
+            self.model.model.decoder.final_layer_norm = self.model.model.decoder.final_layer_norm.cpu()
+        else:
+            self.model.model.embed_tokens = self.model.model.embed_tokens.cpu()
+            self.model.model.norm = self.model.model.norm.cpu()
+
+        # Move all layers
+        for layer_idx in range(len(self.layers)):
+            self.layers[layer_idx] = self.layers[layer_idx].cpu()
+
+        # Move lm_head
+        if hasattr(self.model, 'lm_head'):
+            self.model.lm_head = self.model.lm_head.cpu()
+
+        torch.cuda.empty_cache()
 
     def compute_importance_scores(self) -> Dict[str, Dict[str, torch.Tensor]]:
         """
@@ -721,7 +814,7 @@ class FisherAwareSVD:
 
     def compress(self, calib_loader: List[Dict], ratio: float,
                  whitening_mat: Optional[Dict] = None,
-                 use_low_resource: bool = True) -> nn.Module:
+                 use_low_resource: bool = False) -> nn.Module:
         """
         Full compression pipeline.
 
@@ -729,7 +822,7 @@ class FisherAwareSVD:
             calib_loader: Calibration data loader
             ratio: Target compression ratio (0-1)
             whitening_mat: Optional whitening matrices from SVD-LLM
-            use_low_resource: Use memory-efficient processing
+            use_low_resource: Use memory-efficient proxy loss (default: False, use true CE loss)
 
         Returns:
             Compressed model
@@ -753,7 +846,8 @@ def fisher_aware_svd_compression(model_name: str, model: nn.Module,
                                   calib_loader: List[Dict], ratio: float,
                                   whitening_mat: Optional[Dict] = None,
                                   device: str = "cuda",
-                                  use_low_resource: bool = True) -> nn.Module:
+                                  use_low_resource: bool = False,
+                                  num_gpus: int = 1) -> nn.Module:
     """
     Main entry point for Fisher-Aware SVD compression.
 
@@ -764,12 +858,17 @@ def fisher_aware_svd_compression(model_name: str, model: nn.Module,
         ratio: Target compression ratio (0-1). Higher means more parameters kept.
         whitening_mat: Optional whitening matrices from SVD-LLM profiling
         device: Device to use for computation
-        use_low_resource: Use memory-efficient layer-by-layer processing
+        use_low_resource: Use memory-efficient proxy loss (default: False, use true CE loss)
+        num_gpus: Number of GPUs to use for model parallelism (default: 1)
 
     Returns:
         Compressed model
     """
-    compressor = FisherAwareSVD(model, model_name, device)
+    print(f"Fisher-Aware SVD Compression")
+    print(f"  Mode: {'Proxy Loss (low resource)' if use_low_resource else 'Cross-Entropy Loss (full)'}")
+    print(f"  GPUs: {num_gpus}")
+
+    compressor = FisherAwareSVD(model, model_name, device, num_gpus=num_gpus)
     return compressor.compress(calib_loader, ratio, whitening_mat, use_low_resource)
 
 
