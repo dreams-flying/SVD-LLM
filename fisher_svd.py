@@ -69,6 +69,21 @@ class SVDParameterizedLinear(nn.Module):
         return out.to(original_dtype)
 
 
+class SVDLinear(nn.Module):
+    """
+    A linear layer factorized as W = U @ V where U and V are low-rank matrices.
+    Used for applying SVD compression to linear layers.
+    """
+
+    def __init__(self, v_proj: nn.Linear, u_proj: nn.Linear):
+        super().__init__()
+        self.v_proj = v_proj
+        self.u_proj = u_proj
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.u_proj(self.v_proj(x))
+
+
 class FisherAwareSVD:
     """
     Fisher-Aware SVD compression for LLMs.
@@ -874,15 +889,7 @@ class FisherAwareSVD:
             v_proj: The V projection (in_features -> rank)
             layer_idx: Layer index for model-specific handling
         """
-        # Create a simple SVD wrapper module
-        class SVDLinear(nn.Module):
-            def __init__(self, v_proj, u_proj):
-                super().__init__()
-                self.v_proj = v_proj
-                self.u_proj = u_proj
-
-            def forward(self, x):
-                return self.u_proj(self.v_proj(x))
+        # Use module-level SVDLinear class for pickle compatibility
 
         svd_linear = SVDLinear(v_proj, u_proj)
 
