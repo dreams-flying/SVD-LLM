@@ -179,6 +179,8 @@ class FisherAwareSVD:
 
     def _restore_original_layers(self) -> None:
         """Restore original linear layers from SVD components."""
+        dtype = next(iter(self.model.parameters())).dtype
+
         for layer_idx in range(len(self.layers)):
             layer = self.layers[layer_idx]
 
@@ -186,18 +188,18 @@ class FisherAwareSVD:
             if layer_idx not in self.svd_layer_refs:
                 continue
 
-            for name in self.svd_layer_refs[layer_idx].keys():
+            for name, svd_layer in self.svd_layer_refs[layer_idx].items():
                 if layer_idx in self.svd_components and name in self.svd_components[layer_idx]:
                     U, S, VT, bias = self.svd_components[layer_idx][name]
                     # Reconstruct W = U @ diag(S) @ VT
                     W = torch.matmul(U * S, VT)
 
-                    # Create new linear layer
+                    # Create new linear layer with same dtype as SVD layer
                     out_features, in_features = W.shape
                     new_linear = nn.Linear(in_features, out_features, bias=bias is not None)
-                    new_linear.weight.data = W.to(subset[name].weight.dtype)
+                    new_linear.weight.data = W.to(dtype)
                     if bias is not None:
-                        new_linear.bias.data = bias.to(subset[name].weight.dtype)
+                        new_linear.bias.data = bias.to(dtype)
 
                     self._set_module_by_name(layer, name, new_linear.to(self.device))
 
