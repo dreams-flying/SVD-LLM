@@ -1192,10 +1192,14 @@ class FisherAwareSVD:
                 if b_original is not None:
                     Y_original = Y_original + b_original
 
-                # Create trainable SVD factors
-                sqrt_sigma = torch.sqrt(S.float()).to(self.device)
-                U_param = nn.Parameter((U.float() * sqrt_sigma).to(self.device))
-                V_param = nn.Parameter((sqrt_sigma.unsqueeze(1) * VT.float()).to(self.device))
+                # Create trainable SVD factors - ensure all tensors on same device
+                S_dev = S.float().to(self.device)
+                U_dev = U.float().to(self.device)
+                VT_dev = VT.float().to(self.device)
+
+                sqrt_sigma = torch.sqrt(S_dev)
+                U_param = nn.Parameter(U_dev * sqrt_sigma)
+                V_param = nn.Parameter(sqrt_sigma.unsqueeze(1) * VT_dev)
 
                 optimizer = torch.optim.Adam([U_param, V_param], lr=1e-3)
 
