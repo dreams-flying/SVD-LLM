@@ -1130,9 +1130,9 @@ class FisherAwareSVD:
                         mask_j = attention_masks[j].unsqueeze(0).to(self.device)
                         if position_ids is not None and "opt" not in self.model_name:
                             pos_j = position_ids[j].unsqueeze(0).to(self.device)
-                            outs[j] = layer(inp_j, attention_mask=mask_j, position_ids=pos_j)[0]
+                            outs[j] = layer(inp_j, attention_mask=mask_j, position_ids=pos_j, use_cache=False)[0]
                         else:
-                            outs[j] = layer(inp_j, attention_mask=mask_j)[0]
+                            outs[j] = layer(inp_j, attention_mask=mask_j, use_cache=False)[0]
                 self.layers[layer_idx] = layer.cpu()
                 inps = outs.clone()
                 torch.cuda.empty_cache()
@@ -1146,9 +1146,9 @@ class FisherAwareSVD:
                     mask_j = attention_masks[j].unsqueeze(0).to(self.device)
                     if position_ids is not None and "opt" not in self.model_name:
                         pos_j = position_ids[j].unsqueeze(0).to(self.device)
-                        original_outs[j] = layer(inp_j, attention_mask=mask_j, position_ids=pos_j)[0]
+                        original_outs[j] = layer(inp_j, attention_mask=mask_j, position_ids=pos_j, use_cache=False)[0]
                     else:
-                        original_outs[j] = layer(inp_j, attention_mask=mask_j)[0]
+                        original_outs[j] = layer(inp_j, attention_mask=mask_j, use_cache=False)[0]
 
             # Create trainable SVD layers for calibration
             svd_layers = {}
@@ -1164,18 +1164,22 @@ class FisherAwareSVD:
                 out_features, in_features = U.shape[0], VT.shape[1]
 
                 # Create trainable linear layers with correct dtype
-                sqrt_sigma = torch.sqrt(S.float())
-                svd_u = (U.float() * sqrt_sigma).to(layer_dtype).to(self.device)
-                svd_v = (sqrt_sigma.unsqueeze(1) * VT.float()).to(layer_dtype).to(self.device)
+                # Use float32 for all computations to avoid device/dtype issues
+                sqrt_sigma = torch.sqrt(S.float()).to(self.device)
+                U_dev = U.float().to(self.device)
+                VT_dev = VT.float().to(self.device)
+
+                svd_u = (U_dev * sqrt_sigma).to(layer_dtype)
+                svd_v = (sqrt_sigma.unsqueeze(1) * VT_dev).to(layer_dtype)
 
                 # Create Linear layers with correct dtype from the start
                 u_proj = nn.Linear(rank, out_features, bias=(bias is not None), dtype=layer_dtype, device=self.device)
                 v_proj = nn.Linear(in_features, rank, bias=False, dtype=layer_dtype, device=self.device)
 
-                u_proj.weight.data = svd_u
-                v_proj.weight.data = svd_v
+                u_proj.weight.data.copy_(svd_u)
+                v_proj.weight.data.copy_(svd_v)
                 if bias is not None:
-                    u_proj.bias.data = bias.to(layer_dtype).to(self.device)
+                    u_proj.bias.data.copy_(bias.to(layer_dtype).to(self.device))
 
                 # Make weights trainable
                 u_proj.weight.requires_grad = True
@@ -1187,9 +1191,10 @@ class FisherAwareSVD:
                 svd_linear = SVDLinear(v_proj, u_proj)
                 self._set_module_by_name(layer, name, svd_linear)
 
-            # IMPORTANT: Move entire layer to device after replacing modules
-            # This ensures all buffers and parameters are on the correct device
-            layer = layer.to(self.device)
+            # Move all layer buffers to device (for rotary embeddings, etc.)
+            for name, buf in layer.named_buffers():
+                if buf is not None and buf.device.type == 'cpu':
+                    buf.data = buf.data.to(self.device)
 
             # Optimize SVD layers
             all_params = []
@@ -1212,9 +1217,9 @@ class FisherAwareSVD:
 
                         if position_ids is not None and "opt" not in self.model_name:
                             pos_j = position_ids[j].unsqueeze(0).to(self.device)
-                            out_j = layer(inp_j, attention_mask=mask_j, position_ids=pos_j)[0]
+                            out_j = layer(inp_j, attention_mask=mask_j, position_ids=pos_j, use_cache=False)[0]
                         else:
-                            out_j = layer(inp_j, attention_mask=mask_j)[0]
+                            out_j = layer(inp_j, attention_mask=mask_j, use_cache=False)[0]
 
                         # Reconstruction loss - compute in float32 for stability
                         loss = ((out_j.float() - target_j.float()) ** 2).mean()
@@ -1252,9 +1257,9 @@ class FisherAwareSVD:
                     mask_j = attention_masks[j].unsqueeze(0).to(self.device)
                     if position_ids is not None and "opt" not in self.model_name:
                         pos_j = position_ids[j].unsqueeze(0).to(self.device)
-                        outs[j] = layer(inp_j, attention_mask=mask_j, position_ids=pos_j)[0]
+                        outs[j] = layer(inp_j, attention_mask=mask_j, position_ids=pos_j, use_cache=False)[0]
                     else:
-                        outs[j] = layer(inp_j, attention_mask=mask_j)[0]
+                        outs[j] = layer(inp_j, attention_mask=mask_j, use_cache=False)[0]
 
             self.layers[layer_idx] = layer.cpu()
             inps = outs.clone()
