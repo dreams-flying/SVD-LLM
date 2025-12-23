@@ -683,7 +683,10 @@ class FisherAwareSVD:
         """
         Compute importance scores for all singular values.
 
-        Score_i = σ_i² × F_ii
+        Enhanced scoring formula:
+        Score_i = σ_i² × F_ii × layer_factor
+
+        Where layer_factor increases for later layers (more important for generation).
 
         Returns:
             Dictionary of importance scores per layer and sublayer
@@ -692,19 +695,30 @@ class FisherAwareSVD:
         fisher_used = 0
         fisher_fallback = 0
 
+        num_layers = len(self.layers)
+
         for layer_idx in self.svd_components:
             layer_scores = {}
+
+            # Layer position factor: later layers get higher weight
+            # Using smooth sigmoid-like curve: factor ranges from 0.5 to 1.5
+            # This protects later layers which are more important for generation quality
+            layer_position = layer_idx / (num_layers - 1) if num_layers > 1 else 0.5
+            layer_factor = 0.5 + layer_position  # Range: [0.5, 1.5]
+
             for name in self.svd_components[layer_idx]:
                 U, S, VT, bias = self.svd_components[layer_idx][name]
 
                 if layer_idx in self.fisher_info and name in self.fisher_info[layer_idx]:
                     F = self.fisher_info[layer_idx][name]
-                    # Score_i = σ_i² × F_ii
-                    scores = S.pow(2) * F
+                    # Score_i = σ_i² × F_ii × layer_factor
+                    # Add small epsilon to F to avoid all-zero scores
+                    F_regularized = F + 1e-10
+                    scores = S.pow(2) * F_regularized * layer_factor
                     fisher_used += 1
                 else:
-                    # Fallback to magnitude-based scoring
-                    scores = S.pow(2)
+                    # Fallback to magnitude-based scoring with layer factor
+                    scores = S.pow(2) * layer_factor
                     fisher_fallback += 1
 
                 layer_scores[name] = scores
@@ -713,33 +727,49 @@ class FisherAwareSVD:
         print(f"  Importance scores: {fisher_used} with Fisher, {fisher_fallback} fallback to magnitude")
         return importance_scores
 
-    def phase3_global_truncation(self, ratio: float) -> None:
+    def phase3_global_truncation(self, ratio: float, min_rank: int = 16) -> None:
         """
         Phase 3: Global truncation based on importance scores.
 
         Following the algorithm:
         1. Compute Score_i^(l) = (σ_i^(l))² × F_σi^(l) for all singular values
-        2. Flatten all scores into a list S and sort globally (descending)
-        3. Keep top ρ proportion of scores, zero out the rest
-        4. Reconstruct W'^(l) = U^(l) Σ'^(l) V^(l)^T
+        2. Normalize scores per layer for balanced truncation
+        3. Flatten all scores into a list S and sort globally (descending)
+        4. Keep top ρ proportion of scores, respecting minimum rank constraints
+        5. Reconstruct W'^(l) = U^(l) Σ'^(l) V^(l)^T
 
         Args:
             ratio: Target retention ratio (0-1). Higher means more parameters kept.
+            min_rank: Minimum rank to keep per layer (default: 16)
         """
-        print(f"Phase 3: Global Truncation (target ratio: {ratio:.2%})...")
+        print(f"Phase 3: Global Truncation (target ratio: {ratio:.2%}, min_rank: {min_rank})...")
 
         # Compute importance scores: Score_i = σ_i² × F_ii
         importance_scores = self.compute_importance_scores()
 
-        # Collect all scores with their identifiers (layer_idx, name, singular_value_idx)
-        all_scores = []
+        # Layer-wise normalization for balanced truncation
+        # This prevents some layers from dominating the global selection
+        normalized_scores = {}
         for layer_idx in importance_scores:
+            normalized_scores[layer_idx] = {}
             for name in importance_scores[layer_idx]:
                 scores = importance_scores[layer_idx][name]
-                for i, score in enumerate(scores):
-                    all_scores.append((score.item(), layer_idx, name, i))
+                # Normalize by layer's total importance (L2 norm)
+                layer_norm = torch.norm(scores).item() + 1e-10
+                normalized = scores / layer_norm
+                normalized_scores[layer_idx][name] = normalized
 
-        # Sort by importance (descending) - following Algorithm line 24
+        # Collect all scores with their identifiers (layer_idx, name, singular_value_idx)
+        # Use normalized scores for ranking but store original scores for debugging
+        all_scores = []
+        for layer_idx in normalized_scores:
+            for name in normalized_scores[layer_idx]:
+                scores = normalized_scores[layer_idx][name]
+                original_scores = importance_scores[layer_idx][name]
+                for i, (norm_score, orig_score) in enumerate(zip(scores, original_scores)):
+                    all_scores.append((norm_score.item(), layer_idx, name, i, orig_score.item()))
+
+        # Sort by normalized importance (descending)
         all_scores.sort(key=lambda x: x[0], reverse=True)
 
         # Calculate total singular values and target count
@@ -749,39 +779,68 @@ class FisherAwareSVD:
         # For W ∈ R^{m×n} with rank r: params = r(m+n), original = mn
         # To achieve compression ratio ρ: r(m+n) ≈ ρ × mn → r ≈ ρmn/(m+n)
         layer_max_rank = {}
+        layer_min_rank = {}
         total_original_params = 0
         for layer_idx in self.svd_components:
             for name in self.svd_components[layer_idx]:
                 U, S, VT, _ = self.svd_components[layer_idx][name]
                 m, n = U.shape[0], VT.shape[1]
                 total_original_params += m * n
+                original_rank = len(S)
+
                 # Maximum rank that satisfies compression ratio
                 max_rank = int(m * n * ratio / (m + n))
-                max_rank = max(1, min(max_rank, len(S)))
+                max_rank = max(1, min(max_rank, original_rank))
+
+                # Minimum rank constraint: at least min_rank or 10% of original, whichever is smaller
+                min_r = min(min_rank, max(1, int(original_rank * 0.1)))
+                min_r = min(min_r, max_rank)  # Don't exceed max_rank
+
                 layer_max_rank[(layer_idx, name)] = max_rank
+                layer_min_rank[(layer_idx, name)] = min_r
 
-        # Total target singular values (sum of per-layer max ranks)
-        total_target_sv = sum(layer_max_rank.values())
-
-        # Keep top singular values globally (Algorithm line 25)
-        # Pure global selection - no per-layer constraints beyond max rank
+        # First, allocate minimum ranks for all layers
         kept_indices: Dict[int, Dict[str, set]] = defaultdict(lambda: defaultdict(set))
         kept_count = 0
 
-        for score, layer_idx, name, idx in all_scores:
-            if kept_count >= total_target_sv:
-                break
+        # Pre-allocate minimum ranks by taking top singular values per layer
+        for layer_idx in self.svd_components:
+            for name in self.svd_components[layer_idx]:
+                min_r = layer_min_rank[(layer_idx, name)]
+                # Take top min_r singular values for this layer
+                for i in range(min_r):
+                    kept_indices[layer_idx][name].add(i)
+                    kept_count += 1
 
-            current_kept = len(kept_indices[layer_idx][name])
-            max_for_layer = layer_max_rank.get((layer_idx, name), 0)
+        # Calculate remaining budget after minimum allocation
+        total_target_sv = sum(layer_max_rank.values())
+        remaining_budget = total_target_sv - kept_count
 
-            # Pure global selection: only check if we haven't exceeded max rank for this layer
-            if current_kept < max_for_layer:
-                kept_indices[layer_idx][name].add(idx)
-                kept_count += 1
+        print(f"  Pre-allocated {kept_count} singular values for minimum ranks")
+        print(f"  Remaining budget: {remaining_budget}")
 
-        # Truncate SVD components (Algorithm lines 26-28)
+        # Fill remaining budget using global selection
+        if remaining_budget > 0:
+            for norm_score, layer_idx, name, idx, orig_score in all_scores:
+                if remaining_budget <= 0:
+                    break
+
+                # Skip if already kept (from minimum allocation)
+                if idx in kept_indices[layer_idx][name]:
+                    continue
+
+                current_kept = len(kept_indices[layer_idx][name])
+                max_for_layer = layer_max_rank.get((layer_idx, name), 0)
+
+                # Check if we haven't exceeded max rank for this layer
+                if current_kept < max_for_layer:
+                    kept_indices[layer_idx][name].add(idx)
+                    kept_count += 1
+                    remaining_budget -= 1
+
+        # Truncate SVD components
         truncation_samples = []  # For debug output
+        rank_stats = []  # Track min/max ranks
         for layer_idx in self.svd_components:
             for name in self.svd_components[layer_idx]:
                 U, S, VT, bias = self.svd_components[layer_idx][name]
@@ -799,6 +858,7 @@ class FisherAwareSVD:
 
                 indices = torch.tensor(indices)
                 new_rank = len(indices)
+                rank_stats.append(new_rank)
 
                 # Store sample for debug
                 if len(truncation_samples) < 3:
@@ -815,6 +875,9 @@ class FisherAwareSVD:
         print("  Truncation examples:")
         for sample in truncation_samples:
             print(f"    {sample}")
+
+        # Print rank statistics
+        print(f"  Rank statistics: min={min(rank_stats)}, max={max(rank_stats)}, avg={sum(rank_stats)/len(rank_stats):.1f}")
 
         # Calculate actual compression ratio achieved
         kept_params = 0
@@ -938,7 +1001,8 @@ class FisherAwareSVD:
 
     def compress(self, calib_loader: List[Dict], ratio: float,
                  whitening_mat: Optional[Dict] = None,
-                 use_low_resource: bool = False) -> nn.Module:
+                 use_low_resource: bool = False,
+                 calibration_steps: int = 50) -> nn.Module:
         """
         Full compression pipeline.
 
@@ -947,6 +1011,7 @@ class FisherAwareSVD:
             ratio: Target compression ratio (0-1)
             whitening_mat: Optional whitening matrices from SVD-LLM
             use_low_resource: Use memory-efficient proxy loss (default: False, use true CE loss)
+            calibration_steps: Number of calibration steps per layer (default: 50)
 
         Returns:
             Compressed model
@@ -960,10 +1025,229 @@ class FisherAwareSVD:
         # Phase 3: Global Truncation
         self.phase3_global_truncation(ratio)
 
+        # Phase 4: Layer-wise Calibration (optimize SVD factors to minimize reconstruction error)
+        self.phase4_calibration(calib_loader, calibration_steps)
+
         # Apply compression to model
         self.apply_compression(ratio)
 
         return self.model
+
+    def phase4_calibration(self, calib_loader: List[Dict], num_steps: int = 50) -> None:
+        """
+        Phase 4: Layer-wise calibration to fine-tune SVD factors.
+
+        After truncation, optimize the remaining SVD factors to minimize
+        reconstruction error on calibration data. This is similar to the
+        calibration step in GPTQ and other advanced compression methods.
+
+        Args:
+            calib_loader: Calibration data loader
+            num_steps: Number of optimization steps per layer
+        """
+        print(f"Phase 4: Layer-wise Calibration ({num_steps} steps per layer)...")
+
+        # Move embedding layers to device
+        if "opt" in self.model_name:
+            self.model.model.decoder.embed_tokens = self.model.model.decoder.embed_tokens.to(self.device)
+            self.model.model.decoder.embed_positions = self.model.model.decoder.embed_positions.to(self.device)
+        else:
+            self.model.model.embed_tokens = self.model.model.embed_tokens.to(self.device)
+
+        # Capture inputs to first layer
+        dtype = next(iter(self.model.parameters())).dtype
+        inps = torch.zeros(
+            (len(calib_loader), self.model.seqlen, self.model.config.hidden_size),
+            dtype=dtype, device=self.device
+        )
+        cache = {'i': 0, 'attention_mask': None, 'position_ids': None}
+
+        class Catcher(nn.Module):
+            def __init__(self, module):
+                super().__init__()
+                self.module = module
+
+            def forward(self, inp, **kwargs):
+                inps[cache['i']] = inp
+                cache['i'] += 1
+                if cache['attention_mask'] is None:
+                    cache['attention_mask'] = kwargs['attention_mask']
+                    if 'position_ids' in kwargs:
+                        cache['position_ids'] = kwargs['position_ids']
+                else:
+                    cache['attention_mask'] = torch.cat(
+                        (cache['attention_mask'], kwargs['attention_mask']), dim=0
+                    )
+                    if 'position_ids' in kwargs:
+                        cache['position_ids'] = torch.cat(
+                            (cache['position_ids'], kwargs['position_ids']), dim=0
+                        )
+                raise ValueError
+
+        self.layers[0] = self.layers[0].to(self.device)
+        original_layer0 = self.layers[0]
+        self.layers[0] = Catcher(self.layers[0])
+
+        for batch in calib_loader:
+            try:
+                batch = {k: v.to(self.device) for k, v in batch.items()}
+                self.model(**batch)
+            except ValueError:
+                pass
+
+        self.layers[0] = original_layer0
+        self.layers[0] = self.layers[0].cpu()
+
+        # Move embedding layers back to CPU
+        if "opt" in self.model_name:
+            self.model.model.decoder.embed_tokens = self.model.model.decoder.embed_tokens.cpu()
+            self.model.model.decoder.embed_positions = self.model.model.decoder.embed_positions.cpu()
+        else:
+            self.model.model.embed_tokens = self.model.model.embed_tokens.cpu()
+
+        torch.cuda.empty_cache()
+
+        attention_masks = cache['attention_mask']
+        position_ids = cache.get('position_ids', None)
+
+        outs = torch.zeros_like(inps)
+        total_loss_before = 0.0
+        total_loss_after = 0.0
+
+        for layer_idx in tqdm(range(len(self.layers))):
+            layer = self.layers[layer_idx].to(self.device)
+            subset = find_layers(layer)
+
+            if layer_idx not in self.svd_components:
+                # Just forward through this layer
+                with torch.no_grad():
+                    for j in range(inps.shape[0]):
+                        if position_ids is not None and "opt" not in self.model_name:
+                            outs[j] = layer(inps[j].unsqueeze(0),
+                                           attention_mask=attention_masks[j].unsqueeze(0),
+                                           position_ids=position_ids[j].unsqueeze(0))[0]
+                        else:
+                            outs[j] = layer(inps[j].unsqueeze(0),
+                                           attention_mask=attention_masks[j].unsqueeze(0))[0]
+                self.layers[layer_idx] = layer.cpu()
+                inps = outs.clone()
+                torch.cuda.empty_cache()
+                continue
+
+            # Capture original outputs for this layer
+            original_outs = torch.zeros_like(inps)
+            with torch.no_grad():
+                for j in range(inps.shape[0]):
+                    if position_ids is not None and "opt" not in self.model_name:
+                        original_outs[j] = layer(inps[j].unsqueeze(0),
+                                                  attention_mask=attention_masks[j].unsqueeze(0),
+                                                  position_ids=position_ids[j].unsqueeze(0))[0]
+                    else:
+                        original_outs[j] = layer(inps[j].unsqueeze(0),
+                                                  attention_mask=attention_masks[j].unsqueeze(0))[0]
+
+            # Create trainable SVD layers for calibration
+            svd_layers = {}
+            for name in subset:
+                if name not in self.svd_components[layer_idx]:
+                    continue
+
+                U, S, VT, bias = self.svd_components[layer_idx][name]
+                rank = len(S)
+                out_features, in_features = U.shape[0], VT.shape[1]
+
+                # Create trainable linear layers
+                sqrt_sigma = torch.sqrt(S)
+                svd_u = (U * sqrt_sigma).to(dtype).to(self.device)
+                svd_v = (sqrt_sigma.unsqueeze(1) * VT).to(dtype).to(self.device)
+
+                u_proj = nn.Linear(rank, out_features, bias=(bias is not None)).to(self.device)
+                v_proj = nn.Linear(in_features, rank, bias=False).to(self.device)
+
+                u_proj.weight.data = svd_u
+                v_proj.weight.data = svd_v
+                if bias is not None:
+                    u_proj.bias.data = bias.to(dtype).to(self.device)
+
+                # Make weights trainable
+                u_proj.weight.requires_grad = True
+                v_proj.weight.requires_grad = True
+
+                svd_layers[name] = (u_proj, v_proj, bias is not None)
+
+                # Replace in layer temporarily
+                svd_linear = SVDLinear(v_proj, u_proj)
+                self._set_module_by_name(layer, name, svd_linear)
+
+            # Optimize SVD layers
+            all_params = []
+            for name, (u_proj, v_proj, _) in svd_layers.items():
+                all_params.extend([u_proj.weight, v_proj.weight])
+
+            if len(all_params) > 0:
+                optimizer = torch.optim.Adam(all_params, lr=1e-4)
+
+                for step in range(num_steps):
+                    total_loss = 0.0
+                    for j in range(inps.shape[0]):
+                        optimizer.zero_grad()
+
+                        if position_ids is not None and "opt" not in self.model_name:
+                            out_j = layer(inps[j].unsqueeze(0),
+                                         attention_mask=attention_masks[j].unsqueeze(0),
+                                         position_ids=position_ids[j].unsqueeze(0))[0]
+                        else:
+                            out_j = layer(inps[j].unsqueeze(0),
+                                         attention_mask=attention_masks[j].unsqueeze(0))[0]
+
+                        # Reconstruction loss
+                        loss = ((out_j.float() - original_outs[j].unsqueeze(0).float()) ** 2).mean()
+                        total_loss += loss.item()
+
+                        loss.backward()
+                        optimizer.step()
+
+                    if step == 0:
+                        total_loss_before += total_loss / inps.shape[0]
+
+                total_loss_after += total_loss / inps.shape[0]
+
+                # Update SVD components with calibrated weights
+                for name, (u_proj, v_proj, has_bias) in svd_layers.items():
+                    # Convert back to U, S, VT format
+                    # W = u_proj.weight @ v_proj.weight = U @ sqrt(S) @ sqrt(S) @ VT = U @ S @ VT
+                    with torch.no_grad():
+                        W_new = u_proj.weight.data @ v_proj.weight.data
+                        U_new, S_new, VT_new = torch.linalg.svd(W_new.float(), full_matrices=False)
+
+                        # Keep only the truncated rank
+                        rank = v_proj.weight.shape[0]
+                        U_new = U_new[:, :rank]
+                        S_new = S_new[:rank]
+                        VT_new = VT_new[:rank, :]
+
+                        bias_data = u_proj.bias.data.cpu() if has_bias else None
+                        self.svd_components[layer_idx][name] = (U_new.cpu(), S_new.cpu(), VT_new.cpu(), bias_data)
+
+            # Forward through calibrated layer for next layer's input
+            with torch.no_grad():
+                for j in range(inps.shape[0]):
+                    if position_ids is not None and "opt" not in self.model_name:
+                        outs[j] = layer(inps[j].unsqueeze(0),
+                                       attention_mask=attention_masks[j].unsqueeze(0),
+                                       position_ids=position_ids[j].unsqueeze(0))[0]
+                    else:
+                        outs[j] = layer(inps[j].unsqueeze(0),
+                                       attention_mask=attention_masks[j].unsqueeze(0))[0]
+
+            self.layers[layer_idx] = layer.cpu()
+            inps = outs.clone()
+            torch.cuda.empty_cache()
+
+        avg_loss_before = total_loss_before / len(self.layers)
+        avg_loss_after = total_loss_after / len(self.layers)
+        print(f"  Reconstruction loss: {avg_loss_before:.6f} -> {avg_loss_after:.6f}")
+        print(f"  Improvement: {(1 - avg_loss_after / avg_loss_before) * 100:.1f}%")
 
 
 def fisher_aware_svd_compression(model_name: str, model: nn.Module,
@@ -971,7 +1255,8 @@ def fisher_aware_svd_compression(model_name: str, model: nn.Module,
                                   whitening_mat: Optional[Dict] = None,
                                   device: str = "cuda",
                                   use_low_resource: bool = False,
-                                  num_gpus: int = 1) -> nn.Module:
+                                  num_gpus: int = 1,
+                                  calibration_steps: int = 50) -> nn.Module:
     """
     Main entry point for Fisher-Aware SVD compression.
 
@@ -993,7 +1278,7 @@ def fisher_aware_svd_compression(model_name: str, model: nn.Module,
     print(f"  GPUs: {num_gpus}")
 
     compressor = FisherAwareSVD(model, model_name, device, num_gpus=num_gpus)
-    return compressor.compress(calib_loader, ratio, whitening_mat, use_low_resource)
+    return compressor.compress(calib_loader, ratio, whitening_mat, use_low_resource, calibration_steps)
 
 
 if __name__ == '__main__':

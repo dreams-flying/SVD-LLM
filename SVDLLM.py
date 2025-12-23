@@ -523,6 +523,7 @@ if __name__ == '__main__':
     parser.add_argument('--use_task_loss', action='store_true', help='Use end-to-end task loss for Fisher estimation (default for step 10)')
     parser.add_argument('--use_proxy_loss', action='store_true', help='Use proxy loss for Fisher estimation (memory-efficient but less accurate)')
     parser.add_argument('--num_gpus', type=int, default=1, help='Number of GPUs for model parallelism in Fisher estimation (default: 1)')
+    parser.add_argument('--calibration_steps', type=int, default=100, help='Number of calibration steps per layer for post-compression refinement (default: 100)')
 
     args = parser.parse_args()
     args.ratio = 1- args.ratio
@@ -617,7 +618,8 @@ if __name__ == '__main__':
             whitening_mat=whitening_mat,
             device=args.DEV,
             use_low_resource=use_low_resource,
-            num_gpus=args.num_gpus
+            num_gpus=args.num_gpus,
+            calibration_steps=args.calibration_steps
         )
 
         if args.save_path is not None:
