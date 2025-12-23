@@ -1107,8 +1107,10 @@ class FisherAwareSVD:
 
         torch.cuda.empty_cache()
 
-        attention_masks = cache['attention_mask']
+        attention_masks = cache['attention_mask'].to(self.device)
         position_ids = cache.get('position_ids', None)
+        if position_ids is not None:
+            position_ids = position_ids.to(self.device)
 
         outs = torch.zeros_like(inps)
         total_loss_before = 0.0
@@ -1122,29 +1124,29 @@ class FisherAwareSVD:
                 # Just forward through this layer
                 with torch.no_grad():
                     for j in range(inps.shape[0]):
+                        inp_j = inps[j].unsqueeze(0).to(self.device)
+                        mask_j = attention_masks[j].unsqueeze(0).to(self.device)
                         if position_ids is not None and "opt" not in self.model_name:
-                            outs[j] = layer(inps[j].unsqueeze(0),
-                                           attention_mask=attention_masks[j].unsqueeze(0),
-                                           position_ids=position_ids[j].unsqueeze(0))[0]
+                            pos_j = position_ids[j].unsqueeze(0).to(self.device)
+                            outs[j] = layer(inp_j, attention_mask=mask_j, position_ids=pos_j)[0]
                         else:
-                            outs[j] = layer(inps[j].unsqueeze(0),
-                                           attention_mask=attention_masks[j].unsqueeze(0))[0]
+                            outs[j] = layer(inp_j, attention_mask=mask_j)[0]
                 self.layers[layer_idx] = layer.cpu()
                 inps = outs.clone()
                 torch.cuda.empty_cache()
                 continue
 
             # Capture original outputs for this layer
-            original_outs = torch.zeros_like(inps)
+            original_outs = torch.zeros_like(inps, device=self.device)
             with torch.no_grad():
                 for j in range(inps.shape[0]):
+                    inp_j = inps[j].unsqueeze(0).to(self.device)
+                    mask_j = attention_masks[j].unsqueeze(0).to(self.device)
                     if position_ids is not None and "opt" not in self.model_name:
-                        original_outs[j] = layer(inps[j].unsqueeze(0),
-                                                  attention_mask=attention_masks[j].unsqueeze(0),
-                                                  position_ids=position_ids[j].unsqueeze(0))[0]
+                        pos_j = position_ids[j].unsqueeze(0).to(self.device)
+                        original_outs[j] = layer(inp_j, attention_mask=mask_j, position_ids=pos_j)[0]
                     else:
-                        original_outs[j] = layer(inps[j].unsqueeze(0),
-                                                  attention_mask=attention_masks[j].unsqueeze(0))[0]
+                        original_outs[j] = layer(inp_j, attention_mask=mask_j)[0]
 
             # Create trainable SVD layers for calibration
             svd_layers = {}
@@ -1192,16 +1194,18 @@ class FisherAwareSVD:
                     for j in range(inps.shape[0]):
                         optimizer.zero_grad()
 
+                        inp_j = inps[j].unsqueeze(0).to(self.device)
+                        mask_j = attention_masks[j].unsqueeze(0).to(self.device)
+                        target_j = original_outs[j].unsqueeze(0).to(self.device)
+
                         if position_ids is not None and "opt" not in self.model_name:
-                            out_j = layer(inps[j].unsqueeze(0),
-                                         attention_mask=attention_masks[j].unsqueeze(0),
-                                         position_ids=position_ids[j].unsqueeze(0))[0]
+                            pos_j = position_ids[j].unsqueeze(0).to(self.device)
+                            out_j = layer(inp_j, attention_mask=mask_j, position_ids=pos_j)[0]
                         else:
-                            out_j = layer(inps[j].unsqueeze(0),
-                                         attention_mask=attention_masks[j].unsqueeze(0))[0]
+                            out_j = layer(inp_j, attention_mask=mask_j)[0]
 
                         # Reconstruction loss
-                        loss = ((out_j.float() - original_outs[j].unsqueeze(0).float()) ** 2).mean()
+                        loss = ((out_j.float() - target_j.float()) ** 2).mean()
                         total_loss += loss.item()
 
                         loss.backward()
@@ -1232,13 +1236,13 @@ class FisherAwareSVD:
             # Forward through calibrated layer for next layer's input
             with torch.no_grad():
                 for j in range(inps.shape[0]):
+                    inp_j = inps[j].unsqueeze(0).to(self.device)
+                    mask_j = attention_masks[j].unsqueeze(0).to(self.device)
                     if position_ids is not None and "opt" not in self.model_name:
-                        outs[j] = layer(inps[j].unsqueeze(0),
-                                       attention_mask=attention_masks[j].unsqueeze(0),
-                                       position_ids=position_ids[j].unsqueeze(0))[0]
+                        pos_j = position_ids[j].unsqueeze(0).to(self.device)
+                        outs[j] = layer(inp_j, attention_mask=mask_j, position_ids=pos_j)[0]
                     else:
-                        outs[j] = layer(inps[j].unsqueeze(0),
-                                       attention_mask=attention_masks[j].unsqueeze(0))[0]
+                        outs[j] = layer(inp_j, attention_mask=mask_j)[0]
 
             self.layers[layer_idx] = layer.cpu()
             inps = outs.clone()
