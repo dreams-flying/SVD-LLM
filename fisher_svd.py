@@ -1026,7 +1026,12 @@ class FisherAwareSVD:
         self.phase3_global_truncation(ratio)
 
         # Phase 4: Layer-wise Calibration (optimize SVD factors to minimize reconstruction error)
-        self.phase4_calibration(calib_loader, calibration_steps)
+        if calibration_steps > 0:
+            try:
+                self.phase4_calibration(calib_loader, calibration_steps)
+            except RuntimeError as e:
+                print(f"  Warning: Phase 4 calibration failed ({e}), skipping...")
+                print("  Proceeding without calibration.")
 
         # Apply compression to model
         self.apply_compression(ratio)
@@ -1035,17 +1040,21 @@ class FisherAwareSVD:
 
     def phase4_calibration(self, calib_loader: List[Dict], num_steps: int = 50) -> None:
         """
-        Phase 4: Layer-wise calibration to fine-tune SVD factors.
+        Phase 4: Per-linear-layer calibration to fine-tune SVD factors.
 
-        After truncation, optimize the remaining SVD factors to minimize
-        reconstruction error on calibration data. This is similar to the
-        calibration step in GPTQ and other advanced compression methods.
+        This uses a simplified approach that calibrates each linear layer independently
+        by capturing input activations and optimizing the SVD reconstruction error.
+        This avoids backward through the entire transformer layer.
 
         Args:
             calib_loader: Calibration data loader
             num_steps: Number of optimization steps per layer
         """
-        print(f"Phase 4: Layer-wise Calibration ({num_steps} steps per layer)...")
+        if num_steps <= 0:
+            print("Phase 4: Skipping calibration (num_steps=0)")
+            return
+
+        print(f"Phase 4: Per-Linear-Layer Calibration ({num_steps} steps)...")
 
         # Move embedding layers to device
         if "opt" in self.model_name:
@@ -1068,7 +1077,7 @@ class FisherAwareSVD:
                 self.module = module
 
             def forward(self, inp, **kwargs):
-                inps[cache['i']] = inp
+                inps[cache['i']] = inp.to(inps.device).to(inps.dtype)
                 cache['i'] += 1
                 if cache['attention_mask'] is None:
                     cache['attention_mask'] = kwargs['attention_mask']
@@ -1112,48 +1121,32 @@ class FisherAwareSVD:
         if position_ids is not None:
             position_ids = position_ids.to(self.device)
 
-        # Ensure inps and outs are on device
-        inps = inps.to(self.device)
-        outs = torch.zeros_like(inps, device=self.device)
-        total_loss_before = 0.0
-        total_loss_after = 0.0
+        # Process each layer
+        outs = torch.zeros_like(inps)
+        total_improvement = 0.0
+        calibrated_layers = 0
 
         for layer_idx in tqdm(range(len(self.layers))):
-            layer = self.layers[layer_idx].to(self.device)
-            subset = find_layers(layer)
+            layer = self.layers[layer_idx].float().to(self.device)  # Convert to float32 for calibration
 
             if layer_idx not in self.svd_components:
                 # Just forward through this layer
                 with torch.no_grad():
                     for j in range(inps.shape[0]):
-                        inp_j = inps[j].unsqueeze(0).to(self.device)
+                        inp_j = inps[j].unsqueeze(0).float().to(self.device)
                         mask_j = attention_masks[j].unsqueeze(0).to(self.device)
                         if position_ids is not None and "opt" not in self.model_name:
                             pos_j = position_ids[j].unsqueeze(0).to(self.device)
-                            outs[j] = layer(inp_j, attention_mask=mask_j, position_ids=pos_j, use_cache=False)[0]
+                            outs[j] = layer(inp_j, attention_mask=mask_j, position_ids=pos_j, use_cache=False)[0].to(dtype)
                         else:
-                            outs[j] = layer(inp_j, attention_mask=mask_j, use_cache=False)[0]
-                self.layers[layer_idx] = layer.cpu()
+                            outs[j] = layer(inp_j, attention_mask=mask_j, use_cache=False)[0].to(dtype)
+                self.layers[layer_idx] = layer.to(dtype).cpu()
                 inps = outs.clone()
                 torch.cuda.empty_cache()
                 continue
 
-            # Capture original outputs for this layer
-            original_outs = torch.zeros_like(inps, device=self.device)
-            with torch.no_grad():
-                for j in range(inps.shape[0]):
-                    inp_j = inps[j].unsqueeze(0).to(self.device)
-                    mask_j = attention_masks[j].unsqueeze(0).to(self.device)
-                    if position_ids is not None and "opt" not in self.model_name:
-                        pos_j = position_ids[j].unsqueeze(0).to(self.device)
-                        original_outs[j] = layer(inp_j, attention_mask=mask_j, position_ids=pos_j, use_cache=False)[0]
-                    else:
-                        original_outs[j] = layer(inp_j, attention_mask=mask_j, use_cache=False)[0]
-
-            # Create trainable SVD layers for calibration
-            svd_layers = {}
-            # Get layer dtype from the layer itself
-            layer_dtype = next(layer.parameters()).dtype
+            # For each linear layer, calibrate the SVD factors independently
+            subset = find_layers(layer)
 
             for name in subset:
                 if name not in self.svd_components[layer_idx]:
@@ -1161,114 +1154,119 @@ class FisherAwareSVD:
 
                 U, S, VT, bias = self.svd_components[layer_idx][name]
                 rank = len(S)
-                out_features, in_features = U.shape[0], VT.shape[1]
 
-                # Create trainable linear layers with correct dtype
-                # Use float32 for all computations to avoid device/dtype issues
-                sqrt_sigma = torch.sqrt(S.float()).to(self.device)
-                U_dev = U.float().to(self.device)
-                VT_dev = VT.float().to(self.device)
+                # Get the original linear layer to capture its original output
+                original_linear = self._get_module_by_name(layer, name)
 
-                svd_u = (U_dev * sqrt_sigma).to(layer_dtype)
-                svd_v = (sqrt_sigma.unsqueeze(1) * VT_dev).to(layer_dtype)
+                # Capture input activations to this linear layer using hooks
+                linear_inputs = []
 
-                # Create Linear layers with correct dtype from the start
-                u_proj = nn.Linear(rank, out_features, bias=(bias is not None), dtype=layer_dtype, device=self.device)
-                v_proj = nn.Linear(in_features, rank, bias=False, dtype=layer_dtype, device=self.device)
+                def capture_hook(module, inp, out):
+                    linear_inputs.append(inp[0].detach().float())
 
-                u_proj.weight.data.copy_(svd_u)
-                v_proj.weight.data.copy_(svd_v)
-                if bias is not None:
-                    u_proj.bias.data.copy_(bias.to(layer_dtype).to(self.device))
+                handle = original_linear.register_forward_hook(capture_hook)
 
-                # Make weights trainable
-                u_proj.weight.requires_grad = True
-                v_proj.weight.requires_grad = True
-
-                svd_layers[name] = (u_proj, v_proj, bias is not None)
-
-                # Replace in layer temporarily
-                svd_linear = SVDLinear(v_proj, u_proj)
-                self._set_module_by_name(layer, name, svd_linear)
-
-            # Move all layer buffers to device (for rotary embeddings, etc.)
-            for name, buf in layer.named_buffers():
-                if buf is not None and buf.device.type == 'cpu':
-                    buf.data = buf.data.to(self.device)
-
-            # Optimize SVD layers
-            all_params = []
-            for name, (u_proj, v_proj, _) in svd_layers.items():
-                all_params.extend([u_proj.weight, v_proj.weight])
-
-            if len(all_params) > 0:
-                # Use float32 for optimization stability
-                optimizer = torch.optim.Adam(all_params, lr=1e-4)
-
-                for step in range(num_steps):
-                    total_loss = 0.0
+                # Forward pass to capture inputs
+                with torch.no_grad():
                     for j in range(inps.shape[0]):
-                        optimizer.zero_grad()
-
-                        # Ensure all tensors are on the correct device
-                        inp_j = inps[j].unsqueeze(0).to(self.device)
+                        inp_j = inps[j].unsqueeze(0).float().to(self.device)
                         mask_j = attention_masks[j].unsqueeze(0).to(self.device)
-                        target_j = original_outs[j].unsqueeze(0).detach().to(self.device)
-
                         if position_ids is not None and "opt" not in self.model_name:
                             pos_j = position_ids[j].unsqueeze(0).to(self.device)
-                            out_j = layer(inp_j, attention_mask=mask_j, position_ids=pos_j, use_cache=False)[0]
+                            _ = layer(inp_j, attention_mask=mask_j, position_ids=pos_j, use_cache=False)
                         else:
-                            out_j = layer(inp_j, attention_mask=mask_j, use_cache=False)[0]
+                            _ = layer(inp_j, attention_mask=mask_j, use_cache=False)
 
-                        # Reconstruction loss - compute in float32 for stability
-                        loss = ((out_j.float() - target_j.float()) ** 2).mean()
-                        total_loss += loss.item()
+                handle.remove()
 
-                        loss.backward()
-                        optimizer.step()
+                if len(linear_inputs) == 0:
+                    continue
+
+                # Stack all inputs: (num_samples * seq_len, hidden_dim)
+                X = torch.cat([x.reshape(-1, x.shape[-1]) for x in linear_inputs], dim=0).to(self.device)
+
+                # Compute original outputs: Y = X @ W^T + b
+                W_original = original_linear.weight.data.float().to(self.device)
+                b_original = original_linear.bias.data.float().to(self.device) if original_linear.bias is not None else None
+                Y_original = X @ W_original.T
+                if b_original is not None:
+                    Y_original = Y_original + b_original
+
+                # Create trainable SVD factors
+                sqrt_sigma = torch.sqrt(S.float()).to(self.device)
+                U_param = nn.Parameter((U.float() * sqrt_sigma).to(self.device))
+                V_param = nn.Parameter((sqrt_sigma.unsqueeze(1) * VT.float()).to(self.device))
+
+                optimizer = torch.optim.Adam([U_param, V_param], lr=1e-3)
+
+                # Optimize
+                loss_before = None
+                for step in range(num_steps):
+                    optimizer.zero_grad()
+
+                    # Compute SVD output: Y_svd = X @ V^T @ U^T = X @ (U @ V)^T
+                    W_svd = U_param @ V_param
+                    Y_svd = X @ W_svd.T
+                    if b_original is not None:
+                        Y_svd = Y_svd + b_original
+
+                    loss = ((Y_svd - Y_original.detach()) ** 2).mean()
 
                     if step == 0:
-                        total_loss_before += total_loss / inps.shape[0]
+                        loss_before = loss.item()
 
-                total_loss_after += total_loss / inps.shape[0]
+                    loss.backward()
+                    optimizer.step()
 
-                # Update SVD components with calibrated weights
-                for name, (u_proj, v_proj, has_bias) in svd_layers.items():
-                    # Convert back to U, S, VT format
-                    # W = u_proj.weight @ v_proj.weight = U @ sqrt(S) @ sqrt(S) @ VT = U @ S @ VT
-                    with torch.no_grad():
-                        W_new = u_proj.weight.data @ v_proj.weight.data
-                        U_new, S_new, VT_new = torch.linalg.svd(W_new.float(), full_matrices=False)
+                loss_after = loss.item()
+                if loss_before is not None and loss_before > 0:
+                    improvement = (1 - loss_after / loss_before) * 100
+                    total_improvement += improvement
+                    calibrated_layers += 1
 
-                        # Keep only the truncated rank
-                        rank = v_proj.weight.shape[0]
-                        U_new = U_new[:, :rank]
-                        S_new = S_new[:rank]
-                        VT_new = VT_new[:rank, :]
+                # Update SVD components
+                with torch.no_grad():
+                    W_new = U_param.data @ V_param.data
+                    U_new, S_new, VT_new = torch.linalg.svd(W_new, full_matrices=False)
+                    U_new = U_new[:, :rank]
+                    S_new = S_new[:rank]
+                    VT_new = VT_new[:rank, :]
 
-                        bias_data = u_proj.bias.data.cpu() if has_bias else None
-                        self.svd_components[layer_idx][name] = (U_new.cpu(), S_new.cpu(), VT_new.cpu(), bias_data)
+                    self.svd_components[layer_idx][name] = (U_new.cpu(), S_new.cpu(), VT_new.cpu(),
+                                                            bias.cpu() if bias is not None else None)
 
-            # Forward through calibrated layer for next layer's input
+                # Clear memory
+                del X, Y_original, U_param, V_param, linear_inputs
+                torch.cuda.empty_cache()
+
+            # Forward through layer for next layer's input
             with torch.no_grad():
                 for j in range(inps.shape[0]):
-                    inp_j = inps[j].unsqueeze(0).to(self.device)
+                    inp_j = inps[j].unsqueeze(0).float().to(self.device)
                     mask_j = attention_masks[j].unsqueeze(0).to(self.device)
                     if position_ids is not None and "opt" not in self.model_name:
                         pos_j = position_ids[j].unsqueeze(0).to(self.device)
-                        outs[j] = layer(inp_j, attention_mask=mask_j, position_ids=pos_j, use_cache=False)[0]
+                        outs[j] = layer(inp_j, attention_mask=mask_j, position_ids=pos_j, use_cache=False)[0].to(dtype)
                     else:
-                        outs[j] = layer(inp_j, attention_mask=mask_j, use_cache=False)[0]
+                        outs[j] = layer(inp_j, attention_mask=mask_j, use_cache=False)[0].to(dtype)
 
-            self.layers[layer_idx] = layer.cpu()
+            self.layers[layer_idx] = layer.to(dtype).cpu()
             inps = outs.clone()
             torch.cuda.empty_cache()
 
-        avg_loss_before = total_loss_before / len(self.layers)
-        avg_loss_after = total_loss_after / len(self.layers)
-        print(f"  Reconstruction loss: {avg_loss_before:.6f} -> {avg_loss_after:.6f}")
-        print(f"  Improvement: {(1 - avg_loss_after / avg_loss_before) * 100:.1f}%")
+        if calibrated_layers > 0:
+            avg_improvement = total_improvement / calibrated_layers
+            print(f"  Average improvement: {avg_improvement:.1f}% across {calibrated_layers} linear layers")
+        else:
+            print("  No layers calibrated")
+
+    def _get_module_by_name(self, parent: nn.Module, name: str) -> nn.Module:
+        """Get a submodule by its name path."""
+        parts = name.split('.')
+        module = parent
+        for part in parts:
+            module = getattr(module, part)
+        return module
 
 
 def fisher_aware_svd_compression(model_name: str, model: nn.Module,
