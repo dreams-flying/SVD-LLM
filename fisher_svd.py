@@ -1042,9 +1042,7 @@ class FisherAwareSVD:
         """
         Phase 4: Per-linear-layer calibration to fine-tune SVD factors.
 
-        This uses a simplified approach that calibrates each linear layer independently
-        by capturing input activations and optimizing the SVD reconstruction error.
-        This avoids backward through the entire transformer layer.
+        Optimized: capture all linear layer inputs in ONE forward pass per layer.
 
         Args:
             calib_loader: Calibration data loader
@@ -1127,7 +1125,7 @@ class FisherAwareSVD:
         calibrated_layers = 0
 
         for layer_idx in tqdm(range(len(self.layers))):
-            layer = self.layers[layer_idx].float().to(self.device)  # Convert to float32 for calibration
+            layer = self.layers[layer_idx].float().to(self.device)
 
             if layer_idx not in self.svd_components:
                 # Just forward through this layer
@@ -1145,54 +1143,57 @@ class FisherAwareSVD:
                 torch.cuda.empty_cache()
                 continue
 
-            # For each linear layer, calibrate the SVD factors independently
+            # Capture ALL linear layer inputs in ONE forward pass
             subset = find_layers(layer)
+            layer_inputs = {name: [] for name in subset if name in self.svd_components[layer_idx]}
+            handles = []
 
-            for name in subset:
-                if name not in self.svd_components[layer_idx]:
+            def make_hook(name):
+                def hook(module, inp, out):
+                    layer_inputs[name].append(inp[0].detach().float())
+                return hook
+
+            for name in layer_inputs:
+                linear = self._get_module_by_name(layer, name)
+                handle = linear.register_forward_hook(make_hook(name))
+                handles.append(handle)
+
+            # Single forward pass to capture all inputs
+            with torch.no_grad():
+                for j in range(inps.shape[0]):
+                    inp_j = inps[j].unsqueeze(0).float().to(self.device)
+                    mask_j = attention_masks[j].unsqueeze(0).to(self.device)
+                    if position_ids is not None and "opt" not in self.model_name:
+                        pos_j = position_ids[j].unsqueeze(0).to(self.device)
+                        _ = layer(inp_j, attention_mask=mask_j, position_ids=pos_j, use_cache=False)
+                    else:
+                        _ = layer(inp_j, attention_mask=mask_j, use_cache=False)
+
+            # Remove all hooks
+            for handle in handles:
+                handle.remove()
+
+            # Calibrate each linear layer using captured inputs
+            for name in layer_inputs:
+                if len(layer_inputs[name]) == 0:
                     continue
 
                 U, S, VT, bias = self.svd_components[layer_idx][name]
                 rank = len(S)
 
-                # Get the original linear layer to capture its original output
                 original_linear = self._get_module_by_name(layer, name)
 
-                # Capture input activations to this linear layer using hooks
-                linear_inputs = []
+                # Stack all inputs
+                X = torch.cat([x.reshape(-1, x.shape[-1]) for x in layer_inputs[name]], dim=0).to(self.device)
 
-                def capture_hook(module, inp, out):
-                    linear_inputs.append(inp[0].detach().float())
-
-                handle = original_linear.register_forward_hook(capture_hook)
-
-                # Forward pass to capture inputs
-                with torch.no_grad():
-                    for j in range(inps.shape[0]):
-                        inp_j = inps[j].unsqueeze(0).float().to(self.device)
-                        mask_j = attention_masks[j].unsqueeze(0).to(self.device)
-                        if position_ids is not None and "opt" not in self.model_name:
-                            pos_j = position_ids[j].unsqueeze(0).to(self.device)
-                            _ = layer(inp_j, attention_mask=mask_j, position_ids=pos_j, use_cache=False)
-                        else:
-                            _ = layer(inp_j, attention_mask=mask_j, use_cache=False)
-
-                handle.remove()
-
-                if len(linear_inputs) == 0:
-                    continue
-
-                # Stack all inputs: (num_samples * seq_len, hidden_dim)
-                X = torch.cat([x.reshape(-1, x.shape[-1]) for x in linear_inputs], dim=0).to(self.device)
-
-                # Compute original outputs: Y = X @ W^T + b
+                # Compute original outputs
                 W_original = original_linear.weight.data.float().to(self.device)
                 b_original = original_linear.bias.data.float().to(self.device) if original_linear.bias is not None else None
                 Y_original = X @ W_original.T
                 if b_original is not None:
                     Y_original = Y_original + b_original
 
-                # Create trainable SVD factors - ensure all tensors on same device
+                # Create trainable SVD factors
                 S_dev = S.float().to(self.device)
                 U_dev = U.float().to(self.device)
                 VT_dev = VT.float().to(self.device)
@@ -1207,8 +1208,6 @@ class FisherAwareSVD:
                 loss_before = None
                 for step in range(num_steps):
                     optimizer.zero_grad()
-
-                    # Compute SVD output: Y_svd = X @ V^T @ U^T = X @ (U @ V)^T
                     W_svd = U_param @ V_param
                     Y_svd = X @ W_svd.T
                     if b_original is not None:
@@ -1239,9 +1238,11 @@ class FisherAwareSVD:
                     self.svd_components[layer_idx][name] = (U_new.cpu(), S_new.cpu(), VT_new.cpu(),
                                                             bias.cpu() if bias is not None else None)
 
-                # Clear memory
-                del X, Y_original, U_param, V_param, linear_inputs
-                torch.cuda.empty_cache()
+                del X, Y_original, U_param, V_param
+
+            # Clear layer inputs
+            del layer_inputs
+            torch.cuda.empty_cache()
 
             # Forward through layer for next layer's input
             with torch.no_grad():
