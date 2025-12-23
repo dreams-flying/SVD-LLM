@@ -1112,7 +1112,9 @@ class FisherAwareSVD:
         if position_ids is not None:
             position_ids = position_ids.to(self.device)
 
-        outs = torch.zeros_like(inps)
+        # Ensure inps and outs are on device
+        inps = inps.to(self.device)
+        outs = torch.zeros_like(inps, device=self.device)
         total_loss_before = 0.0
         total_loss_after = 0.0
 
@@ -1185,12 +1187,17 @@ class FisherAwareSVD:
                 svd_linear = SVDLinear(v_proj, u_proj)
                 self._set_module_by_name(layer, name, svd_linear)
 
+            # IMPORTANT: Move entire layer to device after replacing modules
+            # This ensures all buffers and parameters are on the correct device
+            layer = layer.to(self.device)
+
             # Optimize SVD layers
             all_params = []
             for name, (u_proj, v_proj, _) in svd_layers.items():
                 all_params.extend([u_proj.weight, v_proj.weight])
 
             if len(all_params) > 0:
+                # Use float32 for optimization stability
                 optimizer = torch.optim.Adam(all_params, lr=1e-4)
 
                 for step in range(num_steps):
@@ -1198,9 +1205,10 @@ class FisherAwareSVD:
                     for j in range(inps.shape[0]):
                         optimizer.zero_grad()
 
+                        # Ensure all tensors are on the correct device
                         inp_j = inps[j].unsqueeze(0).to(self.device)
                         mask_j = attention_masks[j].unsqueeze(0).to(self.device)
-                        target_j = original_outs[j].unsqueeze(0).to(self.device)
+                        target_j = original_outs[j].unsqueeze(0).detach().to(self.device)
 
                         if position_ids is not None and "opt" not in self.model_name:
                             pos_j = position_ids[j].unsqueeze(0).to(self.device)
@@ -1208,7 +1216,7 @@ class FisherAwareSVD:
                         else:
                             out_j = layer(inp_j, attention_mask=mask_j)[0]
 
-                        # Reconstruction loss
+                        # Reconstruction loss - compute in float32 for stability
                         loss = ((out_j.float() - target_j.float()) ** 2).mean()
                         total_loss += loss.item()
 
