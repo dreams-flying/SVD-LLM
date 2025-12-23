@@ -1040,19 +1040,26 @@ class FisherAwareSVD:
 
     def phase4_calibration(self, calib_loader: List[Dict], num_steps: int = 50) -> None:
         """
-        Phase 4: Per-linear-layer calibration to fine-tune SVD factors.
+        Phase 4: Per-linear-layer calibration using closed-form weighted SVD.
 
-        Optimized: capture all linear layer inputs in ONE forward pass per layer.
+        Key insight: Standard SVD minimizes ||W - W'||_F^2, but we want to minimize
+        ||X(W - W')^T||_F^2 where X is the input distribution. This is a weighted
+        low-rank approximation problem with a closed-form solution:
+
+        1. Compute C = X^T @ X (covariance matrix)
+        2. Eigendecompose C = Q @ Λ @ Q^T to get C^{1/2} and C^{-1/2}
+        3. Compute weighted matrix: W_weighted = W @ C^{1/2}
+        4. Do truncated SVD on W_weighted
+        5. Transform back: new_VT = VT @ C^{-1/2}
+
+        This replaces 50 iterations of Adam with ONE matrix decomposition per layer,
+        achieving the same (or better) optimality with ~50x speedup.
 
         Args:
             calib_loader: Calibration data loader
-            num_steps: Number of optimization steps per layer
+            num_steps: Ignored (kept for API compatibility), uses closed-form solution
         """
-        if num_steps <= 0:
-            print("Phase 4: Skipping calibration (num_steps=0)")
-            return
-
-        print(f"Phase 4: Per-Linear-Layer Calibration ({num_steps} steps)...")
+        print(f"Phase 4: Per-Linear-Layer Calibration (closed-form weighted SVD)...")
 
         # Move embedding layers to device
         if "opt" in self.model_name:
@@ -1173,7 +1180,7 @@ class FisherAwareSVD:
             for handle in handles:
                 handle.remove()
 
-            # Calibrate each linear layer using captured inputs
+            # Calibrate each linear layer using closed-form weighted SVD
             for name in layer_inputs:
                 if len(layer_inputs[name]) == 0:
                     continue
@@ -1183,62 +1190,74 @@ class FisherAwareSVD:
 
                 original_linear = self._get_module_by_name(layer, name)
 
-                # Stack all inputs
+                # Stack all inputs: (N, in_features)
                 X = torch.cat([x.reshape(-1, x.shape[-1]) for x in layer_inputs[name]], dim=0).to(self.device)
 
-                # Compute original outputs
-                W_original = original_linear.weight.data.float().to(self.device)
-                b_original = original_linear.bias.data.float().to(self.device) if original_linear.bias is not None else None
-                Y_original = X @ W_original.T
-                if b_original is not None:
-                    Y_original = Y_original + b_original
+                # Get original weight
+                W = original_linear.weight.data.float().to(self.device)  # (out_features, in_features)
 
-                # Create trainable SVD factors
-                S_dev = S.float().to(self.device)
-                U_dev = U.float().to(self.device)
-                VT_dev = VT.float().to(self.device)
+                # Compute loss before calibration
+                W_before = (U.float().to(self.device) * S.float().to(self.device)) @ VT.float().to(self.device)
+                loss_before = ((X @ W_before.T - X @ W.T) ** 2).mean().item()
 
-                sqrt_sigma = torch.sqrt(S_dev)
-                U_param = nn.Parameter(U_dev * sqrt_sigma)
-                V_param = nn.Parameter(sqrt_sigma.unsqueeze(1) * VT_dev)
+                # === Closed-form weighted SVD ===
+                # Goal: minimize ||X @ (W' - W)^T||_F^2 subject to rank(W') = r
+                # Solution: weighted low-rank approximation using input covariance
 
-                optimizer = torch.optim.Adam([U_param, V_param], lr=1e-3)
+                # Step 1: Compute covariance matrix C = X^T @ X
+                # Use a subsample if X is too large to save memory
+                n_samples = X.shape[0]
+                if n_samples > 4096:
+                    indices = torch.randperm(n_samples)[:4096]
+                    X_sub = X[indices]
+                else:
+                    X_sub = X
 
-                # Optimize
-                loss_before = None
-                for step in range(num_steps):
-                    optimizer.zero_grad()
-                    W_svd = U_param @ V_param
-                    Y_svd = X @ W_svd.T
-                    if b_original is not None:
-                        Y_svd = Y_svd + b_original
+                C = X_sub.T @ X_sub  # (in_features, in_features)
 
-                    loss = ((Y_svd - Y_original.detach()) ** 2).mean()
+                # Step 2: Eigendecompose C = Q @ Λ @ Q^T
+                # Add regularization for numerical stability
+                C = C + 1e-6 * torch.eye(C.shape[0], device=C.device)
+                eigenvalues, Q = torch.linalg.eigh(C)
 
-                    if step == 0:
-                        loss_before = loss.item()
+                # Clamp eigenvalues to avoid numerical issues
+                eigenvalues = eigenvalues.clamp(min=1e-8)
 
-                    loss.backward()
-                    optimizer.step()
+                # Step 3: Compute C^{1/2} and C^{-1/2}
+                sqrt_eigenvalues = torch.sqrt(eigenvalues)
+                inv_sqrt_eigenvalues = 1.0 / sqrt_eigenvalues
 
-                loss_after = loss.item()
-                if loss_before is not None and loss_before > 0:
+                # C_sqrt = Q @ diag(sqrt_eigenvalues) @ Q^T
+                # C_sqrt_inv = Q @ diag(inv_sqrt_eigenvalues) @ Q^T
+
+                # Step 4: Compute W @ C^{1/2} = W @ Q @ diag(sqrt_eigenvalues) @ Q^T
+                # For efficiency, we compute W @ Q @ diag(sqrt_eigenvalues)
+                W_Q = W @ Q  # (out_features, in_features)
+                W_weighted = W_Q * sqrt_eigenvalues  # Broadcasting
+
+                # Step 5: Truncated SVD on the weighted matrix
+                U_new, S_new, VT_weighted = torch.linalg.svd(W_weighted, full_matrices=False)
+                U_new = U_new[:, :rank]
+                S_new = S_new[:rank]
+                VT_weighted = VT_weighted[:rank, :]
+
+                # Step 6: Transform back VT: new_VT = VT_weighted @ diag(inv_sqrt_eigenvalues) @ Q^T
+                VT_new = (VT_weighted * inv_sqrt_eigenvalues) @ Q.T
+
+                # Compute loss after calibration
+                W_after = (U_new * S_new) @ VT_new
+                loss_after = ((X @ W_after.T - X @ W.T) ** 2).mean().item()
+
+                if loss_before > 0:
                     improvement = (1 - loss_after / loss_before) * 100
                     total_improvement += improvement
                     calibrated_layers += 1
 
                 # Update SVD components
-                with torch.no_grad():
-                    W_new = U_param.data @ V_param.data
-                    U_new, S_new, VT_new = torch.linalg.svd(W_new, full_matrices=False)
-                    U_new = U_new[:, :rank]
-                    S_new = S_new[:rank]
-                    VT_new = VT_new[:rank, :]
+                self.svd_components[layer_idx][name] = (U_new.cpu(), S_new.cpu(), VT_new.cpu(),
+                                                        bias.cpu() if bias is not None else None)
 
-                    self.svd_components[layer_idx][name] = (U_new.cpu(), S_new.cpu(), VT_new.cpu(),
-                                                            bias.cpu() if bias is not None else None)
-
-                del X, Y_original, U_param, V_param
+                del X, W, C, Q, eigenvalues, W_weighted, U_new, S_new, VT_new
 
             # Clear layer inputs
             del layer_inputs
