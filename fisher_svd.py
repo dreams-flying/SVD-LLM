@@ -1150,6 +1150,9 @@ class FisherAwareSVD:
 
             # Create trainable SVD layers for calibration
             svd_layers = {}
+            # Get layer dtype from the layer itself
+            layer_dtype = next(layer.parameters()).dtype
+
             for name in subset:
                 if name not in self.svd_components[layer_idx]:
                     continue
@@ -1158,18 +1161,19 @@ class FisherAwareSVD:
                 rank = len(S)
                 out_features, in_features = U.shape[0], VT.shape[1]
 
-                # Create trainable linear layers
-                sqrt_sigma = torch.sqrt(S)
-                svd_u = (U * sqrt_sigma).to(dtype).to(self.device)
-                svd_v = (sqrt_sigma.unsqueeze(1) * VT).to(dtype).to(self.device)
+                # Create trainable linear layers with correct dtype
+                sqrt_sigma = torch.sqrt(S.float())
+                svd_u = (U.float() * sqrt_sigma).to(layer_dtype).to(self.device)
+                svd_v = (sqrt_sigma.unsqueeze(1) * VT.float()).to(layer_dtype).to(self.device)
 
-                u_proj = nn.Linear(rank, out_features, bias=(bias is not None)).to(self.device)
-                v_proj = nn.Linear(in_features, rank, bias=False).to(self.device)
+                # Create Linear layers with correct dtype from the start
+                u_proj = nn.Linear(rank, out_features, bias=(bias is not None), dtype=layer_dtype, device=self.device)
+                v_proj = nn.Linear(in_features, rank, bias=False, dtype=layer_dtype, device=self.device)
 
                 u_proj.weight.data = svd_u
                 v_proj.weight.data = svd_v
                 if bias is not None:
-                    u_proj.bias.data = bias.to(dtype).to(self.device)
+                    u_proj.bias.data = bias.to(layer_dtype).to(self.device)
 
                 # Make weights trainable
                 u_proj.weight.requires_grad = True
