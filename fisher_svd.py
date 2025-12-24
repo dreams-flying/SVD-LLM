@@ -800,16 +800,20 @@ class FisherAwareSVD:
                 layer_min_rank[(layer_idx, name)] = min_r
 
         # First, allocate minimum ranks for all layers
+        # BUG FIX: Take top min_r by IMPORTANCE SCORE, not by index
         kept_indices: Dict[int, Dict[str, set]] = defaultdict(lambda: defaultdict(set))
         kept_count = 0
 
-        # Pre-allocate minimum ranks by taking top singular values per layer
+        # Pre-allocate minimum ranks by taking TOP min_r singular values BY IMPORTANCE
         for layer_idx in self.svd_components:
             for name in self.svd_components[layer_idx]:
                 min_r = layer_min_rank[(layer_idx, name)]
-                # Take top min_r singular values for this layer
-                for i in range(min_r):
-                    kept_indices[layer_idx][name].add(i)
+                # Get importance scores for this layer
+                layer_scores = importance_scores[layer_idx][name]
+                # Get top min_r indices by importance (not by position)
+                top_indices = torch.argsort(layer_scores, descending=True)[:min_r]
+                for idx in top_indices:
+                    kept_indices[layer_idx][name].add(idx.item())
                     kept_count += 1
 
         # Calculate remaining budget after minimum allocation
