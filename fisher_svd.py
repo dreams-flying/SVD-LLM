@@ -1235,16 +1235,18 @@ class FisherAwareSVD:
                 # M* = (Z^T Z)^{-1} @ Z^T @ Y @ U_r = solve(ZTZ, ZTY @ U_r)
                 M_star = torch.linalg.solve(ZTZ, ZTY @ U_r)  # (rank, rank)
 
-                # Step 4: SVD of M* to get proper SVD form
-                # M* = P @ Λ @ Q^T
+                # Step 4: SVD of M_star to get proper SVD form
+                # Note: M_star = M^{*T}, so M^* = Q @ Λ @ P^T
+                # SVD: M_star = P @ Λ @ Q^T, therefore M^* = Q @ Λ @ P^T
                 P, Lambda, QT = torch.linalg.svd(M_star, full_matrices=False)
+                Q = QT.T  # Q = (Q^T)^T
 
                 # Step 5: Compute final SVD components
-                # W' = U_r @ M* @ V_r^T = U_r @ P @ Λ @ Q^T @ V_r^T
-                # So: U' = U_r @ P, S' = Λ, V'^T = Q^T @ V_r^T
-                U_new = U_r @ P  # (out_features, rank)
+                # W' = U_r @ M^* @ V_r^T = U_r @ Q @ Λ @ P^T @ V_r^T
+                # So: U' = U_r @ Q, S' = Λ, V'^T = P^T @ V_r^T
+                U_new = U_r @ Q  # (out_features, rank)
                 S_new = Lambda  # (rank,)
-                VT_new = QT @ VT_r  # (rank, in_features)
+                VT_new = P.T @ VT_r  # (rank, in_features)
 
                 # Compute loss after calibration
                 W_after = (U_new * S_new) @ VT_new
