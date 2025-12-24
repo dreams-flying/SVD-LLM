@@ -430,13 +430,20 @@ class FisherAwareSVD:
         """
         Full Fisher estimation using end-to-end backpropagation with true task loss.
 
+        CORRECTED: Computes per-sample gradients for accurate Fisher information.
+
+        Fisher information is defined as: F_ii = E[(∂L/∂σ_i)²]
+        This requires computing gradients for EACH SAMPLE separately, then averaging
+        the squared gradients. NOT squaring the average gradient.
+
         Memory-efficient implementation with:
         - Multi-GPU model parallelism (if available)
         - Gradient checkpointing
-        - Per-sample gradient accumulation
+        - Per-sample gradient computation (correct Fisher)
         """
 
         print("  Using end-to-end task loss (cross-entropy) for Fisher estimation...")
+        print("  Computing per-sample gradients for accurate Fisher information...")
 
         # Replace all layers with SVD-parameterized versions
         self._replace_with_svd_layers()
@@ -462,48 +469,50 @@ class FisherAwareSVD:
                 layer_fisher[name] = torch.zeros_like(svd_layer.sigma.data, device='cpu')
             self.fisher_info[layer_idx] = layer_fisher
 
-        # Accumulate Fisher information
+        # Accumulate Fisher information with PER-SAMPLE gradients
         num_samples = 0
         total_loss = 0.0
+        target_device = self.devices[0] if self.use_multi_gpu else self.device
 
         for batch in tqdm(calib_loader):
-            # Move batch to appropriate device (first GPU for multi-GPU, or single device)
-            target_device = self.devices[0] if self.use_multi_gpu else self.device
             batch = {k: v.to(target_device) for k, v in batch.items()}
+            batch_size = batch['input_ids'].shape[0]
 
-            # Zero gradients
-            self.model.zero_grad()
+            # Process each sample individually for correct Fisher estimation
+            for sample_idx in range(batch_size):
+                # Extract single sample
+                single_sample = {k: v[sample_idx:sample_idx+1] for k, v in batch.items()}
 
-            try:
-                # Forward pass with cross-entropy loss
-                outputs = self.model(**batch, labels=batch['input_ids'])
-                loss = outputs.loss
-                total_loss += loss.item()
+                # Zero gradients
+                self.model.zero_grad()
 
-                # Backward pass
-                loss.backward()
+                try:
+                    # Forward pass with cross-entropy loss for single sample
+                    outputs = self.model(**single_sample, labels=single_sample['input_ids'])
+                    loss = outputs.loss
+                    total_loss += loss.item()
 
-                # Accumulate squared gradients (Fisher information)
-                # Use stored SVD layer references instead of find_layers
-                for layer_idx in self.svd_layer_refs:
-                    for name, svd_layer in self.svd_layer_refs[layer_idx].items():
-                        if svd_layer.sigma.grad is not None:
-                            self.fisher_info[layer_idx][name] += svd_layer.sigma.grad.pow(2).cpu()
+                    # Backward pass
+                    loss.backward()
 
-                num_samples += 1
+                    # Accumulate squared gradients (correct Fisher: E[grad²])
+                    for layer_idx in self.svd_layer_refs:
+                        for name, svd_layer in self.svd_layer_refs[layer_idx].items():
+                            if svd_layer.sigma.grad is not None:
+                                self.fisher_info[layer_idx][name] += svd_layer.sigma.grad.pow(2).cpu()
 
-            except RuntimeError as e:
-                if "out of memory" in str(e):
-                    print(f"  Warning: OOM at sample {num_samples}, trying to recover...")
-                    torch.cuda.empty_cache()
-                    # Try with gradient accumulation fallback
-                    continue
-                else:
-                    raise e
+                    num_samples += 1
+
+                except RuntimeError as e:
+                    if "out of memory" in str(e):
+                        print(f"  Warning: OOM at sample {num_samples}, skipping...")
+                        torch.cuda.empty_cache()
+                        continue
+                    else:
+                        raise e
 
             # Clear cache after each batch
-            if num_samples % 4 == 0:
-                torch.cuda.empty_cache()
+            torch.cuda.empty_cache()
 
         # Average Fisher information
         if num_samples > 0:
@@ -533,7 +542,7 @@ class FisherAwareSVD:
         self._collect_model_to_cpu()
         self.model.eval()
 
-        print(f"  Estimated Fisher information using {num_samples} samples")
+        print(f"  Estimated Fisher information using {num_samples} samples (per-sample gradients)")
 
     def _distribute_model_across_gpus(self) -> None:
         """
