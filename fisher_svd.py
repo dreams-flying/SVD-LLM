@@ -1155,13 +1155,15 @@ class FisherAwareSVD:
                 continue
 
             # Capture ALL linear layer inputs in ONE forward pass
+            # Store on CPU to save GPU memory
             subset = find_layers(layer)
             layer_inputs = {name: [] for name in subset if name in self.svd_components[layer_idx]}
             handles = []
 
             def make_hook(name):
                 def hook(module, inp, out):
-                    layer_inputs[name].append(inp[0].detach().float())
+                    # Store on CPU to save GPU memory
+                    layer_inputs[name].append(inp[0].detach().float().cpu())
                 return hook
 
             for name in layer_inputs:
@@ -1185,8 +1187,9 @@ class FisherAwareSVD:
                 handle.remove()
 
             # Calibrate each linear layer within Fisher-selected subspace
-            for name in layer_inputs:
+            for name in list(layer_inputs.keys()):
                 if len(layer_inputs[name]) == 0:
+                    del layer_inputs[name]
                     continue
 
                 U_r, S_r, VT_r, bias = self.svd_components[layer_idx][name]
@@ -1194,63 +1197,60 @@ class FisherAwareSVD:
 
                 original_linear = self._get_module_by_name(layer, name)
 
-                # Stack all inputs: (N, in_features)
+                # Stack all inputs and move to GPU (inputs were stored on CPU)
                 X = torch.cat([x.reshape(-1, x.shape[-1]) for x in layer_inputs[name]], dim=0).to(self.device)
+                # Immediately free the CPU copies
+                del layer_inputs[name]
 
                 # Get original weight
-                W = original_linear.weight.data.float().to(self.device)  # (out_features, in_features)
+                W = original_linear.weight.data.float().to(self.device)
 
                 # Move SVD components to device
-                U_r = U_r.float().to(self.device)  # (out_features, rank)
-                S_r = S_r.float().to(self.device)  # (rank,)
-                VT_r = VT_r.float().to(self.device)  # (rank, in_features)
-                V_r = VT_r.T  # (in_features, rank)
+                U_r = U_r.float().to(self.device)
+                VT_r = VT_r.float().to(self.device)
+                V_r = VT_r.T
 
                 # Compute loss before calibration
-                W_before = (U_r * S_r) @ VT_r
+                S_r_dev = S_r.float().to(self.device)
+                W_before = (U_r * S_r_dev) @ VT_r
                 loss_before = ((X @ W_before.T - X @ W.T) ** 2).mean().item()
+                del W_before, S_r_dev
 
                 # === Subspace optimization (closed-form) ===
-                # Goal: min_M ||X @ (U_r @ M @ V_r^T - W)^T||_F^2
-                # where M ∈ R^{r×r} is the coefficient matrix
+                # Memory-efficient computation: avoid storing large intermediate matrices
 
-                # Step 1: Project inputs to V_r subspace
-                # Z = X @ V_r, shape: (N, rank)
+                # Step 1: Z = X @ V_r (N, rank) - smaller than X
                 Z = X @ V_r
 
-                # Step 2: Compute target outputs
-                # Y = X @ W^T, shape: (N, out_features)
-                Y = X @ W.T
+                # Step 2: Compute Z^T @ Z (rank × rank - small) and Z^T @ (X @ W^T) @ U_r
+                ZTZ = Z.T @ Z + 1e-6 * torch.eye(rank, device=self.device)
 
-                # Step 3: Solve for optimal M
-                # M* = U_r^T @ Y^T @ Z @ (Z^T @ Z)^{-1}
-                # Rearranged for numerical stability:
-                # M* = U_r^T @ Y^T @ Z @ inv(Z^T @ Z)
+                # Compute Z^T @ Y @ U_r = Z^T @ X @ W^T @ U_r in memory-efficient way
+                # = (Z^T @ X) @ (W^T @ U_r)
+                ZTX = Z.T @ X  # (rank, in_features)
+                WTU = W.T @ U_r  # (in_features, rank)
+                ZTY_Ur = ZTX @ WTU  # (rank, rank)
+                del ZTX, WTU
 
-                ZTZ = Z.T @ Z  # (rank, rank)
-                # Add regularization for numerical stability
-                ZTZ = ZTZ + 1e-6 * torch.eye(rank, device=ZTZ.device)
+                # Solve for M_star
+                M_star = torch.linalg.solve(ZTZ, ZTY_Ur)
+                del ZTZ, ZTY_Ur
 
-                ZTY = Z.T @ Y  # (rank, out_features)
-                # M* = (Z^T Z)^{-1} @ Z^T @ Y @ U_r = solve(ZTZ, ZTY @ U_r)
-                M_star = torch.linalg.solve(ZTZ, ZTY @ U_r)  # (rank, rank)
-
-                # Step 4: SVD of M_star to get proper SVD form
-                # Note: M_star = M^{*T}, so M^* = Q @ Λ @ P^T
-                # SVD: M_star = P @ Λ @ Q^T, therefore M^* = Q @ Λ @ P^T
+                # Step 3: SVD of M_star
                 P, Lambda, QT = torch.linalg.svd(M_star, full_matrices=False)
-                Q = QT.T  # Q = (Q^T)^T
+                Q = QT.T
+                del M_star, QT
 
-                # Step 5: Compute final SVD components
-                # W' = U_r @ M^* @ V_r^T = U_r @ Q @ Λ @ P^T @ V_r^T
-                # So: U' = U_r @ Q, S' = Λ, V'^T = P^T @ V_r^T
-                U_new = U_r @ Q  # (out_features, rank)
-                S_new = Lambda  # (rank,)
-                VT_new = P.T @ VT_r  # (rank, in_features)
+                # Step 4: Compute final SVD components
+                U_new = U_r @ Q
+                S_new = Lambda
+                VT_new = P.T @ VT_r
+                del P, Q, Lambda, U_r, VT_r, V_r
 
                 # Compute loss after calibration
                 W_after = (U_new * S_new) @ VT_new
                 loss_after = ((X @ W_after.T - X @ W.T) ** 2).mean().item()
+                del W_after, X, W, Z
 
                 if loss_before > 0:
                     improvement = (1 - loss_after / loss_before) * 100
@@ -1260,8 +1260,8 @@ class FisherAwareSVD:
                 # Update SVD components
                 self.svd_components[layer_idx][name] = (U_new.cpu(), S_new.cpu(), VT_new.cpu(),
                                                         bias.cpu() if bias is not None else None)
-
-                del X, W, Z, Y, ZTZ, ZTY, M_star, U_new, S_new, VT_new
+                del U_new, S_new, VT_new
+                torch.cuda.empty_cache()
 
             # Clear layer inputs
             del layer_inputs
