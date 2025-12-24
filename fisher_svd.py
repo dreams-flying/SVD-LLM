@@ -1040,26 +1040,30 @@ class FisherAwareSVD:
 
     def phase4_calibration(self, calib_loader: List[Dict], num_steps: int = 50) -> None:
         """
-        Phase 4: Per-linear-layer calibration using closed-form weighted SVD.
+        Phase 4: Per-linear-layer calibration within the subspace selected by Phase 3.
 
-        Key insight: Standard SVD minimizes ||W - W'||_F^2, but we want to minimize
-        ||X(W - W')^T||_F^2 where X is the input distribution. This is a weighted
-        low-rank approximation problem with a closed-form solution:
+        Key insight: Phase 2-3 selected which singular directions to keep based on
+        Fisher information. Phase 4 optimizes the coefficients WITHIN this subspace
+        to minimize reconstruction error on the input distribution.
 
-        1. Compute C = X^T @ X (covariance matrix)
-        2. Eigendecompose C = Q @ Λ @ Q^T to get C^{1/2} and C^{-1/2}
-        3. Compute weighted matrix: W_weighted = W @ C^{1/2}
-        4. Do truncated SVD on W_weighted
-        5. Transform back: new_VT = VT @ C^{-1/2}
+        Mathematical formulation:
+        - Given U_r, V_r from Phase 3 (the selected singular directions)
+        - Find optimal M ∈ R^{r×r} such that W' = U_r @ M @ V_r^T minimizes:
+          ||X @ (W' - W)^T||_F^2
 
-        This replaces 50 iterations of Adam with ONE matrix decomposition per layer,
-        achieving the same (or better) optimality with ~50x speedup.
+        Closed-form solution:
+        1. Compute Z = X @ V_r (project inputs to V_r subspace)
+        2. Compute Y = X @ W^T (target outputs)
+        3. Solve: M* = U_r^T @ Y^T @ Z @ (Z^T @ Z)^{-1}
+        4. SVD of M* to get final U', S', V'^T in proper form
+
+        This preserves the Fisher-selected directions while optimizing coefficients.
 
         Args:
             calib_loader: Calibration data loader
             num_steps: Ignored (kept for API compatibility), uses closed-form solution
         """
-        print(f"Phase 4: Per-Linear-Layer Calibration (closed-form weighted SVD)...")
+        print(f"Phase 4: Per-Linear-Layer Calibration (subspace optimization)...")
 
         # Move embedding layers to device
         if "opt" in self.model_name:
@@ -1180,13 +1184,13 @@ class FisherAwareSVD:
             for handle in handles:
                 handle.remove()
 
-            # Calibrate each linear layer using closed-form weighted SVD
+            # Calibrate each linear layer within Fisher-selected subspace
             for name in layer_inputs:
                 if len(layer_inputs[name]) == 0:
                     continue
 
-                U, S, VT, bias = self.svd_components[layer_idx][name]
-                rank = len(S)
+                U_r, S_r, VT_r, bias = self.svd_components[layer_idx][name]
+                rank = len(S_r)
 
                 original_linear = self._get_module_by_name(layer, name)
 
@@ -1196,53 +1200,51 @@ class FisherAwareSVD:
                 # Get original weight
                 W = original_linear.weight.data.float().to(self.device)  # (out_features, in_features)
 
+                # Move SVD components to device
+                U_r = U_r.float().to(self.device)  # (out_features, rank)
+                S_r = S_r.float().to(self.device)  # (rank,)
+                VT_r = VT_r.float().to(self.device)  # (rank, in_features)
+                V_r = VT_r.T  # (in_features, rank)
+
                 # Compute loss before calibration
-                W_before = (U.float().to(self.device) * S.float().to(self.device)) @ VT.float().to(self.device)
+                W_before = (U_r * S_r) @ VT_r
                 loss_before = ((X @ W_before.T - X @ W.T) ** 2).mean().item()
 
-                # === Closed-form weighted SVD ===
-                # Goal: minimize ||X @ (W' - W)^T||_F^2 subject to rank(W') = r
-                # Solution: weighted low-rank approximation using input covariance
+                # === Subspace optimization (closed-form) ===
+                # Goal: min_M ||X @ (U_r @ M @ V_r^T - W)^T||_F^2
+                # where M ∈ R^{r×r} is the coefficient matrix
 
-                # Step 1: Compute covariance matrix C = X^T @ X
-                # Use a subsample if X is too large to save memory
-                n_samples = X.shape[0]
-                if n_samples > 4096:
-                    indices = torch.randperm(n_samples)[:4096]
-                    X_sub = X[indices]
-                else:
-                    X_sub = X
+                # Step 1: Project inputs to V_r subspace
+                # Z = X @ V_r, shape: (N, rank)
+                Z = X @ V_r
 
-                C = X_sub.T @ X_sub  # (in_features, in_features)
+                # Step 2: Compute target outputs
+                # Y = X @ W^T, shape: (N, out_features)
+                Y = X @ W.T
 
-                # Step 2: Eigendecompose C = Q @ Λ @ Q^T
+                # Step 3: Solve for optimal M
+                # M* = U_r^T @ Y^T @ Z @ (Z^T @ Z)^{-1}
+                # Rearranged for numerical stability:
+                # M* = U_r^T @ Y^T @ Z @ inv(Z^T @ Z)
+
+                ZTZ = Z.T @ Z  # (rank, rank)
                 # Add regularization for numerical stability
-                C = C + 1e-6 * torch.eye(C.shape[0], device=C.device)
-                eigenvalues, Q = torch.linalg.eigh(C)
+                ZTZ = ZTZ + 1e-6 * torch.eye(rank, device=ZTZ.device)
 
-                # Clamp eigenvalues to avoid numerical issues
-                eigenvalues = eigenvalues.clamp(min=1e-8)
+                ZTY = Z.T @ Y  # (rank, out_features)
+                # M* = (Z^T Z)^{-1} @ Z^T @ Y @ U_r = solve(ZTZ, ZTY @ U_r)
+                M_star = torch.linalg.solve(ZTZ, ZTY @ U_r)  # (rank, rank)
 
-                # Step 3: Compute C^{1/2} and C^{-1/2}
-                sqrt_eigenvalues = torch.sqrt(eigenvalues)
-                inv_sqrt_eigenvalues = 1.0 / sqrt_eigenvalues
+                # Step 4: SVD of M* to get proper SVD form
+                # M* = P @ Λ @ Q^T
+                P, Lambda, QT = torch.linalg.svd(M_star, full_matrices=False)
 
-                # C_sqrt = Q @ diag(sqrt_eigenvalues) @ Q^T
-                # C_sqrt_inv = Q @ diag(inv_sqrt_eigenvalues) @ Q^T
-
-                # Step 4: Compute W @ C^{1/2} = W @ Q @ diag(sqrt_eigenvalues) @ Q^T
-                # For efficiency, we compute W @ Q @ diag(sqrt_eigenvalues)
-                W_Q = W @ Q  # (out_features, in_features)
-                W_weighted = W_Q * sqrt_eigenvalues  # Broadcasting
-
-                # Step 5: Truncated SVD on the weighted matrix
-                U_new, S_new, VT_weighted = torch.linalg.svd(W_weighted, full_matrices=False)
-                U_new = U_new[:, :rank]
-                S_new = S_new[:rank]
-                VT_weighted = VT_weighted[:rank, :]
-
-                # Step 6: Transform back VT: new_VT = VT_weighted @ diag(inv_sqrt_eigenvalues) @ Q^T
-                VT_new = (VT_weighted * inv_sqrt_eigenvalues) @ Q.T
+                # Step 5: Compute final SVD components
+                # W' = U_r @ M* @ V_r^T = U_r @ P @ Λ @ Q^T @ V_r^T
+                # So: U' = U_r @ P, S' = Λ, V'^T = Q^T @ V_r^T
+                U_new = U_r @ P  # (out_features, rank)
+                S_new = Lambda  # (rank,)
+                VT_new = QT @ VT_r  # (rank, in_features)
 
                 # Compute loss after calibration
                 W_after = (U_new * S_new) @ VT_new
@@ -1257,7 +1259,7 @@ class FisherAwareSVD:
                 self.svd_components[layer_idx][name] = (U_new.cpu(), S_new.cpu(), VT_new.cpu(),
                                                         bias.cpu() if bias is not None else None)
 
-                del X, W, C, Q, eigenvalues, W_weighted, U_new, S_new, VT_new
+                del X, W, Z, Y, ZTZ, ZTY, M_star, U_new, S_new, VT_new
 
             # Clear layer inputs
             del layer_inputs
