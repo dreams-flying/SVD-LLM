@@ -871,15 +871,13 @@ class FisherAwareSVD:
         # Calculate total singular values and target count
         total_sv_count = len(all_scores)
 
-        # TRUE GLOBAL TRUNCATION:
-        # 1. Compute total budget based on target compression ratio
-        # 2. Use relaxed per-layer limits (allow layers to keep more if globally important)
-        # 3. Let greedy selection naturally allocate budget to important layers
+        # CORRECTED GLOBAL TRUNCATION:
+        # Key insight: Fisher should determine HOW MANY to keep per layer,
+        # but within each layer, ALWAYS keep TOP-k (contiguous) singular values!
+        # Non-contiguous selection destroys the model.
 
-        # Step 1: Calculate target budget for each layer and total budget
-        layer_target_rank = {}  # Target rank for budget calculation
-        layer_relaxed_max = {}  # Relaxed max (original rank - no constraint)
-        layer_min_rank = {}
+        # Step 1: Calculate total budget and per-layer targets
+        layer_target_rank = {}
         total_original_params = 0
         total_budget = 0
 
@@ -890,62 +888,101 @@ class FisherAwareSVD:
                 total_original_params += m * n
                 original_rank = len(S)
 
-                # Target rank for BUDGET calculation (what we'd allocate if uniform)
+                # Target rank for this projection
                 target_rank = int(m * n * ratio / (m + n))
-                target_rank = max(1, min(target_rank, original_rank))
+                target_rank = max(min_rank, min(target_rank, original_rank))
                 total_budget += target_rank
-
-                # Relaxed max: allow keeping up to original rank
-                # This enables truly global allocation
-                layer_relaxed_max[(layer_idx, name)] = original_rank
-
-                # Minimum rank constraint: at least min_rank or 10% of original
-                min_r = min(min_rank, max(1, int(original_rank * 0.1)))
-                min_r = min(min_r, target_rank)
-
                 layer_target_rank[(layer_idx, name)] = target_rank
-                layer_min_rank[(layer_idx, name)] = min_r
 
         print(f"  Total budget (target singular values): {total_budget}")
         print(f"  Total singular values available: {total_sv_count}")
 
-        # Step 2: Pre-allocate minimum ranks
+        # Step 2: Compute per-projection importance for budget allocation
+        # Use sum of top-k scores as projection importance
+        projection_importance = {}
+        for layer_idx in self.svd_components:
+            # Layer factor for later layers
+            layer_position = layer_idx / (num_layers - 1) if num_layers > 1 else 0.5
+            layer_factor = 0.5 + layer_position
+
+            for name in self.svd_components[layer_idx]:
+                scores = importance_scores[layer_idx][name]
+                target = layer_target_rank[(layer_idx, name)]
+                # Use sum of top-k scores (what we'd keep with uniform allocation)
+                top_k_scores = torch.topk(scores, min(target, len(scores))).values
+                importance = top_k_scores.sum().item() * layer_factor
+                projection_importance[(layer_idx, name)] = importance
+
+        total_importance = sum(projection_importance.values())
+
+        # Step 3: Allocate budget proportionally based on importance
+        # But constrain to reasonable range (50% - 150% of target)
+        layer_allocated_rank = {}
+
+        for key in layer_target_rank:
+            layer_idx, name = key
+            target = layer_target_rank[key]
+            U, S, VT, _ = self.svd_components[layer_idx][name]
+            original_rank = len(S)
+
+            # Proportional allocation
+            if total_importance > 0:
+                share = projection_importance[key] / total_importance
+                allocated = int(share * total_budget)
+            else:
+                allocated = target
+
+            # Constrain to 50%-150% of target (not too extreme)
+            min_alloc = max(min_rank, int(target * 0.5))
+            max_alloc = min(original_rank, int(target * 1.5))
+            allocated = max(min_alloc, min(allocated, max_alloc))
+
+            layer_allocated_rank[key] = allocated
+
+        # Step 4: Adjust to match total budget exactly
+        total_allocated = sum(layer_allocated_rank.values())
+        diff = total_budget - total_allocated
+
+        # Sort by importance for adjustment
+        sorted_keys = sorted(layer_allocated_rank.keys(),
+                            key=lambda k: projection_importance.get(k, 0), reverse=True)
+
+        # Adjust high-importance projections first (for adding) or low-importance (for removing)
+        idx = 0
+        while diff != 0 and idx < len(sorted_keys) * 3:
+            if diff > 0:
+                # Add to high-importance projections
+                key = sorted_keys[idx % len(sorted_keys)]
+            else:
+                # Remove from low-importance projections
+                key = sorted_keys[-(idx % len(sorted_keys)) - 1]
+
+            layer_idx, name = key
+            U, S, VT, _ = self.svd_components[layer_idx][name]
+            original_rank = len(S)
+            target = layer_target_rank[key]
+
+            if diff > 0 and layer_allocated_rank[key] < min(original_rank, int(target * 1.5)):
+                layer_allocated_rank[key] += 1
+                diff -= 1
+            elif diff < 0 and layer_allocated_rank[key] > max(min_rank, int(target * 0.5)):
+                layer_allocated_rank[key] -= 1
+                diff += 1
+            idx += 1
+
+        # Step 5: Select TOP-k singular values for each projection (ALWAYS CONTIGUOUS!)
         kept_indices: Dict[int, Dict[str, set]] = defaultdict(lambda: defaultdict(set))
         kept_count = 0
 
         for layer_idx in self.svd_components:
             for name in self.svd_components[layer_idx]:
-                min_r = layer_min_rank[(layer_idx, name)]
-                layer_scores = importance_scores[layer_idx][name]
-                top_indices = torch.argsort(layer_scores, descending=True)[:min_r]
-                for idx in top_indices:
-                    kept_indices[layer_idx][name].add(idx.item())
+                k = layer_allocated_rank[(layer_idx, name)]
+                # CRITICAL: Always keep indices 0 to k-1 (top singular values)
+                for i in range(k):
+                    kept_indices[layer_idx][name].add(i)
                     kept_count += 1
 
-        remaining_budget = total_budget - kept_count
-
-        print(f"  Pre-allocated {kept_count} singular values for minimum ranks")
-        print(f"  Remaining budget: {remaining_budget}")
-
-        # Step 3: Fill remaining budget using TRUE global selection
-        # No per-layer max constraint (only relaxed max = original rank)
-        if remaining_budget > 0:
-            for norm_score, layer_idx, name, idx, orig_score in all_scores:
-                if remaining_budget <= 0:
-                    break
-
-                # Skip if already kept
-                if idx in kept_indices[layer_idx][name]:
-                    continue
-
-                current_kept = len(kept_indices[layer_idx][name])
-                relaxed_max = layer_relaxed_max.get((layer_idx, name), 0)
-
-                # Only check relaxed max (original rank), not target ratio
-                if current_kept < relaxed_max:
-                    kept_indices[layer_idx][name].add(idx)
-                    kept_count += 1
-                    remaining_budget -= 1
+        print(f"  Allocated {kept_count} singular values (budget: {total_budget})")
 
         # Analyze allocation distribution
         layer_allocation = {}
@@ -960,7 +997,8 @@ class FisherAwareSVD:
         # Print allocation analysis
         under_target = sum(1 for l, (actual, target) in layer_allocation.items() if actual < target)
         over_target = sum(1 for l, (actual, target) in layer_allocation.items() if actual > target)
-        print(f"  Allocation: {under_target} layers under target, {over_target} layers over target")
+        at_target = len(layer_allocation) - under_target - over_target
+        print(f"  Allocation: {under_target} layers under, {at_target} at, {over_target} over target")
 
         # Show extreme examples
         if layer_allocation:
