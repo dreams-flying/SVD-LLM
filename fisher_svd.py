@@ -922,18 +922,55 @@ class FisherAwareSVD:
         print(f"  Total original params: {total_original_params:,}")
         print(f"  Target params (ratio={ratio:.0%}): {target_params:,}")
 
-        # Step 2: Initialize - all layers start with k=0
-        # Each layer MUST have at least min_rank, so pre-allocate that
-        layer_allocated_rank = {key: 0 for key in projection_info}
+        # Step 2: Calculate per-projection minimum and maximum ranks
+        # CRITICAL: Each projection needs a MINIMUM allocation to avoid information bottleneck
+        # Even unimportant layers must pass information through!
+        projection_min_rank = {}
+        projection_max_rank = {}
+
+        for key, info in projection_info.items():
+            m, n = info['m'], info['n']
+            original_rank = info['original_rank']
+
+            # Uniform allocation (what we'd give with no Fisher)
+            uniform_rank = int(m * n * ratio / (m + n))
+            uniform_rank = max(min_rank, min(uniform_rank, original_rank))
+
+            # MINIMUM: At least 30% of uniform allocation
+            # This prevents any projection from becoming an information bottleneck
+            min_alloc = max(min_rank, int(uniform_rank * 0.3))
+
+            # MAXIMUM: At most 200% of uniform allocation
+            max_alloc = min(original_rank, int(uniform_rank * 2.0))
+
+            projection_min_rank[key] = min_alloc
+            projection_max_rank[key] = max_alloc
+
+            # Store uniform rank for later comparison
+            info['uniform_rank'] = uniform_rank
+
+        # Step 3: Pre-allocate MINIMUM ranks (mandatory)
+        # This ensures every projection has reasonable capacity
+        layer_allocated_rank = {}
         current_params = 0
 
-        # Step 3: Pre-allocate minimum ranks (mandatory)
         for key, info in projection_info.items():
-            min_r = min(min_rank, info['original_rank'])
+            min_r = projection_min_rank[key]
             layer_allocated_rank[key] = min_r
             current_params += min_r * info['cost']
 
-        print(f"  After min_rank allocation: {current_params:,} params")
+        print(f"  After min allocation (30% of uniform): {current_params:,} params ({current_params/total_original_params*100:.1f}%)")
+
+        # Check if minimum allocation already exceeds budget
+        if current_params > target_params:
+            print(f"  WARNING: Minimum allocation exceeds budget! Reducing proportionally...")
+            scale = target_params / current_params * 0.95
+            current_params = 0
+            for key, info in projection_info.items():
+                min_r = max(min_rank, int(projection_min_rank[key] * scale))
+                layer_allocated_rank[key] = min_r
+                current_params += min_r * info['cost']
+            print(f"  After scaling: {current_params:,} params")
 
         # Step 4: Build priority queue for remaining allocation
         # Use negative score for max-heap behavior (heapq is min-heap)
@@ -942,7 +979,8 @@ class FisherAwareSVD:
 
         for key, info in projection_info.items():
             current_k = layer_allocated_rank[key]
-            if current_k < info['original_rank']:
+            max_k = projection_max_rank[key]
+            if current_k < max_k:
                 # Next candidate is index current_k
                 score = info['scores'][current_k].item()
                 cost = info['cost']
@@ -951,16 +989,21 @@ class FisherAwareSVD:
                 # Push negative for max-heap behavior
                 heapq.heappush(heap, (-priority, score, key[0], key[1], current_k))
 
-        # Step 5: Greedy allocation
+        # Step 5: Greedy allocation (respecting max constraints)
         allocations_made = 0
         while heap and current_params < target_params:
             neg_priority, score, layer_idx, name, k = heapq.heappop(heap)
             key = (layer_idx, name)
             info = projection_info[key]
+            max_k = projection_max_rank[key]
 
             # Check if this is still the current frontier
             if layer_allocated_rank[key] != k:
                 # This entry is stale (already allocated), skip
+                continue
+
+            # Check if we've hit max for this projection
+            if k >= max_k:
                 continue
 
             # Check if adding this SV exceeds budget
@@ -973,9 +1016,9 @@ class FisherAwareSVD:
             current_params += info['cost']
             allocations_made += 1
 
-            # Push next candidate from this layer
+            # Push next candidate from this layer (if under max)
             next_k = k + 1
-            if next_k < info['original_rank']:
+            if next_k < max_k:
                 next_score = info['scores'][next_k].item()
                 next_priority = next_score / info['cost']
                 heapq.heappush(heap, (-next_priority, next_score, layer_idx, name, next_k))
