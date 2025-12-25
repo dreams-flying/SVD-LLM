@@ -1499,6 +1499,19 @@ class FisherAwareSVD:
 
                 # Solve for M_star
                 M_star = torch.linalg.solve(ZTZ, ZTY_Ur)
+
+                # Debug: Check if M_star is doing something useful
+                if layer_idx < 3:
+                    # Check condition number of ZTZ
+                    cond = torch.linalg.cond(ZTZ).item()
+                    # Check how far M_star is from identity-scaled matrix
+                    # If M_star ≈ diag(S_r), calibration isn't helping
+                    M_diag = torch.diag(M_star.diag())
+                    off_diag_energy = ((M_star - M_diag) ** 2).sum().item()
+                    diag_energy = (M_star.diag() ** 2).sum().item()
+                    off_diag_ratio = off_diag_energy / (diag_energy + 1e-10) * 100
+                    print(f"    L{layer_idx} {name}: ZTZ cond={cond:.1e}, M off-diag energy={off_diag_ratio:.1f}%")
+
                 del ZTZ, ZTY_Ur
 
                 # Step 3: SVD of M_star
@@ -1522,6 +1535,10 @@ class FisherAwareSVD:
                     improvement = (1 - loss_after / loss_before) * 100
                     total_improvement += improvement
                     calibrated_layers += 1
+
+                    # Debug: Show per-layer improvement for first few layers
+                    if layer_idx < 3:
+                        print(f"    L{layer_idx} {name}: before={loss_before:.6f} after={loss_after:.6f} improvement={improvement:.1f}%")
 
                 # Update SVD components
                 self.svd_components[layer_idx][name] = (U_new.cpu(), S_new.cpu(), VT_new.cpu(),
