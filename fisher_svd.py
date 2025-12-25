@@ -1064,11 +1064,16 @@ class FisherAwareSVD:
 
         # Phase 4: Layer-wise Calibration (optimize SVD factors to minimize reconstruction error)
         if calibration_steps > 0:
+            print(f"Starting Phase 4 calibration with {calibration_steps} steps...")
             try:
                 self.phase4_calibration(calib_loader, calibration_steps)
-            except RuntimeError as e:
-                print(f"  Warning: Phase 4 calibration failed ({e}), skipping...")
+            except Exception as e:
+                print(f"  Warning: Phase 4 calibration failed ({type(e).__name__}: {e}), skipping...")
                 print("  Proceeding without calibration.")
+                import traceback
+                traceback.print_exc()
+        else:
+            print("Phase 4: Skipped (calibration_steps=0)")
 
         # Apply compression to model
         self.apply_compression(ratio)
