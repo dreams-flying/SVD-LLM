@@ -692,11 +692,13 @@ class FisherAwareSVD:
         """
         Compute importance scores for all singular values.
 
-        Scoring formula (Fisher-based):
-        Score_i = σ_i² × F_ii
+        Scoring formula (Fisher-based with regularization):
+        Score_i = σ_i² × (F_ii + α × mean(F))
+
+        Regularization helps stabilize noisy Fisher estimates.
 
         Note: layer_factor is NOT applied here to avoid cancellation by normalization.
-        It's applied AFTER per-projection normalization in phase3_global_truncation.
+        It's applied AFTER per-layer normalization in phase3_global_truncation.
 
         Returns:
             Dictionary of importance scores per layer and sublayer
@@ -704,6 +706,9 @@ class FisherAwareSVD:
         importance_scores = {}
         fisher_used = 0
         fisher_fallback = 0
+
+        # Regularization coefficient: balance Fisher signal vs magnitude prior
+        fisher_reg_alpha = 0.1
 
         for layer_idx in self.svd_components:
             layer_scores = {}
@@ -713,9 +718,10 @@ class FisherAwareSVD:
 
                 if layer_idx in self.fisher_info and name in self.fisher_info[layer_idx]:
                     F = self.fisher_info[layer_idx][name]
-                    # Score_i = σ_i² × F_ii (no layer_factor here)
-                    # Add small epsilon to F to avoid all-zero scores
-                    F_regularized = F + 1e-10
+                    # Regularization: Add α × mean(F) to stabilize noisy estimates
+                    # This blends Fisher signal with a uniform prior
+                    F_mean = F.mean().item() + 1e-10
+                    F_regularized = F + fisher_reg_alpha * F_mean
                     scores = S.pow(2) * F_regularized
                     fisher_used += 1
                 else:
@@ -727,6 +733,7 @@ class FisherAwareSVD:
             importance_scores[layer_idx] = layer_scores
 
         print(f"  Importance scores: {fisher_used} with Fisher, {fisher_fallback} fallback to magnitude")
+        print(f"  Fisher regularization alpha: {fisher_reg_alpha}")
         return importance_scores
 
     def phase3_global_truncation(self, ratio: float, min_rank: int = 16) -> None:
@@ -751,12 +758,22 @@ class FisherAwareSVD:
 
         num_layers = len(self.layers)
 
-        # Layer-wise normalization for balanced truncation
-        # Then apply layer_factor AFTER normalization (so it doesn't cancel out)
-        # This prevents some layers from dominating the global selection
+        # Strategy: Per-LAYER normalization (not per-projection)
+        # This preserves relative importance between projections (q/k/v/o) within a layer
+        # But normalizes across layers for balanced global selection
         normalized_scores = {}
+
         for layer_idx in importance_scores:
             normalized_scores[layer_idx] = {}
+
+            # Collect all scores in this layer to compute layer-level norm
+            all_layer_scores = []
+            for name in importance_scores[layer_idx]:
+                all_layer_scores.append(importance_scores[layer_idx][name])
+
+            # Concatenate and compute L2 norm across the entire layer
+            all_scores_tensor = torch.cat(all_layer_scores)
+            layer_norm = torch.norm(all_scores_tensor).item() + 1e-10
 
             # Layer position factor: later layers get higher weight
             # This protects later layers which are more important for generation quality
@@ -765,11 +782,10 @@ class FisherAwareSVD:
 
             for name in importance_scores[layer_idx]:
                 scores = importance_scores[layer_idx][name]
-                # Step 1: Normalize by layer's total importance (L2 norm)
-                layer_norm = torch.norm(scores).item() + 1e-10
+                # Normalize by LAYER's total importance (not projection)
+                # This preserves relative importance between q/k/v/o projections
                 normalized = scores / layer_norm
-                # Step 2: Apply layer_factor AFTER normalization
-                # This ensures layer_factor affects cross-layer ranking
+                # Apply layer_factor AFTER normalization
                 normalized = normalized * layer_factor
                 normalized_scores[layer_idx][name] = normalized
 
@@ -1259,14 +1275,15 @@ class FisherAwareSVD:
 
                 # Step 3: SVD of M_star
                 P, Lambda, QT = torch.linalg.svd(M_star, full_matrices=False)
-                Q = QT.T
-                del M_star, QT
+                del M_star
 
                 # Step 4: Compute final SVD components
-                U_new = U_r @ Q
+                # If M_star = P @ Λ @ Q^T, then:
+                # W' = U_r @ M_star @ VT_r = U_r @ P @ Λ @ Q^T @ VT_r = (U_r @ P) @ Λ @ (Q^T @ VT_r)
+                U_new = U_r @ P
                 S_new = Lambda
-                VT_new = P.T @ VT_r
-                del P, Q, Lambda, U_r, VT_r, V_r
+                VT_new = QT @ VT_r
+                del P, Lambda, QT, U_r, VT_r, V_r
 
                 # Compute loss after calibration
                 W_after = (U_new * S_new) @ VT_new
