@@ -1519,11 +1519,13 @@ class FisherAwareSVD:
                 del M_star
 
                 # Step 4: Compute final SVD components
-                # If M_star = P @ Λ @ Q^T, then:
-                # W' = U_r @ M_star @ VT_r = U_r @ P @ Λ @ Q^T @ VT_r = (U_r @ P) @ Λ @ (Q^T @ VT_r)
-                U_new = U_r @ P
+                # CORRECTED: M_star is actually M^T (from the least squares solution)
+                # M_star = M^T = P @ Λ @ Q^T
+                # Therefore: M = Q @ Λ @ P^T
+                # W' = U_r @ M @ VT_r = U_r @ Q @ Λ @ P^T @ VT_r = (U_r @ Q) @ Λ @ (P^T @ VT_r)
+                U_new = U_r @ QT.T  # QT.T = Q
                 S_new = Lambda
-                VT_new = QT @ VT_r
+                VT_new = P.T @ VT_r  # P^T @ VT_r
                 del P, Lambda, QT, U_r, VT_r, V_r
 
                 # Compute loss after calibration
