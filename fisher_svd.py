@@ -871,143 +871,166 @@ class FisherAwareSVD:
         # Calculate total singular values and target count
         total_sv_count = len(all_scores)
 
-        # CORRECTED GLOBAL TRUNCATION:
-        # Key insight: Fisher should determine HOW MANY to keep per layer,
-        # but within each layer, ALWAYS keep TOP-k (contiguous) singular values!
-        # Non-contiguous selection destroys the model.
+        # ================================================================
+        # GREEDY RANK ALLOCATION based on MARGINAL UTILITY
+        # ================================================================
+        # Core idea: "Each +1 rank costs (m+n) params. Which layer gives best ROI?"
+        #
+        # Key insight: We MUST keep top-k (contiguous), so we only compete
+        # at each layer's "current frontier" (next unselected SV).
+        #
+        # Algorithm:
+        # 1. Initialize all layers with k=0
+        # 2. Priority queue with (priority, layer, current_k) where
+        #    priority = Score[k] / Cost, Cost = m + n
+        # 3. Greedy: pop best, allocate, push next candidate
+        # 4. Stop when param budget exhausted
+        # ================================================================
 
-        # Step 1: Calculate total budget and per-layer targets
-        layer_target_rank = {}
+        import heapq
+
+        # Step 1: Calculate total parameter budget
         total_original_params = 0
-        total_budget = 0
+        projection_info = {}  # (layer_idx, name) -> (m, n, original_rank, scores)
 
         for layer_idx in self.svd_components:
             for name in self.svd_components[layer_idx]:
                 U, S, VT, _ = self.svd_components[layer_idx][name]
                 m, n = U.shape[0], VT.shape[1]
-                total_original_params += m * n
                 original_rank = len(S)
+                total_original_params += m * n
 
-                # Target rank for this projection
-                target_rank = int(m * n * ratio / (m + n))
-                target_rank = max(min_rank, min(target_rank, original_rank))
-                total_budget += target_rank
-                layer_target_rank[(layer_idx, name)] = target_rank
-
-        print(f"  Total budget (target singular values): {total_budget}")
-        print(f"  Total singular values available: {total_sv_count}")
-
-        # Step 2: Compute per-projection importance for budget allocation
-        # Use sum of top-k scores as projection importance
-        projection_importance = {}
-        for layer_idx in self.svd_components:
-            # Layer factor for later layers
-            layer_position = layer_idx / (num_layers - 1) if num_layers > 1 else 0.5
-            layer_factor = 0.5 + layer_position
-
-            for name in self.svd_components[layer_idx]:
+                # Get importance scores for this projection
                 scores = importance_scores[layer_idx][name]
-                target = layer_target_rank[(layer_idx, name)]
-                # Use sum of top-k scores (what we'd keep with uniform allocation)
-                top_k_scores = torch.topk(scores, min(target, len(scores))).values
-                importance = top_k_scores.sum().item() * layer_factor
-                projection_importance[(layer_idx, name)] = importance
 
-        total_importance = sum(projection_importance.values())
+                # Apply layer factor to scores
+                layer_position = layer_idx / (num_layers - 1) if num_layers > 1 else 0.5
+                layer_factor = 0.5 + layer_position
+                weighted_scores = scores * layer_factor
 
-        # Step 3: Allocate budget proportionally based on importance
-        # But constrain to reasonable range (50% - 150% of target)
-        layer_allocated_rank = {}
+                projection_info[(layer_idx, name)] = {
+                    'm': m,
+                    'n': n,
+                    'cost': m + n,  # Cost per singular value
+                    'original_rank': original_rank,
+                    'scores': weighted_scores,
+                    'layer_factor': layer_factor
+                }
 
-        for key in layer_target_rank:
-            layer_idx, name = key
-            target = layer_target_rank[key]
-            U, S, VT, _ = self.svd_components[layer_idx][name]
-            original_rank = len(S)
+        # Target parameter budget
+        target_params = int(total_original_params * ratio)
+        print(f"  Total original params: {total_original_params:,}")
+        print(f"  Target params (ratio={ratio:.0%}): {target_params:,}")
 
-            # Proportional allocation
-            if total_importance > 0:
-                share = projection_importance[key] / total_importance
-                allocated = int(share * total_budget)
-            else:
-                allocated = target
+        # Step 2: Initialize - all layers start with k=0
+        # Each layer MUST have at least min_rank, so pre-allocate that
+        layer_allocated_rank = {key: 0 for key in projection_info}
+        current_params = 0
 
-            # Constrain to 50%-150% of target (not too extreme)
-            min_alloc = max(min_rank, int(target * 0.5))
-            max_alloc = min(original_rank, int(target * 1.5))
-            allocated = max(min_alloc, min(allocated, max_alloc))
+        # Step 3: Pre-allocate minimum ranks (mandatory)
+        for key, info in projection_info.items():
+            min_r = min(min_rank, info['original_rank'])
+            layer_allocated_rank[key] = min_r
+            current_params += min_r * info['cost']
 
-            layer_allocated_rank[key] = allocated
+        print(f"  After min_rank allocation: {current_params:,} params")
 
-        # Step 4: Adjust to match total budget exactly
-        total_allocated = sum(layer_allocated_rank.values())
-        diff = total_budget - total_allocated
+        # Step 4: Build priority queue for remaining allocation
+        # Use negative score for max-heap behavior (heapq is min-heap)
+        # Priority = Score[k] / Cost (marginal utility per parameter)
+        heap = []
 
-        # Sort by importance for adjustment
-        sorted_keys = sorted(layer_allocated_rank.keys(),
-                            key=lambda k: projection_importance.get(k, 0), reverse=True)
+        for key, info in projection_info.items():
+            current_k = layer_allocated_rank[key]
+            if current_k < info['original_rank']:
+                # Next candidate is index current_k
+                score = info['scores'][current_k].item()
+                cost = info['cost']
+                # Marginal utility = score / cost
+                priority = score / cost
+                # Push negative for max-heap behavior
+                heapq.heappush(heap, (-priority, score, key[0], key[1], current_k))
 
-        # Adjust high-importance projections first (for adding) or low-importance (for removing)
-        idx = 0
-        while diff != 0 and idx < len(sorted_keys) * 3:
-            if diff > 0:
-                # Add to high-importance projections
-                key = sorted_keys[idx % len(sorted_keys)]
-            else:
-                # Remove from low-importance projections
-                key = sorted_keys[-(idx % len(sorted_keys)) - 1]
+        # Step 5: Greedy allocation
+        allocations_made = 0
+        while heap and current_params < target_params:
+            neg_priority, score, layer_idx, name, k = heapq.heappop(heap)
+            key = (layer_idx, name)
+            info = projection_info[key]
 
-            layer_idx, name = key
-            U, S, VT, _ = self.svd_components[layer_idx][name]
-            original_rank = len(S)
-            target = layer_target_rank[key]
+            # Check if this is still the current frontier
+            if layer_allocated_rank[key] != k:
+                # This entry is stale (already allocated), skip
+                continue
 
-            if diff > 0 and layer_allocated_rank[key] < min(original_rank, int(target * 1.5)):
-                layer_allocated_rank[key] += 1
-                diff -= 1
-            elif diff < 0 and layer_allocated_rank[key] > max(min_rank, int(target * 0.5)):
-                layer_allocated_rank[key] -= 1
-                diff += 1
-            idx += 1
+            # Check if adding this SV exceeds budget
+            if current_params + info['cost'] > target_params:
+                # Would exceed budget, but continue looking for cheaper options
+                continue
 
-        # Step 5: Select TOP-k singular values for each projection (ALWAYS CONTIGUOUS!)
+            # Allocate this singular value
+            layer_allocated_rank[key] = k + 1
+            current_params += info['cost']
+            allocations_made += 1
+
+            # Push next candidate from this layer
+            next_k = k + 1
+            if next_k < info['original_rank']:
+                next_score = info['scores'][next_k].item()
+                next_priority = next_score / info['cost']
+                heapq.heappush(heap, (-next_priority, next_score, layer_idx, name, next_k))
+
+        print(f"  Greedy allocations: {allocations_made}")
+        print(f"  Final params: {current_params:,} ({current_params/total_original_params*100:.2f}%)")
+
+        # Step 6: Build kept_indices (always contiguous: 0 to k-1)
         kept_indices: Dict[int, Dict[str, set]] = defaultdict(lambda: defaultdict(set))
         kept_count = 0
 
-        for layer_idx in self.svd_components:
-            for name in self.svd_components[layer_idx]:
-                k = layer_allocated_rank[(layer_idx, name)]
-                # CRITICAL: Always keep indices 0 to k-1 (top singular values)
-                for i in range(k):
-                    kept_indices[layer_idx][name].add(i)
-                    kept_count += 1
+        for key, k in layer_allocated_rank.items():
+            layer_idx, name = key
+            for i in range(k):
+                kept_indices[layer_idx][name].add(i)
+                kept_count += 1
 
-        print(f"  Allocated {kept_count} singular values (budget: {total_budget})")
+        print(f"  Total singular values kept: {kept_count}")
 
         # Analyze allocation distribution
         layer_allocation = {}
+        layer_target_rank = {}  # For comparison
+
         for layer_idx in self.svd_components:
             layer_total = 0
             layer_target = 0
             for name in self.svd_components[layer_idx]:
-                layer_total += len(kept_indices[layer_idx][name])
-                layer_target += layer_target_rank[(layer_idx, name)]
+                key = (layer_idx, name)
+                info = projection_info[key]
+                m, n = info['m'], info['n']
+                # What would uniform allocation give?
+                uniform_rank = int(m * n * ratio / (m + n))
+                uniform_rank = max(min_rank, min(uniform_rank, info['original_rank']))
+
+                layer_total += layer_allocated_rank[key]
+                layer_target += uniform_rank
+                layer_target_rank[key] = uniform_rank
+
             layer_allocation[layer_idx] = (layer_total, layer_target)
 
         # Print allocation analysis
-        under_target = sum(1 for l, (actual, target) in layer_allocation.items() if actual < target)
-        over_target = sum(1 for l, (actual, target) in layer_allocation.items() if actual > target)
+        under_target = sum(1 for l, (actual, target) in layer_allocation.items() if actual < target * 0.9)
+        over_target = sum(1 for l, (actual, target) in layer_allocation.items() if actual > target * 1.1)
         at_target = len(layer_allocation) - under_target - over_target
-        print(f"  Allocation: {under_target} layers under, {at_target} at, {over_target} over target")
+        print(f"  Allocation: {under_target} layers <90%, {at_target} ~100%, {over_target} >110% of uniform")
 
         # Show extreme examples
         if layer_allocation:
-            sorted_layers = sorted(layer_allocation.items(), key=lambda x: x[1][0]/x[1][1] if x[1][1] > 0 else 0)
+            sorted_layers = sorted(layer_allocation.items(),
+                                   key=lambda x: x[1][0]/x[1][1] if x[1][1] > 0 else 0)
             if len(sorted_layers) >= 2:
                 min_layer, (min_actual, min_target) = sorted_layers[0]
                 max_layer, (max_actual, max_target) = sorted_layers[-1]
-                print(f"  Layer {min_layer}: {min_actual}/{min_target} ({min_actual/min_target*100:.0f}% of target)")
-                print(f"  Layer {max_layer}: {max_actual}/{max_target} ({max_actual/max_target*100:.0f}% of target)")
+                print(f"  Layer {min_layer}: {min_actual}/{min_target} ({min_actual/min_target*100:.0f}% of uniform)")
+                print(f"  Layer {max_layer}: {max_actual}/{max_target} ({max_actual/max_target*100:.0f}% of uniform)")
 
         # Truncate SVD components
         truncation_samples = []
