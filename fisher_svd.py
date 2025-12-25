@@ -692,10 +692,11 @@ class FisherAwareSVD:
         """
         Compute importance scores for all singular values.
 
-        Enhanced scoring formula:
-        Score_i = σ_i² × F_ii × layer_factor
+        Scoring formula (Fisher-based):
+        Score_i = σ_i² × F_ii
 
-        Where layer_factor increases for later layers (more important for generation).
+        Note: layer_factor is NOT applied here to avoid cancellation by normalization.
+        It's applied AFTER per-projection normalization in phase3_global_truncation.
 
         Returns:
             Dictionary of importance scores per layer and sublayer
@@ -704,30 +705,22 @@ class FisherAwareSVD:
         fisher_used = 0
         fisher_fallback = 0
 
-        num_layers = len(self.layers)
-
         for layer_idx in self.svd_components:
             layer_scores = {}
-
-            # Layer position factor: later layers get higher weight
-            # Using smooth sigmoid-like curve: factor ranges from 0.5 to 1.5
-            # This protects later layers which are more important for generation quality
-            layer_position = layer_idx / (num_layers - 1) if num_layers > 1 else 0.5
-            layer_factor = 0.5 + layer_position  # Range: [0.5, 1.5]
 
             for name in self.svd_components[layer_idx]:
                 U, S, VT, bias = self.svd_components[layer_idx][name]
 
                 if layer_idx in self.fisher_info and name in self.fisher_info[layer_idx]:
                     F = self.fisher_info[layer_idx][name]
-                    # Score_i = σ_i² × F_ii × layer_factor
+                    # Score_i = σ_i² × F_ii (no layer_factor here)
                     # Add small epsilon to F to avoid all-zero scores
                     F_regularized = F + 1e-10
-                    scores = S.pow(2) * F_regularized * layer_factor
+                    scores = S.pow(2) * F_regularized
                     fisher_used += 1
                 else:
-                    # Fallback to magnitude-based scoring with layer factor
-                    scores = S.pow(2) * layer_factor
+                    # Fallback to magnitude-based scoring
+                    scores = S.pow(2)
                     fisher_fallback += 1
 
                 layer_scores[name] = scores
@@ -756,17 +749,32 @@ class FisherAwareSVD:
         # Compute importance scores: Score_i = σ_i² × F_ii
         importance_scores = self.compute_importance_scores()
 
+        num_layers = len(self.layers)
+
         # Layer-wise normalization for balanced truncation
+        # Then apply layer_factor AFTER normalization (so it doesn't cancel out)
         # This prevents some layers from dominating the global selection
         normalized_scores = {}
         for layer_idx in importance_scores:
             normalized_scores[layer_idx] = {}
+
+            # Layer position factor: later layers get higher weight
+            # This protects later layers which are more important for generation quality
+            layer_position = layer_idx / (num_layers - 1) if num_layers > 1 else 0.5
+            layer_factor = 0.5 + layer_position  # Range: [0.5, 1.5]
+
             for name in importance_scores[layer_idx]:
                 scores = importance_scores[layer_idx][name]
-                # Normalize by layer's total importance (L2 norm)
+                # Step 1: Normalize by layer's total importance (L2 norm)
                 layer_norm = torch.norm(scores).item() + 1e-10
                 normalized = scores / layer_norm
+                # Step 2: Apply layer_factor AFTER normalization
+                # This ensures layer_factor affects cross-layer ranking
+                normalized = normalized * layer_factor
                 normalized_scores[layer_idx][name] = normalized
+
+        # Print layer factor info for debugging
+        print(f"  Layer factors: L0={0.5:.2f}, L{num_layers//2}={0.5 + 0.5:.2f}, L{num_layers-1}={1.5:.2f}")
 
         # Collect all scores with their identifiers (layer_idx, name, singular_value_idx)
         # Use normalized scores for ranking but store original scores for debugging
