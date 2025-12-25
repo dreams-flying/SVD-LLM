@@ -710,6 +710,10 @@ class FisherAwareSVD:
         # Regularization coefficient: balance Fisher signal vs magnitude prior
         fisher_reg_alpha = 0.1
 
+        # Collect statistics for diagnostics
+        fisher_stats = {'min': float('inf'), 'max': 0, 'mean': 0, 'count': 0}
+        sigma_stats = {'min': float('inf'), 'max': 0, 'mean': 0, 'count': 0}
+
         for layer_idx in self.svd_components:
             layer_scores = {}
 
@@ -718,6 +722,19 @@ class FisherAwareSVD:
 
                 if layer_idx in self.fisher_info and name in self.fisher_info[layer_idx]:
                     F = self.fisher_info[layer_idx][name]
+
+                    # Collect Fisher statistics
+                    fisher_stats['min'] = min(fisher_stats['min'], F.min().item())
+                    fisher_stats['max'] = max(fisher_stats['max'], F.max().item())
+                    fisher_stats['mean'] += F.sum().item()
+                    fisher_stats['count'] += len(F)
+
+                    # Collect sigma statistics
+                    sigma_stats['min'] = min(sigma_stats['min'], S.min().item())
+                    sigma_stats['max'] = max(sigma_stats['max'], S.max().item())
+                    sigma_stats['mean'] += S.sum().item()
+                    sigma_stats['count'] += len(S)
+
                     # Regularization: Add α × mean(F) to stabilize noisy estimates
                     # This blends Fisher signal with a uniform prior
                     F_mean = F.mean().item() + 1e-10
@@ -732,8 +749,19 @@ class FisherAwareSVD:
                 layer_scores[name] = scores
             importance_scores[layer_idx] = layer_scores
 
+        # Print statistics
         print(f"  Importance scores: {fisher_used} with Fisher, {fisher_fallback} fallback to magnitude")
         print(f"  Fisher regularization alpha: {fisher_reg_alpha}")
+        if fisher_stats['count'] > 0:
+            fisher_stats['mean'] /= fisher_stats['count']
+            sigma_stats['mean'] /= sigma_stats['count']
+            print(f"  Fisher stats: min={fisher_stats['min']:.2e}, max={fisher_stats['max']:.2e}, mean={fisher_stats['mean']:.2e}")
+            print(f"  Sigma stats: min={sigma_stats['min']:.4f}, max={sigma_stats['max']:.4f}, mean={sigma_stats['mean']:.4f}")
+
+            # Check if Fisher has meaningful variance
+            fisher_range = fisher_stats['max'] / (fisher_stats['min'] + 1e-10)
+            print(f"  Fisher dynamic range: {fisher_range:.2e} (higher = more selective)")
+
         return importance_scores
 
     def phase3_global_truncation(self, ratio: float, min_rank: int = 16) -> None:
@@ -758,36 +786,54 @@ class FisherAwareSVD:
 
         num_layers = len(self.layers)
 
-        # Strategy: Per-LAYER normalization (not per-projection)
-        # This preserves relative importance between projections (q/k/v/o) within a layer
-        # But normalizes across layers for balanced global selection
+        # Normalization strategy selection
+        # Option 1: Per-layer normalization (current) - equalizes layers, may lose important signals
+        # Option 2: No normalization - uses raw S² × F scores with layer_factor
+        # Option 3: Global normalization - single normalization across all layers
+        USE_NORMALIZATION = False  # Try without normalization to see if it helps
+
         normalized_scores = {}
 
-        for layer_idx in importance_scores:
-            normalized_scores[layer_idx] = {}
+        if USE_NORMALIZATION:
+            # Per-LAYER normalization (preserves relative importance within layer)
+            for layer_idx in importance_scores:
+                normalized_scores[layer_idx] = {}
 
-            # Collect all scores in this layer to compute layer-level norm
-            all_layer_scores = []
-            for name in importance_scores[layer_idx]:
-                all_layer_scores.append(importance_scores[layer_idx][name])
+                # Collect all scores in this layer to compute layer-level norm
+                all_layer_scores = []
+                for name in importance_scores[layer_idx]:
+                    all_layer_scores.append(importance_scores[layer_idx][name])
 
-            # Concatenate and compute L2 norm across the entire layer
-            all_scores_tensor = torch.cat(all_layer_scores)
-            layer_norm = torch.norm(all_scores_tensor).item() + 1e-10
+                # Concatenate and compute L2 norm across the entire layer
+                all_scores_tensor = torch.cat(all_layer_scores)
+                layer_norm = torch.norm(all_scores_tensor).item() + 1e-10
 
-            # Layer position factor: later layers get higher weight
-            # This protects later layers which are more important for generation quality
-            layer_position = layer_idx / (num_layers - 1) if num_layers > 1 else 0.5
-            layer_factor = 0.5 + layer_position  # Range: [0.5, 1.5]
+                # Layer position factor
+                layer_position = layer_idx / (num_layers - 1) if num_layers > 1 else 0.5
+                layer_factor = 0.5 + layer_position
 
-            for name in importance_scores[layer_idx]:
-                scores = importance_scores[layer_idx][name]
-                # Normalize by LAYER's total importance (not projection)
-                # This preserves relative importance between q/k/v/o projections
-                normalized = scores / layer_norm
-                # Apply layer_factor AFTER normalization
-                normalized = normalized * layer_factor
-                normalized_scores[layer_idx][name] = normalized
+                for name in importance_scores[layer_idx]:
+                    scores = importance_scores[layer_idx][name]
+                    normalized = scores / layer_norm * layer_factor
+                    normalized_scores[layer_idx][name] = normalized
+
+            print(f"  Using per-layer normalization with layer_factor")
+        else:
+            # NO normalization - use raw S² × F scores with layer_factor only
+            # This preserves absolute importance information
+            for layer_idx in importance_scores:
+                normalized_scores[layer_idx] = {}
+
+                # Layer position factor: later layers get higher weight
+                layer_position = layer_idx / (num_layers - 1) if num_layers > 1 else 0.5
+                layer_factor = 0.5 + layer_position  # Range: [0.5, 1.5]
+
+                for name in importance_scores[layer_idx]:
+                    scores = importance_scores[layer_idx][name]
+                    # No normalization, just apply layer_factor to raw scores
+                    normalized_scores[layer_idx][name] = scores * layer_factor
+
+            print(f"  Using NO normalization (raw S² × F × layer_factor)")
 
         # Print layer factor info for debugging
         print(f"  Layer factors: L0={0.5:.2f}, L{num_layers//2}={0.5 + 0.5:.2f}, L{num_layers-1}={1.5:.2f}")
@@ -795,15 +841,32 @@ class FisherAwareSVD:
         # Collect all scores with their identifiers (layer_idx, name, singular_value_idx)
         # Use normalized scores for ranking but store original scores for debugging
         all_scores = []
+        magnitude_scores = []  # For comparison: what would pure σ² ranking give?
+
         for layer_idx in normalized_scores:
             for name in normalized_scores[layer_idx]:
                 scores = normalized_scores[layer_idx][name]
                 original_scores = importance_scores[layer_idx][name]
+
+                # Get singular values for magnitude comparison
+                U, S, VT, bias = self.svd_components[layer_idx][name]
+
                 for i, (norm_score, orig_score) in enumerate(zip(scores, original_scores)):
                     all_scores.append((norm_score.item(), layer_idx, name, i, orig_score.item()))
+                    magnitude_scores.append((S[i].item() ** 2, layer_idx, name, i))
 
         # Sort by normalized importance (descending)
         all_scores.sort(key=lambda x: x[0], reverse=True)
+        magnitude_scores.sort(key=lambda x: x[0], reverse=True)
+
+        # Compare Fisher-based ranking vs magnitude-based ranking
+        # How many of the top-K Fisher selections would also be in top-K magnitude?
+        target_count = int(len(all_scores) * ratio * 0.8)  # Approximate target
+        fisher_top_set = set((s[1], s[2], s[3]) for s in all_scores[:target_count])
+        magnitude_top_set = set((s[1], s[2], s[3]) for s in magnitude_scores[:target_count])
+        overlap = len(fisher_top_set & magnitude_top_set)
+        overlap_pct = overlap / target_count * 100 if target_count > 0 else 0
+        print(f"  Fisher vs Magnitude ranking overlap: {overlap_pct:.1f}% (100% = identical, 0% = completely different)")
 
         # Calculate total singular values and target count
         total_sv_count = len(all_scores)
@@ -907,6 +970,29 @@ class FisherAwareSVD:
                 VT_trunc = VT[indices, :]
 
                 self.svd_components[layer_idx][name] = (U_trunc, S_trunc, VT_trunc, bias)
+
+        # Analyze which singular value indices are kept
+        # If Fisher works, it might keep non-contiguous indices (not just top-k)
+        # If it keeps mostly contiguous top indices, Fisher isn't adding value
+        contiguous_count = 0
+        non_contiguous_count = 0
+        total_projections = 0
+
+        for layer_idx in kept_indices:
+            for name in kept_indices[layer_idx]:
+                indices_list = sorted(list(kept_indices[layer_idx][name]))
+                if len(indices_list) > 0:
+                    total_projections += 1
+                    # Check if indices are contiguous from 0 (like pure top-k)
+                    expected_contiguous = list(range(len(indices_list)))
+                    if indices_list == expected_contiguous:
+                        contiguous_count += 1
+                    else:
+                        non_contiguous_count += 1
+
+        contiguous_pct = contiguous_count / total_projections * 100 if total_projections > 0 else 0
+        print(f"  Selection pattern: {contiguous_pct:.1f}% contiguous (top-k), {100-contiguous_pct:.1f}% non-contiguous")
+        print(f"    (100% contiguous = Fisher not helping, just keeping top singular values)")
 
         # Print truncation samples
         print("  Truncation examples:")
