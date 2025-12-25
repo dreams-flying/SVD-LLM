@@ -871,12 +871,18 @@ class FisherAwareSVD:
         # Calculate total singular values and target count
         total_sv_count = len(all_scores)
 
-        # Calculate per-layer parameter constraints for proper compression ratio
-        # For W ∈ R^{m×n} with rank r: params = r(m+n), original = mn
-        # To achieve compression ratio ρ: r(m+n) ≈ ρ × mn → r ≈ ρmn/(m+n)
-        layer_max_rank = {}
+        # TRUE GLOBAL TRUNCATION:
+        # 1. Compute total budget based on target compression ratio
+        # 2. Use relaxed per-layer limits (allow layers to keep more if globally important)
+        # 3. Let greedy selection naturally allocate budget to important layers
+
+        # Step 1: Calculate target budget for each layer and total budget
+        layer_target_rank = {}  # Target rank for budget calculation
+        layer_relaxed_max = {}  # Relaxed max (original rank - no constraint)
         layer_min_rank = {}
         total_original_params = 0
+        total_budget = 0
+
         for layer_idx in self.svd_components:
             for name in self.svd_components[layer_idx]:
                 U, S, VT, _ = self.svd_components[layer_idx][name]
@@ -884,63 +890,90 @@ class FisherAwareSVD:
                 total_original_params += m * n
                 original_rank = len(S)
 
-                # Maximum rank that satisfies compression ratio
-                max_rank = int(m * n * ratio / (m + n))
-                max_rank = max(1, min(max_rank, original_rank))
+                # Target rank for BUDGET calculation (what we'd allocate if uniform)
+                target_rank = int(m * n * ratio / (m + n))
+                target_rank = max(1, min(target_rank, original_rank))
+                total_budget += target_rank
 
-                # Minimum rank constraint: at least min_rank or 10% of original, whichever is smaller
+                # Relaxed max: allow keeping up to original rank
+                # This enables truly global allocation
+                layer_relaxed_max[(layer_idx, name)] = original_rank
+
+                # Minimum rank constraint: at least min_rank or 10% of original
                 min_r = min(min_rank, max(1, int(original_rank * 0.1)))
-                min_r = min(min_r, max_rank)  # Don't exceed max_rank
+                min_r = min(min_r, target_rank)
 
-                layer_max_rank[(layer_idx, name)] = max_rank
+                layer_target_rank[(layer_idx, name)] = target_rank
                 layer_min_rank[(layer_idx, name)] = min_r
 
-        # First, allocate minimum ranks for all layers
-        # BUG FIX: Take top min_r by IMPORTANCE SCORE, not by index
+        print(f"  Total budget (target singular values): {total_budget}")
+        print(f"  Total singular values available: {total_sv_count}")
+
+        # Step 2: Pre-allocate minimum ranks
         kept_indices: Dict[int, Dict[str, set]] = defaultdict(lambda: defaultdict(set))
         kept_count = 0
 
-        # Pre-allocate minimum ranks by taking TOP min_r singular values BY IMPORTANCE
         for layer_idx in self.svd_components:
             for name in self.svd_components[layer_idx]:
                 min_r = layer_min_rank[(layer_idx, name)]
-                # Get importance scores for this layer
                 layer_scores = importance_scores[layer_idx][name]
-                # Get top min_r indices by importance (not by position)
                 top_indices = torch.argsort(layer_scores, descending=True)[:min_r]
                 for idx in top_indices:
                     kept_indices[layer_idx][name].add(idx.item())
                     kept_count += 1
 
-        # Calculate remaining budget after minimum allocation
-        total_target_sv = sum(layer_max_rank.values())
-        remaining_budget = total_target_sv - kept_count
+        remaining_budget = total_budget - kept_count
 
         print(f"  Pre-allocated {kept_count} singular values for minimum ranks")
         print(f"  Remaining budget: {remaining_budget}")
 
-        # Fill remaining budget using global selection
+        # Step 3: Fill remaining budget using TRUE global selection
+        # No per-layer max constraint (only relaxed max = original rank)
         if remaining_budget > 0:
             for norm_score, layer_idx, name, idx, orig_score in all_scores:
                 if remaining_budget <= 0:
                     break
 
-                # Skip if already kept (from minimum allocation)
+                # Skip if already kept
                 if idx in kept_indices[layer_idx][name]:
                     continue
 
                 current_kept = len(kept_indices[layer_idx][name])
-                max_for_layer = layer_max_rank.get((layer_idx, name), 0)
+                relaxed_max = layer_relaxed_max.get((layer_idx, name), 0)
 
-                # Check if we haven't exceeded max rank for this layer
-                if current_kept < max_for_layer:
+                # Only check relaxed max (original rank), not target ratio
+                if current_kept < relaxed_max:
                     kept_indices[layer_idx][name].add(idx)
                     kept_count += 1
                     remaining_budget -= 1
 
+        # Analyze allocation distribution
+        layer_allocation = {}
+        for layer_idx in self.svd_components:
+            layer_total = 0
+            layer_target = 0
+            for name in self.svd_components[layer_idx]:
+                layer_total += len(kept_indices[layer_idx][name])
+                layer_target += layer_target_rank[(layer_idx, name)]
+            layer_allocation[layer_idx] = (layer_total, layer_target)
+
+        # Print allocation analysis
+        under_target = sum(1 for l, (actual, target) in layer_allocation.items() if actual < target)
+        over_target = sum(1 for l, (actual, target) in layer_allocation.items() if actual > target)
+        print(f"  Allocation: {under_target} layers under target, {over_target} layers over target")
+
+        # Show extreme examples
+        if layer_allocation:
+            sorted_layers = sorted(layer_allocation.items(), key=lambda x: x[1][0]/x[1][1] if x[1][1] > 0 else 0)
+            if len(sorted_layers) >= 2:
+                min_layer, (min_actual, min_target) = sorted_layers[0]
+                max_layer, (max_actual, max_target) = sorted_layers[-1]
+                print(f"  Layer {min_layer}: {min_actual}/{min_target} ({min_actual/min_target*100:.0f}% of target)")
+                print(f"  Layer {max_layer}: {max_actual}/{max_target} ({max_actual/max_target*100:.0f}% of target)")
+
         # Truncate SVD components
-        truncation_samples = []  # For debug output
-        rank_stats = []  # Track min/max ranks
+        truncation_samples = []
+        rank_stats = []
         for layer_idx in self.svd_components:
             for name in self.svd_components[layer_idx]:
                 U, S, VT, bias = self.svd_components[layer_idx][name]
