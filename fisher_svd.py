@@ -932,22 +932,38 @@ class FisherAwareSVD:
             m, n = info['m'], info['n']
             original_rank = info['original_rank']
 
-            # Uniform allocation (what we'd give with no Fisher)
+            # Uniform allocation (what we'd give with no Fisher) - theoretical value
+            # This should NOT be constrained by min_rank
             uniform_rank = int(m * n * ratio / (m + n))
-            uniform_rank = max(min_rank, min(uniform_rank, original_rank))
+            uniform_rank = min(uniform_rank, original_rank)  # Only cap at original_rank
 
-            # MINIMUM: At least 30% of uniform allocation
+            # MINIMUM: At least min_rank OR 30% of uniform allocation
             # This prevents any projection from becoming an information bottleneck
             min_alloc = max(min_rank, int(uniform_rank * 0.3))
+            min_alloc = min(min_alloc, original_rank)  # Can't exceed original
 
-            # MAXIMUM: At most 200% of uniform allocation
-            max_alloc = min(original_rank, int(uniform_rank * 2.0))
+            # MAXIMUM: At most 200% of uniform allocation (but not more than original)
+            max_alloc = min(original_rank, max(min_alloc, int(uniform_rank * 2.0)))
 
             projection_min_rank[key] = min_alloc
             projection_max_rank[key] = max_alloc
 
             # Store uniform rank for later comparison
             info['uniform_rank'] = uniform_rank
+
+        # Diagnostic: Check if min_rank is constraining allocations
+        constrained_count = 0
+        for key, info in projection_info.items():
+            if projection_min_rank[key] > info['uniform_rank']:
+                constrained_count += 1
+
+        if constrained_count > 0:
+            print(f"  WARNING: min_rank={min_rank} is higher than theoretical uniform_rank for {constrained_count}/{len(projection_info)} projections")
+            print(f"           This forces over-allocation to some layers, reducing flexibility for global optimization")
+            # Show example
+            example_key = list(projection_info.keys())[0]
+            example_info = projection_info[example_key]
+            print(f"           Example: {example_key[1]} uniform_rank={example_info['uniform_rank']}, but min_alloc={projection_min_rank[example_key]}")
 
         # Step 3: Pre-allocate MINIMUM ranks (mandatory)
         # This ensures every projection has reasonable capacity
