@@ -828,25 +828,24 @@ class FisherAwareSVD:
             print(f"  Top-{ratio:.0%} overlap (old vs new formula): {overlap_pct:.1f}%")
 
     def phase3_global_truncation(self, ratio: float, min_rank: int = 16,
-                                   fisher_lambda: float = 2.0,
-                                   max_rank_ratio: float = 1.5) -> None:
+                                   fisher_lambda: float = 2.0) -> None:
         """
         Phase 3: Global truncation based on importance scores.
 
         Following the algorithm:
         1. Compute Score_i = log(σ_i) + λ × log(F_ii) for all singular values
         2. Apply layer position factor for balanced truncation
-        3. Use greedy allocation based on marginal utility
-        4. Keep top-k singular values per projection (contiguous)
-        5. Reconstruct W'^(l) = U^(l) Σ'^(l) V^(l)^T
+        3. Use ADAPTIVE min/max allocation:
+           - f_min: Binary search to achieve target floor_share of budget
+           - max_factor: Per-projection, based on score entropy/concentration
+        4. Greedy allocation based on marginal utility
+        5. Keep top-k singular values per projection (contiguous)
 
         Args:
             ratio: Target retention ratio (0-1). Higher means more parameters kept.
             min_rank: Minimum rank to keep per layer (default: 16)
             fisher_lambda: Weight for Fisher term in log-space formula (default: 2.0)
                           Higher values give Fisher more influence.
-            max_rank_ratio: Maximum rank as ratio of uniform allocation (default: 1.5)
-                           Lower values = more uniform distribution, less memory variance
         """
         print(f"Phase 3: Global Truncation (target ratio: {ratio:.2%}, min_rank: {min_rank}, λ={fisher_lambda})...")
 
@@ -977,13 +976,18 @@ class FisherAwareSVD:
                 layer_factor = 0.5 + layer_position
                 weighted_scores = scores * layer_factor
 
+                # Pre-compute uniform rank for this projection
+                uniform_rank = int(m * n * ratio / (m + n))
+                uniform_rank = min(uniform_rank, original_rank)
+
                 projection_info[(layer_idx, name)] = {
                     'm': m,
                     'n': n,
                     'cost': m + n,  # Cost per singular value
                     'original_rank': original_rank,
                     'scores': weighted_scores,
-                    'layer_factor': layer_factor
+                    'layer_factor': layer_factor,
+                    'uniform_rank': uniform_rank  # Pre-computed for binary search
                 }
 
         # Target parameter budget
@@ -991,35 +995,106 @@ class FisherAwareSVD:
         print(f"  Total original params: {total_original_params:,}")
         print(f"  Target params (ratio={ratio:.0%}): {target_params:,}")
 
-        # Step 2: Calculate per-projection minimum and maximum ranks
-        # CRITICAL: Each projection needs a MINIMUM allocation to avoid information bottleneck
-        # Even unimportant layers must pass information through!
+        # ================================================================
+        # ADAPTIVE MIN/MAX ALLOCATION (replacing fixed 0.3 and 1.5)
+        # ================================================================
+        #
+        # Scheme A: Binary search to find f_min such that floor allocation
+        #           consumes floor_share of target budget
+        #
+        # Scheme B: Per-projection max_factor based on score concentration
+        #           (entropy-based: sharp distributions get higher max)
+        # ================================================================
+
+        import math
+
+        # Step 2a: Compute per-projection entropy-based concentration (Scheme B)
+        # This determines how "sharp" each projection's importance distribution is
+        projection_concentration = {}
+
+        for key, info in projection_info.items():
+            scores = info['scores']
+            # Clamp to positive and normalize to probability distribution
+            scores_pos = scores.clamp(min=1e-20)
+            p = scores_pos / scores_pos.sum()
+
+            # Compute entropy: H = -Σ p_i log(p_i)
+            entropy = -(p * torch.log(p + 1e-20)).sum().item()
+
+            # Normalize entropy: H_norm = H / log(n), range [0, 1]
+            max_entropy = math.log(len(scores))
+            entropy_norm = entropy / max_entropy if max_entropy > 0 else 0
+
+            # Concentration = 1 - H_norm (1 = very sharp, 0 = very flat)
+            concentration = 1.0 - entropy_norm
+            projection_concentration[key] = concentration
+
+            # Store for debugging
+            info['concentration'] = concentration
+
+        # Print concentration statistics
+        conc_values = list(projection_concentration.values())
+        print(f"  Score concentration: min={min(conc_values):.3f}, max={max(conc_values):.3f}, mean={sum(conc_values)/len(conc_values):.3f}")
+
+        # Step 2b: Binary search to find optimal f_min (Scheme A)
+        # Goal: floor allocation = floor_share × target_params
+        # floor_share should be higher when compression is more aggressive
+        floor_share = 0.5 + 0.2 * (1 - ratio)  # 0.5 at ratio=1, 0.7 at ratio=0
+        floor_target = floor_share * target_params
+
+        def compute_floor_params(f_min_candidate):
+            """Compute total params if we use f_min_candidate as the min factor."""
+            total = 0
+            for key, info in projection_info.items():
+                uniform_rank = info['uniform_rank']
+                original_rank = info['original_rank']
+                min_alloc = max(min_rank, int(uniform_rank * f_min_candidate))
+                min_alloc = min(min_alloc, original_rank)
+                total += min_alloc * info['cost']
+            return total
+
+        # Binary search for f_min in range [0.1, 0.9]
+        f_min_lo, f_min_hi = 0.1, 0.9
+        for _ in range(20):  # ~20 iterations for precision
+            f_min_mid = (f_min_lo + f_min_hi) / 2
+            floor_params = compute_floor_params(f_min_mid)
+            if floor_params < floor_target:
+                f_min_lo = f_min_mid
+            else:
+                f_min_hi = f_min_mid
+
+        f_min_optimal = (f_min_lo + f_min_hi) / 2
+        print(f"  Adaptive f_min: {f_min_optimal:.3f} (floor_share={floor_share:.2f})")
+
+        # Step 2c: Calculate per-projection min and max ranks
         projection_min_rank = {}
         projection_max_rank = {}
 
         for key, info in projection_info.items():
             m, n = info['m'], info['n']
             original_rank = info['original_rank']
+            uniform_rank = info['uniform_rank']
+            concentration = projection_concentration[key]
 
-            # Uniform allocation (what we'd give with no Fisher) - theoretical value
-            # This should NOT be constrained by min_rank
-            uniform_rank = int(m * n * ratio / (m + n))
-            uniform_rank = min(uniform_rank, original_rank)  # Only cap at original_rank
+            # MINIMUM: Use adaptive f_min from binary search
+            min_alloc = max(min_rank, int(uniform_rank * f_min_optimal))
+            min_alloc = min(min_alloc, original_rank)
 
-            # MINIMUM: At least min_rank OR 30% of uniform allocation
-            # This prevents any projection from becoming an information bottleneck
-            min_alloc = max(min_rank, int(uniform_rank * 0.3))
-            min_alloc = min(min_alloc, original_rank)  # Can't exceed original
-
-            # MAXIMUM: At most max_rank_ratio × uniform allocation (but not more than original)
-            # Lower values = more uniform distribution = less memory variance
-            max_alloc = min(original_rank, max(min_alloc, int(uniform_rank * max_rank_ratio)))
+            # MAXIMUM: Use concentration-based max_factor (Scheme B)
+            # Sharp distribution (high concentration) → allow higher max
+            # Flat distribution (low concentration) → restrict max
+            max_factor = 1.1 + 0.9 * concentration  # Range: [1.1, 2.0]
+            max_alloc = min(original_rank, max(min_alloc, int(uniform_rank * max_factor)))
 
             projection_min_rank[key] = min_alloc
             projection_max_rank[key] = max_alloc
 
-            # Store uniform rank for later comparison
-            info['uniform_rank'] = uniform_rank
+            # Store for debugging
+            info['max_factor'] = max_factor
+
+        # Print max_factor statistics
+        max_factors = [info['max_factor'] for info in projection_info.values()]
+        print(f"  Adaptive max_factor: min={min(max_factors):.2f}, max={max(max_factors):.2f}, mean={sum(max_factors)/len(max_factors):.2f}")
 
         # Diagnostic: Check if min_rank is constraining allocations
         constrained_count = 0
@@ -1029,14 +1104,8 @@ class FisherAwareSVD:
 
         if constrained_count > 0:
             print(f"  WARNING: min_rank={min_rank} is higher than theoretical uniform_rank for {constrained_count}/{len(projection_info)} projections")
-            print(f"           This forces over-allocation to some layers, reducing flexibility for global optimization")
-            # Show example
-            example_key = list(projection_info.keys())[0]
-            example_info = projection_info[example_key]
-            print(f"           Example: {example_key[1]} uniform_rank={example_info['uniform_rank']}, but min_alloc={projection_min_rank[example_key]}")
 
         # Step 3: Pre-allocate MINIMUM ranks (mandatory)
-        # This ensures every projection has reasonable capacity
         layer_allocated_rank = {}
         current_params = 0
 
@@ -1045,7 +1114,7 @@ class FisherAwareSVD:
             layer_allocated_rank[key] = min_r
             current_params += min_r * info['cost']
 
-        print(f"  After min allocation (30% of uniform): {current_params:,} params ({current_params/total_original_params*100:.1f}%)")
+        print(f"  After min allocation: {current_params:,} params ({current_params/total_original_params*100:.1f}%)")
 
         # Check if minimum allocation already exceeds budget
         if current_params > target_params:
@@ -1055,6 +1124,7 @@ class FisherAwareSVD:
             for key, info in projection_info.items():
                 min_r = max(min_rank, int(projection_min_rank[key] * scale))
                 layer_allocated_rank[key] = min_r
+                projection_min_rank[key] = min_r  # Update min rank
                 current_params += min_r * info['cost']
             print(f"  After scaling: {current_params:,} params")
 
@@ -1350,8 +1420,7 @@ class FisherAwareSVD:
                  use_low_resource: bool = False,
                  calibration_steps: int = 50,
                  min_rank: int = 16,
-                 fisher_lambda: float = 2.0,
-                 max_rank_ratio: float = 1.5) -> nn.Module:
+                 fisher_lambda: float = 2.0) -> nn.Module:
         """
         Full compression pipeline.
 
@@ -1364,8 +1433,6 @@ class FisherAwareSVD:
             min_rank: Minimum rank to keep per projection (default: 16)
             fisher_lambda: Weight for Fisher in log-space formula (default: 2.0)
                           Formula: Score = log(σ) + λ × log(F)
-            max_rank_ratio: Maximum rank as ratio of uniform (default: 1.5)
-                           Lower = more uniform, less memory variance
 
         Returns:
             Compressed model
@@ -1376,9 +1443,8 @@ class FisherAwareSVD:
         # Phase 2: Sensitivity Estimation
         self.phase2_sensitivity_estimation(calib_loader, use_low_resource)
 
-        # Phase 3: Global Truncation with log-space importance scoring
-        self.phase3_global_truncation(ratio, min_rank=min_rank, fisher_lambda=fisher_lambda,
-                                      max_rank_ratio=max_rank_ratio)
+        # Phase 3: Global Truncation with adaptive min/max allocation
+        self.phase3_global_truncation(ratio, min_rank=min_rank, fisher_lambda=fisher_lambda)
 
         # Phase 4: Layer-wise Calibration (optimize SVD factors to minimize reconstruction error)
         if calibration_steps > 0:
@@ -1685,10 +1751,14 @@ def fisher_aware_svd_compression(model_name: str, model: nn.Module,
                                   num_gpus: int = 1,
                                   calibration_steps: int = 50,
                                   min_rank: int = 16,
-                                  fisher_lambda: float = 2.0,
-                                  max_rank_ratio: float = 1.5) -> nn.Module:
+                                  fisher_lambda: float = 2.0) -> nn.Module:
     """
     Main entry point for Fisher-Aware SVD compression.
+
+    Uses adaptive min/max rank allocation:
+    - f_min: Binary search to achieve target floor_share of budget
+    - max_factor: Per-projection, based on score entropy/concentration
+      (sharp distributions get higher max, flat distributions get lower max)
 
     Args:
         model_name: Name of the model (e.g., "llama", "mistral", "opt")
@@ -1704,8 +1774,6 @@ def fisher_aware_svd_compression(model_name: str, model: nn.Module,
         fisher_lambda: Weight for Fisher in log-space formula (default: 2.0)
                       Formula: Score = log(σ) + λ × log(F)
                       Higher values give Fisher more influence on ranking.
-        max_rank_ratio: Maximum rank as ratio of uniform allocation (default: 1.5)
-                       Lower values = more uniform distribution, less memory variance
 
     Returns:
         Compressed model
@@ -1714,12 +1782,11 @@ def fisher_aware_svd_compression(model_name: str, model: nn.Module,
     print(f"  Mode: {'Proxy Loss (low resource)' if use_low_resource else 'Cross-Entropy Loss (full)'}")
     print(f"  GPUs: {num_gpus}")
     print(f"  Fisher λ: {fisher_lambda} (log-space formula)")
-    print(f"  Min rank: {min_rank}, Max rank ratio: {max_rank_ratio}x")
+    print(f"  Min rank: {min_rank} (adaptive f_min and max_factor)")
 
     compressor = FisherAwareSVD(model, model_name, device, num_gpus=num_gpus)
     return compressor.compress(calib_loader, ratio, whitening_mat, use_low_resource,
-                               calibration_steps, min_rank=min_rank, fisher_lambda=fisher_lambda,
-                               max_rank_ratio=max_rank_ratio)
+                               calibration_steps, min_rank=min_rank, fisher_lambda=fisher_lambda)
 
 
 if __name__ == '__main__':
