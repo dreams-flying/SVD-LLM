@@ -1014,12 +1014,18 @@ class FisherAwareSVD:
 
         for key, info in projection_info.items():
             scores = info['scores']
-            # Clamp to positive and normalize to probability distribution
-            scores_pos = scores.clamp(min=1e-20)
-            p = scores_pos / scores_pos.sum()
+
+            # IMPORTANT: scores are in LOG-SPACE (log(σ) + λ*log(F))
+            # They can be negative! Use softmax to convert to probability distribution
+            # softmax(x_i) = exp(x_i) / Σexp(x_j)
+            # This is equivalent to normalizing σ × F^λ
+            scores_shifted = scores - scores.max()  # Numerical stability
+            exp_scores = torch.exp(scores_shifted)
+            p = exp_scores / exp_scores.sum()
 
             # Compute entropy: H = -Σ p_i log(p_i)
-            entropy = -(p * torch.log(p + 1e-20)).sum().item()
+            # Use p.clamp(min=1e-20) to avoid log(0)
+            entropy = -(p * torch.log(p.clamp(min=1e-20))).sum().item()
 
             # Normalize entropy: H_norm = H / log(n), range [0, 1]
             max_entropy = math.log(len(scores))
