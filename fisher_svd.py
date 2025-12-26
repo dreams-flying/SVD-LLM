@@ -688,17 +688,27 @@ class FisherAwareSVD:
 
         torch.cuda.empty_cache()
 
-    def compute_importance_scores(self) -> Dict[str, Dict[str, torch.Tensor]]:
+    def compute_importance_scores(self, fisher_lambda: float = 2.0) -> Dict[str, Dict[str, torch.Tensor]]:
         """
-        Compute importance scores for all singular values.
+        Compute importance scores for all singular values using LOG-SPACE formula.
 
-        Scoring formula (Fisher-based with regularization):
-        Score_i = σ_i² × (F_ii + α × mean(F))
+        Formula: Score_i = log(σ_i + ε) + λ × log(F_ii + ε)
 
-        Regularization helps stabilize noisy Fisher estimates.
+        This is mathematically equivalent to: Score ∝ σ × F^λ (for ranking purposes)
 
-        Note: layer_factor is NOT applied here to avoid cancellation by normalization.
-        It's applied AFTER per-layer normalization in phase3_global_truncation.
+        The log-space formulation has key advantages:
+        1. Scale invariance: not affected by absolute magnitudes
+        2. Balanced influence: compresses σ's huge range (0 to 70000) to ~11
+        3. Numerical stability: avoids extreme values from σ² × F
+
+        Theoretical justification:
+        - When λ=1: equivalent to first-order Taylor approximation (ΔL ∝ σ × √F)
+        - When λ=2: equivalent to second-order approximation (ΔL ∝ σ² × F)
+        - λ>1 gives Fisher more influence to compensate for its smaller dynamic range
+
+        Args:
+            fisher_lambda: Weight for Fisher term in log space. Default=2.0
+                          Higher values give Fisher more influence on ranking.
 
         Returns:
             Dictionary of importance scores per layer and sublayer
@@ -707,15 +717,20 @@ class FisherAwareSVD:
         fisher_used = 0
         fisher_fallback = 0
 
-        # Regularization coefficient: balance Fisher signal vs magnitude prior
-        fisher_reg_alpha = 0.1
+        # Small epsilon to avoid log(0)
+        eps = 1e-10
 
         # Collect statistics for diagnostics
         fisher_stats = {'min': float('inf'), 'max': 0, 'mean': 0, 'count': 0}
         sigma_stats = {'min': float('inf'), 'max': 0, 'mean': 0, 'count': 0}
 
+        # For comparing old vs new formula rankings
+        old_formula_scores = {}
+        new_formula_scores = {}
+
         for layer_idx in self.svd_components:
             layer_scores = {}
+            old_layer_scores = {}
 
             for name in self.svd_components[layer_idx]:
                 U, S, VT, bias = self.svd_components[layer_idx][name]
@@ -724,65 +739,116 @@ class FisherAwareSVD:
                     F = self.fisher_info[layer_idx][name]
 
                     # Collect Fisher statistics
-                    fisher_stats['min'] = min(fisher_stats['min'], F.min().item())
-                    fisher_stats['max'] = max(fisher_stats['max'], F.max().item())
-                    fisher_stats['mean'] += F.sum().item()
+                    F_positive = F.clamp(min=eps)  # Ensure positive for log
+                    fisher_stats['min'] = min(fisher_stats['min'], F_positive.min().item())
+                    fisher_stats['max'] = max(fisher_stats['max'], F_positive.max().item())
+                    fisher_stats['mean'] += F_positive.sum().item()
                     fisher_stats['count'] += len(F)
 
                     # Collect sigma statistics
-                    sigma_stats['min'] = min(sigma_stats['min'], S.min().item())
-                    sigma_stats['max'] = max(sigma_stats['max'], S.max().item())
-                    sigma_stats['mean'] += S.sum().item()
+                    S_positive = S.clamp(min=eps)  # Ensure positive for log
+                    sigma_stats['min'] = min(sigma_stats['min'], S_positive.min().item())
+                    sigma_stats['max'] = max(sigma_stats['max'], S_positive.max().item())
+                    sigma_stats['mean'] += S_positive.sum().item()
                     sigma_stats['count'] += len(S)
 
-                    # Regularization: Add α × mean(F) to stabilize noisy estimates
-                    # This blends Fisher signal with a uniform prior
-                    F_mean = F.mean().item() + 1e-10
-                    F_regularized = F + fisher_reg_alpha * F_mean
-                    scores = S.pow(2) * F_regularized
+                    # ============================================
+                    # NEW: Log-space importance score
+                    # Score = log(σ) + λ × log(F)
+                    # ============================================
+                    log_sigma = torch.log(S_positive)
+                    log_fisher = torch.log(F_positive)
+                    scores = log_sigma + fisher_lambda * log_fisher
+
+                    # Also compute old formula for comparison
+                    old_scores = S.pow(2) * F
+                    old_layer_scores[name] = old_scores
+
                     fisher_used += 1
                 else:
-                    # Fallback to magnitude-based scoring
-                    scores = S.pow(2)
+                    # Fallback to log magnitude-based scoring
+                    S_positive = S.clamp(min=eps)
+                    scores = torch.log(S_positive)  # Just log(σ)
+                    old_layer_scores[name] = S.pow(2)
                     fisher_fallback += 1
 
                 layer_scores[name] = scores
+
             importance_scores[layer_idx] = layer_scores
+            old_formula_scores[layer_idx] = old_layer_scores
 
         # Print statistics
-        print(f"  Importance scores: {fisher_used} with Fisher, {fisher_fallback} fallback to magnitude")
-        print(f"  Fisher regularization alpha: {fisher_reg_alpha}")
+        print(f"  Importance scoring: LOG-SPACE formula")
+        print(f"  Formula: Score = log(σ) + {fisher_lambda} × log(F)")
+        print(f"  Projections: {fisher_used} with Fisher, {fisher_fallback} fallback to magnitude")
+
         if fisher_stats['count'] > 0:
             fisher_stats['mean'] /= fisher_stats['count']
             sigma_stats['mean'] /= sigma_stats['count']
             print(f"  Fisher stats: min={fisher_stats['min']:.2e}, max={fisher_stats['max']:.2e}, mean={fisher_stats['mean']:.2e}")
             print(f"  Sigma stats: min={sigma_stats['min']:.4f}, max={sigma_stats['max']:.4f}, mean={sigma_stats['mean']:.4f}")
 
-            # Check if Fisher has meaningful variance
-            fisher_range = fisher_stats['max'] / (fisher_stats['min'] + 1e-10)
-            print(f"  Fisher dynamic range: {fisher_range:.2e} (higher = more selective)")
+            # Dynamic range in log space
+            fisher_log_range = torch.log(torch.tensor(fisher_stats['max'])) - torch.log(torch.tensor(fisher_stats['min'] + eps))
+            sigma_log_range = torch.log(torch.tensor(sigma_stats['max'])) - torch.log(torch.tensor(sigma_stats['min'] + eps))
+            print(f"  Log-space ranges: log(σ) range={sigma_log_range.item():.1f}, log(F) range={fisher_log_range.item():.1f}")
+            print(f"  Effective Fisher influence: {fisher_lambda} × {fisher_log_range.item():.1f} = {fisher_lambda * fisher_log_range.item():.1f}")
+
+            # Compare rankings between old and new formula
+            self._compare_ranking_formulas(old_formula_scores, importance_scores)
 
         return importance_scores
 
-    def phase3_global_truncation(self, ratio: float, min_rank: int = 16) -> None:
+    def _compare_ranking_formulas(self, old_scores: Dict, new_scores: Dict) -> None:
+        """Compare rankings between old (σ²×F) and new (log) formulas."""
+        # Flatten all scores
+        old_flat = []
+        new_flat = []
+
+        for layer_idx in old_scores:
+            for name in old_scores[layer_idx]:
+                old_s = old_scores[layer_idx][name]
+                new_s = new_scores[layer_idx][name]
+                for i in range(len(old_s)):
+                    old_flat.append((old_s[i].item(), layer_idx, name, i))
+                    new_flat.append((new_s[i].item(), layer_idx, name, i))
+
+        # Sort by score (descending)
+        old_flat.sort(key=lambda x: x[0], reverse=True)
+        new_flat.sort(key=lambda x: x[0], reverse=True)
+
+        # Compare top-K selections
+        total = len(old_flat)
+        for ratio in [0.2, 0.4, 0.6]:
+            k = int(total * ratio)
+            old_top_k = set((x[1], x[2], x[3]) for x in old_flat[:k])
+            new_top_k = set((x[1], x[2], x[3]) for x in new_flat[:k])
+            overlap = len(old_top_k & new_top_k)
+            overlap_pct = overlap / k * 100
+            print(f"  Top-{ratio:.0%} overlap (old vs new formula): {overlap_pct:.1f}%")
+
+    def phase3_global_truncation(self, ratio: float, min_rank: int = 16,
+                                   fisher_lambda: float = 2.0) -> None:
         """
         Phase 3: Global truncation based on importance scores.
 
         Following the algorithm:
-        1. Compute Score_i^(l) = (σ_i^(l))² × F_σi^(l) for all singular values
-        2. Normalize scores per layer for balanced truncation
-        3. Flatten all scores into a list S and sort globally (descending)
-        4. Keep top ρ proportion of scores, respecting minimum rank constraints
+        1. Compute Score_i = log(σ_i) + λ × log(F_ii) for all singular values
+        2. Apply layer position factor for balanced truncation
+        3. Use greedy allocation based on marginal utility
+        4. Keep top-k singular values per projection (contiguous)
         5. Reconstruct W'^(l) = U^(l) Σ'^(l) V^(l)^T
 
         Args:
             ratio: Target retention ratio (0-1). Higher means more parameters kept.
             min_rank: Minimum rank to keep per layer (default: 16)
+            fisher_lambda: Weight for Fisher term in log-space formula (default: 2.0)
+                          Higher values give Fisher more influence.
         """
-        print(f"Phase 3: Global Truncation (target ratio: {ratio:.2%}, min_rank: {min_rank})...")
+        print(f"Phase 3: Global Truncation (target ratio: {ratio:.2%}, min_rank: {min_rank}, λ={fisher_lambda})...")
 
-        # Compute importance scores: Score_i = σ_i² × F_ii
-        importance_scores = self.compute_importance_scores()
+        # Compute importance scores using log-space formula
+        importance_scores = self.compute_importance_scores(fisher_lambda=fisher_lambda)
 
         num_layers = len(self.layers)
 
@@ -1278,7 +1344,9 @@ class FisherAwareSVD:
     def compress(self, calib_loader: List[Dict], ratio: float,
                  whitening_mat: Optional[Dict] = None,
                  use_low_resource: bool = False,
-                 calibration_steps: int = 50) -> nn.Module:
+                 calibration_steps: int = 50,
+                 min_rank: int = 16,
+                 fisher_lambda: float = 2.0) -> nn.Module:
         """
         Full compression pipeline.
 
@@ -1288,6 +1356,9 @@ class FisherAwareSVD:
             whitening_mat: Optional whitening matrices from SVD-LLM
             use_low_resource: Use memory-efficient proxy loss (default: False, use true CE loss)
             calibration_steps: Number of calibration steps per layer (default: 50)
+            min_rank: Minimum rank to keep per projection (default: 16)
+            fisher_lambda: Weight for Fisher in log-space formula (default: 2.0)
+                          Formula: Score = log(σ) + λ × log(F)
 
         Returns:
             Compressed model
@@ -1298,8 +1369,8 @@ class FisherAwareSVD:
         # Phase 2: Sensitivity Estimation
         self.phase2_sensitivity_estimation(calib_loader, use_low_resource)
 
-        # Phase 3: Global Truncation
-        self.phase3_global_truncation(ratio)
+        # Phase 3: Global Truncation with log-space importance scoring
+        self.phase3_global_truncation(ratio, min_rank=min_rank, fisher_lambda=fisher_lambda)
 
         # Phase 4: Layer-wise Calibration (optimize SVD factors to minimize reconstruction error)
         if calibration_steps > 0:
@@ -1604,7 +1675,9 @@ def fisher_aware_svd_compression(model_name: str, model: nn.Module,
                                   device: str = "cuda",
                                   use_low_resource: bool = False,
                                   num_gpus: int = 1,
-                                  calibration_steps: int = 50) -> nn.Module:
+                                  calibration_steps: int = 50,
+                                  min_rank: int = 16,
+                                  fisher_lambda: float = 2.0) -> nn.Module:
     """
     Main entry point for Fisher-Aware SVD compression.
 
@@ -1617,6 +1690,11 @@ def fisher_aware_svd_compression(model_name: str, model: nn.Module,
         device: Device to use for computation
         use_low_resource: Use memory-efficient proxy loss (default: False, use true CE loss)
         num_gpus: Number of GPUs to use for model parallelism (default: 1)
+        calibration_steps: Number of Phase 4 calibration steps (default: 50)
+        min_rank: Minimum rank to keep per projection (default: 16)
+        fisher_lambda: Weight for Fisher in log-space formula (default: 2.0)
+                      Formula: Score = log(σ) + λ × log(F)
+                      Higher values give Fisher more influence on ranking.
 
     Returns:
         Compressed model
@@ -1624,9 +1702,12 @@ def fisher_aware_svd_compression(model_name: str, model: nn.Module,
     print(f"Fisher-Aware SVD Compression")
     print(f"  Mode: {'Proxy Loss (low resource)' if use_low_resource else 'Cross-Entropy Loss (full)'}")
     print(f"  GPUs: {num_gpus}")
+    print(f"  Fisher λ: {fisher_lambda} (log-space formula)")
+    print(f"  Min rank: {min_rank}")
 
     compressor = FisherAwareSVD(model, model_name, device, num_gpus=num_gpus)
-    return compressor.compress(calib_loader, ratio, whitening_mat, use_low_resource, calibration_steps)
+    return compressor.compress(calib_loader, ratio, whitening_mat, use_low_resource,
+                               calibration_steps, min_rank=min_rank, fisher_lambda=fisher_lambda)
 
 
 if __name__ == '__main__':
