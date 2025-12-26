@@ -828,7 +828,8 @@ class FisherAwareSVD:
             print(f"  Top-{ratio:.0%} overlap (old vs new formula): {overlap_pct:.1f}%")
 
     def phase3_global_truncation(self, ratio: float, min_rank: int = 16,
-                                   fisher_lambda: float = 2.0) -> None:
+                                   fisher_lambda: float = 2.0,
+                                   max_rank_ratio: float = 1.5) -> None:
         """
         Phase 3: Global truncation based on importance scores.
 
@@ -844,6 +845,8 @@ class FisherAwareSVD:
             min_rank: Minimum rank to keep per layer (default: 16)
             fisher_lambda: Weight for Fisher term in log-space formula (default: 2.0)
                           Higher values give Fisher more influence.
+            max_rank_ratio: Maximum rank as ratio of uniform allocation (default: 1.5)
+                           Lower values = more uniform distribution, less memory variance
         """
         print(f"Phase 3: Global Truncation (target ratio: {ratio:.2%}, min_rank: {min_rank}, λ={fisher_lambda})...")
 
@@ -1008,8 +1011,9 @@ class FisherAwareSVD:
             min_alloc = max(min_rank, int(uniform_rank * 0.3))
             min_alloc = min(min_alloc, original_rank)  # Can't exceed original
 
-            # MAXIMUM: At most 200% of uniform allocation (but not more than original)
-            max_alloc = min(original_rank, max(min_alloc, int(uniform_rank * 2.0)))
+            # MAXIMUM: At most max_rank_ratio × uniform allocation (but not more than original)
+            # Lower values = more uniform distribution = less memory variance
+            max_alloc = min(original_rank, max(min_alloc, int(uniform_rank * max_rank_ratio)))
 
             projection_min_rank[key] = min_alloc
             projection_max_rank[key] = max_alloc
@@ -1346,7 +1350,8 @@ class FisherAwareSVD:
                  use_low_resource: bool = False,
                  calibration_steps: int = 50,
                  min_rank: int = 16,
-                 fisher_lambda: float = 2.0) -> nn.Module:
+                 fisher_lambda: float = 2.0,
+                 max_rank_ratio: float = 1.5) -> nn.Module:
         """
         Full compression pipeline.
 
@@ -1359,6 +1364,8 @@ class FisherAwareSVD:
             min_rank: Minimum rank to keep per projection (default: 16)
             fisher_lambda: Weight for Fisher in log-space formula (default: 2.0)
                           Formula: Score = log(σ) + λ × log(F)
+            max_rank_ratio: Maximum rank as ratio of uniform (default: 1.5)
+                           Lower = more uniform, less memory variance
 
         Returns:
             Compressed model
@@ -1370,7 +1377,8 @@ class FisherAwareSVD:
         self.phase2_sensitivity_estimation(calib_loader, use_low_resource)
 
         # Phase 3: Global Truncation with log-space importance scoring
-        self.phase3_global_truncation(ratio, min_rank=min_rank, fisher_lambda=fisher_lambda)
+        self.phase3_global_truncation(ratio, min_rank=min_rank, fisher_lambda=fisher_lambda,
+                                      max_rank_ratio=max_rank_ratio)
 
         # Phase 4: Layer-wise Calibration (optimize SVD factors to minimize reconstruction error)
         if calibration_steps > 0:
@@ -1677,7 +1685,8 @@ def fisher_aware_svd_compression(model_name: str, model: nn.Module,
                                   num_gpus: int = 1,
                                   calibration_steps: int = 50,
                                   min_rank: int = 16,
-                                  fisher_lambda: float = 2.0) -> nn.Module:
+                                  fisher_lambda: float = 2.0,
+                                  max_rank_ratio: float = 1.5) -> nn.Module:
     """
     Main entry point for Fisher-Aware SVD compression.
 
@@ -1695,6 +1704,8 @@ def fisher_aware_svd_compression(model_name: str, model: nn.Module,
         fisher_lambda: Weight for Fisher in log-space formula (default: 2.0)
                       Formula: Score = log(σ) + λ × log(F)
                       Higher values give Fisher more influence on ranking.
+        max_rank_ratio: Maximum rank as ratio of uniform allocation (default: 1.5)
+                       Lower values = more uniform distribution, less memory variance
 
     Returns:
         Compressed model
@@ -1703,11 +1714,12 @@ def fisher_aware_svd_compression(model_name: str, model: nn.Module,
     print(f"  Mode: {'Proxy Loss (low resource)' if use_low_resource else 'Cross-Entropy Loss (full)'}")
     print(f"  GPUs: {num_gpus}")
     print(f"  Fisher λ: {fisher_lambda} (log-space formula)")
-    print(f"  Min rank: {min_rank}")
+    print(f"  Min rank: {min_rank}, Max rank ratio: {max_rank_ratio}x")
 
     compressor = FisherAwareSVD(model, model_name, device, num_gpus=num_gpus)
     return compressor.compress(calib_loader, ratio, whitening_mat, use_low_resource,
-                               calibration_steps, min_rank=min_rank, fisher_lambda=fisher_lambda)
+                               calibration_steps, min_rank=min_rank, fisher_lambda=fisher_lambda,
+                               max_rank_ratio=max_rank_ratio)
 
 
 if __name__ == '__main__':

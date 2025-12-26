@@ -526,6 +526,7 @@ if __name__ == '__main__':
     parser.add_argument('--calibration_steps', type=int, default=100, help='Number of calibration steps per layer for post-compression refinement (default: 100)')
     parser.add_argument('--min_rank', type=int, default=16, help='Minimum rank to keep per projection (default: 16)')
     parser.add_argument('--fisher_lambda', type=float, default=2.0, help='Weight for Fisher in log-space formula: Score = log(σ) + λ×log(F). Higher values give Fisher more influence (default: 2.0)')
+    parser.add_argument('--max_rank_ratio', type=float, default=1.5, help='Maximum rank as ratio of uniform allocation. Lower = more uniform distribution, less memory variance (default: 1.5)')
 
     args = parser.parse_args()
     args.ratio = 1- args.ratio
@@ -623,7 +624,8 @@ if __name__ == '__main__':
             num_gpus=args.num_gpus,
             calibration_steps=args.calibration_steps,
             min_rank=args.min_rank,
-            fisher_lambda=args.fisher_lambda
+            fisher_lambda=args.fisher_lambda,
+            max_rank_ratio=args.max_rank_ratio
         )
 
         if args.save_path is not None:
