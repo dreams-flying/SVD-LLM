@@ -1088,8 +1088,15 @@ class FisherAwareSVD:
 
             # MAXIMUM: Use concentration-based max_factor (Scheme B)
             # Sharp distribution (high concentration) → allow higher max
-            # Flat distribution (low concentration) → restrict max
-            max_factor = 1.1 + 0.9 * concentration  # Range: [1.1, 2.0]
+            # Flat distribution (low concentration) → still allow moderate flexibility
+            #
+            # Key insight from experiments:
+            # - Old mapping: 1.1 + 0.9 * concentration → too conservative (mean=1.17)
+            # - Best manual setting: fixed 1.5 → PPL=43.09
+            # - New mapping: higher baseline (1.35) + smaller range
+            #
+            # This allows Fisher to redistribute ranks even when scores are relatively flat
+            max_factor = 1.35 + 0.45 * concentration  # Range: [1.35, 1.80]
             max_alloc = min(original_rank, max(min_alloc, int(uniform_rank * max_factor)))
 
             projection_min_rank[key] = min_alloc
