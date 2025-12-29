@@ -527,8 +527,14 @@ if __name__ == '__main__':
     parser.add_argument('--min_rank', type=int, default=16, help='Minimum rank to keep per projection (default: 16)')
     parser.add_argument('--fisher_lambda', type=float, default=2.0, help='Weight for Fisher in log-space formula: Score = log(σ) + λ×log(F). Higher values give Fisher more influence (default: 2.0)')
     # NOTE: max_rank_ratio is now adaptive (entropy-based), no longer needs manual tuning
+    parser.add_argument('--use_als', action='store_true', default=True, help='Use ALS calibration in Phase 4 (default: True)')
+    parser.add_argument('--no_als', action='store_true', help='Disable ALS calibration, use M-optimization instead')
+    parser.add_argument('--als_iters', type=int, default=2, help='Number of ALS iterations per layer (default: 2)')
 
     args = parser.parse_args()
+    # Handle --no_als flag
+    if args.no_als:
+        args.use_als = False
     args.ratio = 1- args.ratio
     if args.step == 1:
         model, tokenizer = get_model_from_huggingface(model_id=args.model)
@@ -624,7 +630,9 @@ if __name__ == '__main__':
             num_gpus=args.num_gpus,
             calibration_steps=args.calibration_steps,
             min_rank=args.min_rank,
-            fisher_lambda=args.fisher_lambda
+            fisher_lambda=args.fisher_lambda,
+            use_als=args.use_als,
+            als_iters=args.als_iters
         )
 
         if args.save_path is not None:

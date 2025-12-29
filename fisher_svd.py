@@ -1433,7 +1433,9 @@ class FisherAwareSVD:
                  use_low_resource: bool = False,
                  calibration_steps: int = 50,
                  min_rank: int = 16,
-                 fisher_lambda: float = 2.0) -> nn.Module:
+                 fisher_lambda: float = 2.0,
+                 use_als: bool = True,
+                 als_iters: int = 2) -> nn.Module:
         """
         Full compression pipeline.
 
@@ -1446,6 +1448,8 @@ class FisherAwareSVD:
             min_rank: Minimum rank to keep per projection (default: 16)
             fisher_lambda: Weight for Fisher in log-space formula (default: 2.0)
                           Formula: Score = log(σ) + λ × log(F)
+            use_als: Use ALS calibration instead of M-optimization (default: True)
+            als_iters: Number of ALS iterations per layer (default: 2)
 
         Returns:
             Compressed model
@@ -1461,9 +1465,13 @@ class FisherAwareSVD:
 
         # Phase 4: Layer-wise Calibration (optimize SVD factors to minimize reconstruction error)
         if calibration_steps > 0:
-            print(f"Starting Phase 4 calibration with {calibration_steps} steps...")
             try:
-                self.phase4_calibration(calib_loader, calibration_steps)
+                if use_als:
+                    print(f"Starting Phase 4 ALS calibration ({als_iters} iterations)...")
+                    self.phase4_als_calibration(calib_loader, num_iters=als_iters, update_sigma=True)
+                else:
+                    print(f"Starting Phase 4 M-optimization calibration...")
+                    self.phase4_calibration(calib_loader, calibration_steps)
             except Exception as e:
                 print(f"  Warning: Phase 4 calibration failed ({type(e).__name__}: {e}), skipping...")
                 print("  Proceeding without calibration.")
@@ -1755,6 +1763,273 @@ class FisherAwareSVD:
             module = getattr(module, part)
         return module
 
+    def phase4_als_calibration(self, calib_loader: List[Dict], num_iters: int = 2,
+                                update_sigma: bool = True) -> None:
+        """
+        Phase 4: ALS (Alternating Least Squares) Calibration.
+
+        Unlike the M-optimization approach, ALS iteratively updates U and V separately:
+        - Step A: Fix V, Σ, solve for U using least squares
+        - Step B: Fix U, Σ, solve for V using least squares
+        - Step C (optional): Fix U, V, solve for diagonal scaling D
+
+        This preserves the low-rank structure while allowing more flexible optimization.
+
+        Mathematical formulation:
+        Given W' = U @ Σ @ V^T, we want to minimize ||X @ W'^T - X @ W^T||_F^2
+
+        Step A: Fix V, Σ, solve U
+            out = X @ V @ Σ @ U^T
+            Let Z = X @ V @ Σ (N × r), Y = X @ W^T (N × out_dim)
+            Solve: Z @ U^T = Y → U^T = lstsq(Z, Y) → U = lstsq(Z, Y).solution.T
+
+        Step B: Fix U, Σ, solve V
+            out = X @ V @ Σ @ U^T
+            Y = X @ V @ (Σ @ U^T)
+            Let Y' = Y @ U @ Σ^{-1} (N × r), then Y' = X @ V
+            Solve: X @ V = Y' → V = lstsq(X, Y')
+
+        Step C: Fix U, V, solve D (diagonal scaling)
+            For each singular direction i:
+            d_i = <X @ v_i, Y @ u_i> / <X @ v_i, X @ v_i>
+
+        Args:
+            calib_loader: Calibration data loader
+            num_iters: Number of ALS iterations (default: 2)
+            update_sigma: Whether to update diagonal scaling in Step C (default: True)
+        """
+        print(f"Phase 4: ALS Calibration ({num_iters} iterations, update_sigma={update_sigma})...")
+
+        # Move embedding layers to device
+        if "opt" in self.model_name:
+            self.model.model.decoder.embed_tokens = self.model.model.decoder.embed_tokens.to(self.device)
+            self.model.model.decoder.embed_positions = self.model.model.decoder.embed_positions.to(self.device)
+        else:
+            self.model.model.embed_tokens = self.model.model.embed_tokens.to(self.device)
+
+        # Capture inputs to first layer
+        dtype = next(iter(self.model.parameters())).dtype
+        inps = torch.zeros(
+            (len(calib_loader), self.model.seqlen, self.model.config.hidden_size),
+            dtype=dtype, device=self.device
+        )
+        cache = {'i': 0, 'attention_mask': None, 'position_ids': None}
+
+        class Catcher(nn.Module):
+            def __init__(self, module):
+                super().__init__()
+                self.module = module
+
+            def forward(self, inp, **kwargs):
+                inps[cache['i']] = inp.to(inps.device).to(inps.dtype)
+                cache['i'] += 1
+                if cache['attention_mask'] is None:
+                    cache['attention_mask'] = kwargs['attention_mask']
+                    if 'position_ids' in kwargs:
+                        cache['position_ids'] = kwargs['position_ids']
+                else:
+                    cache['attention_mask'] = torch.cat(
+                        (cache['attention_mask'], kwargs['attention_mask']), dim=0
+                    )
+                    if 'position_ids' in kwargs:
+                        cache['position_ids'] = torch.cat(
+                            (cache['position_ids'], kwargs['position_ids']), dim=0
+                        )
+                raise ValueError
+
+        self.layers[0] = self.layers[0].to(self.device)
+        original_layer0 = self.layers[0]
+        self.layers[0] = Catcher(self.layers[0])
+
+        for batch in calib_loader:
+            try:
+                batch = {k: v.to(self.device) for k, v in batch.items()}
+                self.model(**batch)
+            except ValueError:
+                pass
+
+        self.layers[0] = original_layer0
+        self.layers[0] = self.layers[0].cpu()
+
+        # Move embedding layers back to CPU
+        if "opt" in self.model_name:
+            self.model.model.decoder.embed_tokens = self.model.model.decoder.embed_tokens.cpu()
+            self.model.model.decoder.embed_positions = self.model.model.decoder.embed_positions.cpu()
+        else:
+            self.model.model.embed_tokens = self.model.model.embed_tokens.cpu()
+
+        torch.cuda.empty_cache()
+
+        attention_masks = cache['attention_mask'].to(self.device)
+        position_ids = cache.get('position_ids', None)
+        if position_ids is not None:
+            position_ids = position_ids.to(self.device)
+
+        # Process each layer
+        outs = torch.zeros_like(inps)
+        total_improvement = 0.0
+        calibrated_layers = 0
+
+        for layer_idx in tqdm(range(len(self.layers))):
+            layer = self.layers[layer_idx].float().to(self.device)
+
+            if layer_idx not in self.svd_components:
+                # Just forward through this layer
+                with torch.no_grad():
+                    for j in range(inps.shape[0]):
+                        inp_j = inps[j].unsqueeze(0).float().to(self.device)
+                        mask_j = attention_masks[j].unsqueeze(0).to(self.device)
+                        if position_ids is not None and "opt" not in self.model_name:
+                            pos_j = position_ids[j].unsqueeze(0).to(self.device)
+                            outs[j] = layer(inp_j, attention_mask=mask_j, position_ids=pos_j, use_cache=False)[0].to(dtype)
+                        else:
+                            outs[j] = layer(inp_j, attention_mask=mask_j, use_cache=False)[0].to(dtype)
+                self.layers[layer_idx] = layer.to(dtype).cpu()
+                inps = outs.clone()
+                torch.cuda.empty_cache()
+                continue
+
+            # Capture ALL linear layer inputs in ONE forward pass
+            subset = find_layers(layer)
+            layer_inputs = {name: [] for name in subset if name in self.svd_components[layer_idx]}
+            handles = []
+
+            def make_hook(name):
+                def hook(module, inp, out):
+                    layer_inputs[name].append(inp[0].detach().float().cpu())
+                return hook
+
+            for name in layer_inputs:
+                linear = self._get_module_by_name(layer, name)
+                handle = linear.register_forward_hook(make_hook(name))
+                handles.append(handle)
+
+            # Single forward pass to capture all inputs
+            with torch.no_grad():
+                for j in range(inps.shape[0]):
+                    inp_j = inps[j].unsqueeze(0).float().to(self.device)
+                    mask_j = attention_masks[j].unsqueeze(0).to(self.device)
+                    if position_ids is not None and "opt" not in self.model_name:
+                        pos_j = position_ids[j].unsqueeze(0).to(self.device)
+                        _ = layer(inp_j, attention_mask=mask_j, position_ids=pos_j, use_cache=False)
+                    else:
+                        _ = layer(inp_j, attention_mask=mask_j, use_cache=False)
+
+            # Remove all hooks
+            for handle in handles:
+                handle.remove()
+
+            # ALS calibration for each linear layer
+            for name in list(layer_inputs.keys()):
+                if len(layer_inputs[name]) == 0:
+                    del layer_inputs[name]
+                    continue
+
+                U_r, S_r, VT_r, bias = self.svd_components[layer_idx][name]
+                rank = len(S_r)
+
+                original_linear = self._get_module_by_name(layer, name)
+
+                # Stack all inputs and move to GPU
+                X = torch.cat([x.reshape(-1, x.shape[-1]) for x in layer_inputs[name]], dim=0).to(self.device)
+                del layer_inputs[name]
+
+                # Get original weight and target outputs
+                W = original_linear.weight.data.float().to(self.device)
+                Y = X @ W.T  # Target outputs (N, out_dim)
+
+                # Move SVD components to device
+                U = U_r.float().to(self.device)  # (out_dim, r)
+                S = S_r.float().to(self.device)  # (r,)
+                V = VT_r.T.float().to(self.device)  # (in_dim, r)
+
+                # Compute loss before ALS
+                W_before = (U * S) @ VT_r.float().to(self.device)
+                loss_before = ((X @ W_before.T - Y) ** 2).mean().item()
+                del W_before
+
+                # Regularization for numerical stability
+                reg = 1e-6
+
+                # ALS iterations
+                for als_iter in range(num_iters):
+                    # Step A: Fix V, Σ, solve U
+                    # Z @ U^T = Y where Z = X @ V @ diag(S)
+                    Z = (X @ V) * S  # (N, r)
+                    ZTZ = Z.T @ Z + reg * torch.eye(rank, device=self.device)
+                    ZTY = Z.T @ Y  # (r, out_dim)
+                    U_T_new = torch.linalg.solve(ZTZ, ZTY)  # (r, out_dim)
+                    U = U_T_new.T  # (out_dim, r)
+                    del Z, ZTZ, ZTY, U_T_new
+
+                    # Step B: Fix U, Σ, solve V
+                    # Y' = Y @ U @ diag(1/S) = X @ V
+                    # Note: S might have very small values, add regularization
+                    S_inv = 1.0 / (S + reg)
+                    Y_prime = (Y @ U) * S_inv  # (N, r)
+                    XTX = X.T @ X + reg * torch.eye(X.shape[1], device=self.device)
+                    XTY_prime = X.T @ Y_prime  # (in_dim, r)
+                    V = torch.linalg.solve(XTX, XTY_prime)  # (in_dim, r)
+                    del Y_prime, XTX, XTY_prime
+
+                # Step C (optional): Fix U, V, solve diagonal scaling D
+                if update_sigma:
+                    # For each i: d_i = <X @ v_i, Y @ u_i> / <X @ v_i, X @ v_i>
+                    Xv = X @ V  # (N, r)
+                    Yu = Y @ U  # (N, r)
+                    numerator = (Xv * Yu).sum(dim=0)  # (r,)
+                    denominator = (Xv * Xv).sum(dim=0) + reg  # (r,)
+                    S_new = numerator / denominator
+                    # Ensure positive singular values
+                    S_new = torch.abs(S_new)
+                    S = S_new
+                    del Xv, Yu, numerator, denominator, S_new
+
+                # Compute loss after ALS
+                VT = V.T  # (r, in_dim)
+                W_after = (U * S) @ VT
+                loss_after = ((X @ W_after.T - Y) ** 2).mean().item()
+                del W_after, X, W, Y
+
+                if loss_before > 0:
+                    improvement = (1 - loss_after / loss_before) * 100
+                    total_improvement += improvement
+                    calibrated_layers += 1
+
+                    if layer_idx < 3:
+                        print(f"    L{layer_idx} {name}: before={loss_before:.6f} after={loss_after:.6f} improvement={improvement:.1f}%")
+
+                # Update SVD components
+                self.svd_components[layer_idx][name] = (U.cpu(), S.cpu(), VT.cpu(),
+                                                        bias.cpu() if bias is not None else None)
+                del U, S, V, VT
+                torch.cuda.empty_cache()
+
+            # Clear layer inputs
+            del layer_inputs
+            torch.cuda.empty_cache()
+
+            # Forward through layer for next layer's input
+            with torch.no_grad():
+                for j in range(inps.shape[0]):
+                    inp_j = inps[j].unsqueeze(0).float().to(self.device)
+                    mask_j = attention_masks[j].unsqueeze(0).to(self.device)
+                    if position_ids is not None and "opt" not in self.model_name:
+                        pos_j = position_ids[j].unsqueeze(0).to(self.device)
+                        outs[j] = layer(inp_j, attention_mask=mask_j, position_ids=pos_j, use_cache=False)[0].to(dtype)
+                    else:
+                        outs[j] = layer(inp_j, attention_mask=mask_j, use_cache=False)[0].to(dtype)
+
+            self.layers[layer_idx] = layer.to(dtype).cpu()
+            inps = outs.clone()
+            torch.cuda.empty_cache()
+
+        if calibrated_layers > 0:
+            avg_improvement = total_improvement / calibrated_layers
+            print(f"  Average ALS improvement: {avg_improvement:.1f}% across {calibrated_layers} linear layers")
+        else:
+            print("  No layers calibrated")
+
 
 def fisher_aware_svd_compression(model_name: str, model: nn.Module,
                                   calib_loader: List[Dict], ratio: float,
@@ -1764,7 +2039,9 @@ def fisher_aware_svd_compression(model_name: str, model: nn.Module,
                                   num_gpus: int = 1,
                                   calibration_steps: int = 50,
                                   min_rank: int = 16,
-                                  fisher_lambda: float = 2.0) -> nn.Module:
+                                  fisher_lambda: float = 2.0,
+                                  use_als: bool = True,
+                                  als_iters: int = 2) -> nn.Module:
     """
     Main entry point for Fisher-Aware SVD compression.
 
@@ -1787,6 +2064,8 @@ def fisher_aware_svd_compression(model_name: str, model: nn.Module,
         fisher_lambda: Weight for Fisher in log-space formula (default: 2.0)
                       Formula: Score = log(σ) + λ × log(F)
                       Higher values give Fisher more influence on ranking.
+        use_als: Use ALS calibration instead of M-optimization (default: True)
+        als_iters: Number of ALS iterations per layer (default: 2)
 
     Returns:
         Compressed model
@@ -1796,10 +2075,12 @@ def fisher_aware_svd_compression(model_name: str, model: nn.Module,
     print(f"  GPUs: {num_gpus}")
     print(f"  Fisher λ: {fisher_lambda} (log-space formula)")
     print(f"  Min rank: {min_rank} (adaptive f_min and max_factor)")
+    print(f"  Phase 4: {'ALS' if use_als else 'M-optimization'} ({als_iters} iterations)" if use_als else "  Phase 4: M-optimization")
 
     compressor = FisherAwareSVD(model, model_name, device, num_gpus=num_gpus)
     return compressor.compress(calib_loader, ratio, whitening_mat, use_low_resource,
-                               calibration_steps, min_rank=min_rank, fisher_lambda=fisher_lambda)
+                               calibration_steps, min_rank=min_rank, fisher_lambda=fisher_lambda,
+                               use_als=use_als, als_iters=als_iters)
 
 
 if __name__ == '__main__':
