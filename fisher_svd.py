@@ -1435,7 +1435,8 @@ class FisherAwareSVD:
                  min_rank: int = 16,
                  fisher_lambda: float = 2.0,
                  use_als: bool = True,
-                 als_iters: int = 2) -> nn.Module:
+                 als_iters: int = 2,
+                 token_sample_ratio: float = 0.1) -> nn.Module:
         """
         Full compression pipeline.
 
@@ -1450,6 +1451,7 @@ class FisherAwareSVD:
                           Formula: Score = log(σ) + λ × log(F)
             use_als: Use ALS calibration instead of M-optimization (default: True)
             als_iters: Number of ALS iterations per layer (default: 2)
+            token_sample_ratio: Ratio of tokens to sample per sequence for ALS (default: 0.1)
 
         Returns:
             Compressed model
@@ -1468,7 +1470,8 @@ class FisherAwareSVD:
             try:
                 if use_als:
                     print(f"Starting Phase 4 ALS calibration ({als_iters} iterations)...")
-                    self.phase4_als_calibration(calib_loader, num_iters=als_iters, update_sigma=True)
+                    self.phase4_als_calibration(calib_loader, num_iters=als_iters,
+                                                 update_sigma=True, token_sample_ratio=token_sample_ratio)
                 else:
                     print(f"Starting Phase 4 M-optimization calibration...")
                     self.phase4_calibration(calib_loader, calibration_steps)
@@ -1764,41 +1767,43 @@ class FisherAwareSVD:
         return module
 
     def phase4_als_calibration(self, calib_loader: List[Dict], num_iters: int = 2,
-                                update_sigma: bool = True) -> None:
+                                update_sigma: bool = True, token_sample_ratio: float = 0.1) -> None:
         """
         Phase 4: ALS (Alternating Least Squares) Calibration.
 
         Unlike the M-optimization approach, ALS iteratively updates U and V separately:
         - Step A: Fix V, Σ, solve for U using least squares
-        - Step B: Fix U, Σ, solve for V using least squares
-        - Step C (optional): Fix U, V, solve for diagonal scaling D
+        - Step B: Fix U, Σ, solve for V using least squares (FIXED: no U orthogonality assumption)
+        - Step C (optional): Fix U, V, solve for diagonal scaling D (FIXED: r×r linear system)
 
-        This preserves the low-rank structure while allowing more flexible optimization.
+        After each projection is calibrated, we write the updated SVD components back to
+        the layer so that subsequent layers see the calibrated outputs.
 
         Mathematical formulation:
         Given W' = U @ Σ @ V^T, we want to minimize ||X @ W'^T - X @ W^T||_F^2
 
         Step A: Fix V, Σ, solve U
-            out = X @ V @ Σ @ U^T
-            Let Z = X @ V @ Σ (N × r), Y = X @ W^T (N × out_dim)
-            Solve: Z @ U^T = Y → U^T = lstsq(Z, Y) → U = lstsq(Z, Y).solution.T
+            Z = X @ V @ Σ (N × r)
+            U^T = (Z^T Z)^{-1} Z^T Y → U = (solution)^T
 
-        Step B: Fix U, Σ, solve V
-            out = X @ V @ Σ @ U^T
-            Y = X @ V @ (Σ @ U^T)
-            Let Y' = Y @ U @ Σ^{-1} (N × r), then Y' = X @ V
-            Solve: X @ V = Y' → V = lstsq(X, Y')
+        Step B: Fix U, Σ, solve V (CORRECTED - no U orthogonality assumption)
+            Let U_s = U * S (out_dim × r)
+            Z = Y @ U_s @ (U_s^T U_s)^{-1}  (target for X @ V)
+            V = lstsq(X, Z)
 
-        Step C: Fix U, V, solve D (diagonal scaling)
-            For each singular direction i:
-            d_i = <X @ v_i, Y @ u_i> / <X @ v_i, X @ v_i>
+        Step C: Fix U, V, solve D (r×r linear system)
+            A = X @ V, B = U
+            h = (A * (Y @ B)).sum(dim=0)
+            G = (A^T A) ⊙ (B^T B)  (Hadamard product)
+            d = solve(G, h)
 
         Args:
             calib_loader: Calibration data loader
             num_iters: Number of ALS iterations (default: 2)
             update_sigma: Whether to update diagonal scaling in Step C (default: True)
+            token_sample_ratio: Ratio of tokens to sample per sequence to avoid OOM (default: 0.1)
         """
-        print(f"Phase 4: ALS Calibration ({num_iters} iterations, update_sigma={update_sigma})...")
+        print(f"Phase 4: ALS Calibration ({num_iters} iterations, update_sigma={update_sigma}, token_sample={token_sample_ratio:.0%})...")
 
         # Move embedding layers to device
         if "opt" in self.model_name:
@@ -1811,7 +1816,7 @@ class FisherAwareSVD:
         dtype = next(iter(self.model.parameters())).dtype
         inps = torch.zeros(
             (len(calib_loader), self.model.seqlen, self.model.config.hidden_size),
-            dtype=dtype, device=self.device
+            dtype=dtype, device='cpu'  # Store on CPU to save GPU memory
         )
         cache = {'i': 0, 'attention_mask': None, 'position_ids': None}
 
@@ -1821,19 +1826,20 @@ class FisherAwareSVD:
                 self.module = module
 
             def forward(self, inp, **kwargs):
-                inps[cache['i']] = inp.to(inps.device).to(inps.dtype)
+                # FIXED: Store inp[0] to remove batch dimension
+                inps[cache['i']] = inp[0].detach().cpu().to(inps.dtype)
                 cache['i'] += 1
                 if cache['attention_mask'] is None:
-                    cache['attention_mask'] = kwargs['attention_mask']
+                    cache['attention_mask'] = kwargs['attention_mask'].cpu()
                     if 'position_ids' in kwargs:
-                        cache['position_ids'] = kwargs['position_ids']
+                        cache['position_ids'] = kwargs['position_ids'].cpu()
                 else:
                     cache['attention_mask'] = torch.cat(
-                        (cache['attention_mask'], kwargs['attention_mask']), dim=0
+                        (cache['attention_mask'], kwargs['attention_mask'].cpu()), dim=0
                     )
                     if 'position_ids' in kwargs:
                         cache['position_ids'] = torch.cat(
-                            (cache['position_ids'], kwargs['position_ids']), dim=0
+                            (cache['position_ids'], kwargs['position_ids'].cpu()), dim=0
                         )
                 raise ValueError
 
@@ -1860,15 +1866,17 @@ class FisherAwareSVD:
 
         torch.cuda.empty_cache()
 
-        attention_masks = cache['attention_mask'].to(self.device)
+        attention_masks = cache['attention_mask']
         position_ids = cache.get('position_ids', None)
-        if position_ids is not None:
-            position_ids = position_ids.to(self.device)
 
         # Process each layer
         outs = torch.zeros_like(inps)
         total_improvement = 0.0
         calibrated_layers = 0
+
+        # Compute number of tokens to sample per sequence
+        tokens_per_seq = max(1, int(self.model.seqlen * token_sample_ratio))
+        print(f"  Sampling {tokens_per_seq} tokens per sequence (total ~{len(calib_loader) * tokens_per_seq} tokens)")
 
         for layer_idx in tqdm(range(len(self.layers))):
             layer = self.layers[layer_idx].float().to(self.device)
@@ -1881,9 +1889,9 @@ class FisherAwareSVD:
                         mask_j = attention_masks[j].unsqueeze(0).to(self.device)
                         if position_ids is not None and "opt" not in self.model_name:
                             pos_j = position_ids[j].unsqueeze(0).to(self.device)
-                            outs[j] = layer(inp_j, attention_mask=mask_j, position_ids=pos_j, use_cache=False)[0].to(dtype)
+                            outs[j] = layer(inp_j, attention_mask=mask_j, position_ids=pos_j, use_cache=False)[0].cpu().to(dtype)
                         else:
-                            outs[j] = layer(inp_j, attention_mask=mask_j, use_cache=False)[0].to(dtype)
+                            outs[j] = layer(inp_j, attention_mask=mask_j, use_cache=False)[0].cpu().to(dtype)
                 self.layers[layer_idx] = layer.to(dtype).cpu()
                 inps = outs.clone()
                 torch.cuda.empty_cache()
@@ -1896,7 +1904,13 @@ class FisherAwareSVD:
 
             def make_hook(name):
                 def hook(module, inp, out):
-                    layer_inputs[name].append(inp[0].detach().float().cpu())
+                    # Sample tokens to reduce memory
+                    x = inp[0].detach().float()  # (batch, seq, hidden)
+                    # Randomly sample tokens
+                    if x.shape[1] > tokens_per_seq:
+                        indices = torch.randperm(x.shape[1])[:tokens_per_seq]
+                        x = x[:, indices, :]
+                    layer_inputs[name].append(x.cpu())
                 return hook
 
             for name in layer_inputs:
@@ -1930,11 +1944,11 @@ class FisherAwareSVD:
 
                 original_linear = self._get_module_by_name(layer, name)
 
-                # Stack all inputs and move to GPU
+                # Stack all inputs and move to GPU (sampled tokens)
                 X = torch.cat([x.reshape(-1, x.shape[-1]) for x in layer_inputs[name]], dim=0).to(self.device)
                 del layer_inputs[name]
 
-                # Get original weight and target outputs
+                # Get original weight and target outputs (teacher signal)
                 W = original_linear.weight.data.float().to(self.device)
                 Y = X @ W.T  # Target outputs (N, out_dim)
 
@@ -1953,43 +1967,43 @@ class FisherAwareSVD:
 
                 # ALS iterations
                 for als_iter in range(num_iters):
-                    # Step A: Fix V, Σ, solve U
+                    # ===== Step A: Fix V, Σ, solve U =====
                     # Z @ U^T = Y where Z = X @ V @ diag(S)
                     Z = (X @ V) * S  # (N, r)
-                    ZTZ = Z.T @ Z + reg * torch.eye(rank, device=self.device)
-                    ZTY = Z.T @ Y  # (r, out_dim)
-                    U_T_new = torch.linalg.solve(ZTZ, ZTY)  # (r, out_dim)
+                    # Use lstsq for better numerical stability
+                    U_T_new = torch.linalg.lstsq(Z, Y).solution  # (r, out_dim)
                     U = U_T_new.T  # (out_dim, r)
-                    del Z, ZTZ, ZTY, U_T_new
+                    del Z, U_T_new
 
-                    # Step B: Fix U, Σ, solve V
-                    # Y' = Y @ U @ diag(1/S) = X @ V
-                    # Note: S might have very small values, add regularization
-                    S_inv = 1.0 / (S + reg)
-                    Y_prime = (Y @ U) * S_inv  # (N, r)
-                    XTX = X.T @ X + reg * torch.eye(X.shape[1], device=self.device)
-                    XTY_prime = X.T @ Y_prime  # (in_dim, r)
-                    V = torch.linalg.solve(XTX, XTY_prime)  # (in_dim, r)
-                    del Y_prime, XTX, XTY_prime
+                    # ===== Step B (FIXED): Fix U, S, solve V correctly =====
+                    # No U orthogonality assumption!
+                    # Let U_s = U * S (out_dim, r)
+                    # Z = Y @ U_s @ (U_s^T U_s)^{-1}  (target for X @ V)
+                    U_s = U * S  # (out_dim, r)
+                    G = U_s.T @ U_s + reg * torch.eye(rank, device=self.device)  # (r, r)
+                    Z_target = (Y @ U_s) @ torch.linalg.inv(G)  # (N, r)
+                    # Solve X @ V = Z_target -> V = lstsq(X, Z_target)
+                    V = torch.linalg.lstsq(X, Z_target).solution  # (in_dim, r)
+                    del U_s, G, Z_target
 
-                # Step C (optional): Fix U, V, solve diagonal scaling D
+                # ===== Step C (FIXED): Fix U, V, solve D using r×r linear system =====
                 if update_sigma:
-                    # For each i: d_i = <X @ v_i, Y @ u_i> / <X @ v_i, X @ v_i>
-                    Xv = X @ V  # (N, r)
-                    Yu = Y @ U  # (N, r)
-                    numerator = (Xv * Yu).sum(dim=0)  # (r,)
-                    denominator = (Xv * Xv).sum(dim=0) + reg  # (r,)
-                    S_new = numerator / denominator
-                    # Ensure positive singular values
-                    S_new = torch.abs(S_new)
-                    S = S_new
-                    del Xv, Yu, numerator, denominator, S_new
+                    A = X @ V  # (N, r)
+                    YB = Y @ U  # (N, r)
+
+                    h = (A * YB).sum(dim=0)  # (r,)
+                    AtA = A.T @ A  # (r, r)
+                    BtB = U.T @ U  # (r, r)
+                    G = AtA * BtB  # Hadamard product (r, r)
+
+                    d = torch.linalg.solve(G + reg * torch.eye(rank, device=self.device), h)
+                    S = torch.abs(d)  # Keep positive
+                    del A, YB, h, AtA, BtB, G, d
 
                 # Compute loss after ALS
                 VT = V.T  # (r, in_dim)
                 W_after = (U * S) @ VT
                 loss_after = ((X @ W_after.T - Y) ** 2).mean().item()
-                del W_after, X, W, Y
 
                 if loss_before > 0:
                     improvement = (1 - loss_after / loss_before) * 100
@@ -2002,23 +2016,28 @@ class FisherAwareSVD:
                 # Update SVD components
                 self.svd_components[layer_idx][name] = (U.cpu(), S.cpu(), VT.cpu(),
                                                         bias.cpu() if bias is not None else None)
-                del U, S, V, VT
+
+                # ===== CRITICAL: Write updated SVD back to layer for proper forward =====
+                # Reconstruct weight and update the linear layer in place
+                original_linear.weight.data = W_after.to(original_linear.weight.dtype)
+
+                del U, S, V, VT, W_after, X, W, Y
                 torch.cuda.empty_cache()
 
             # Clear layer inputs
             del layer_inputs
             torch.cuda.empty_cache()
 
-            # Forward through layer for next layer's input
+            # Forward through layer for next layer's input (now using calibrated weights)
             with torch.no_grad():
                 for j in range(inps.shape[0]):
                     inp_j = inps[j].unsqueeze(0).float().to(self.device)
                     mask_j = attention_masks[j].unsqueeze(0).to(self.device)
                     if position_ids is not None and "opt" not in self.model_name:
                         pos_j = position_ids[j].unsqueeze(0).to(self.device)
-                        outs[j] = layer(inp_j, attention_mask=mask_j, position_ids=pos_j, use_cache=False)[0].to(dtype)
+                        outs[j] = layer(inp_j, attention_mask=mask_j, position_ids=pos_j, use_cache=False)[0].cpu().to(dtype)
                     else:
-                        outs[j] = layer(inp_j, attention_mask=mask_j, use_cache=False)[0].to(dtype)
+                        outs[j] = layer(inp_j, attention_mask=mask_j, use_cache=False)[0].cpu().to(dtype)
 
             self.layers[layer_idx] = layer.to(dtype).cpu()
             inps = outs.clone()
@@ -2041,7 +2060,8 @@ def fisher_aware_svd_compression(model_name: str, model: nn.Module,
                                   min_rank: int = 16,
                                   fisher_lambda: float = 2.0,
                                   use_als: bool = True,
-                                  als_iters: int = 2) -> nn.Module:
+                                  als_iters: int = 2,
+                                  token_sample_ratio: float = 0.1) -> nn.Module:
     """
     Main entry point for Fisher-Aware SVD compression.
 
@@ -2066,6 +2086,7 @@ def fisher_aware_svd_compression(model_name: str, model: nn.Module,
                       Higher values give Fisher more influence on ranking.
         use_als: Use ALS calibration instead of M-optimization (default: True)
         als_iters: Number of ALS iterations per layer (default: 2)
+        token_sample_ratio: Ratio of tokens to sample per sequence for ALS (default: 0.1)
 
     Returns:
         Compressed model
@@ -2075,12 +2096,13 @@ def fisher_aware_svd_compression(model_name: str, model: nn.Module,
     print(f"  GPUs: {num_gpus}")
     print(f"  Fisher λ: {fisher_lambda} (log-space formula)")
     print(f"  Min rank: {min_rank} (adaptive f_min and max_factor)")
-    print(f"  Phase 4: {'ALS' if use_als else 'M-optimization'} ({als_iters} iterations)" if use_als else "  Phase 4: M-optimization")
+    print(f"  Phase 4: {'ALS' if use_als else 'M-optimization'} ({als_iters} iterations, {token_sample_ratio:.0%} tokens)" if use_als else "  Phase 4: M-optimization")
 
     compressor = FisherAwareSVD(model, model_name, device, num_gpus=num_gpus)
     return compressor.compress(calib_loader, ratio, whitening_mat, use_low_resource,
                                calibration_steps, min_rank=min_rank, fisher_lambda=fisher_lambda,
-                               use_als=use_als, als_iters=als_iters)
+                               use_als=use_als, als_iters=als_iters,
+                               token_sample_ratio=token_sample_ratio)
 
 
 if __name__ == '__main__':

@@ -530,6 +530,7 @@ if __name__ == '__main__':
     parser.add_argument('--use_als', action='store_true', default=True, help='Use ALS calibration in Phase 4 (default: True)')
     parser.add_argument('--no_als', action='store_true', help='Disable ALS calibration, use M-optimization instead')
     parser.add_argument('--als_iters', type=int, default=2, help='Number of ALS iterations per layer (default: 2)')
+    parser.add_argument('--token_sample_ratio', type=float, default=0.1, help='Ratio of tokens to sample per sequence for ALS calibration (default: 0.1)')
 
     args = parser.parse_args()
     # Handle --no_als flag
@@ -632,7 +633,8 @@ if __name__ == '__main__':
             min_rank=args.min_rank,
             fisher_lambda=args.fisher_lambda,
             use_als=args.use_als,
-            als_iters=args.als_iters
+            als_iters=args.als_iters,
+            token_sample_ratio=args.token_sample_ratio
         )
 
         if args.save_path is not None:
