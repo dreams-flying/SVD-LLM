@@ -1898,181 +1898,209 @@ class FisherAwareSVD:
                 continue
 
             # Capture ALL linear layer inputs in ONE forward pass
+            # NOTE: We'll do two passes - first for attention + gate/up, then for down_proj
+            # because down_proj's input depends on gate/up outputs
             subset = find_layers(layer)
-            layer_inputs = {name: [] for name in subset if name in self.svd_components[layer_idx]}
-            handles = []
 
-            # Store current sample's attention mask for valid token sampling
-            current_mask = {'mask': None}
+            # Separate projections: attention/gate/up vs down_proj
+            attn_mlp_first = []  # q, k, v, o, gate, up
+            mlp_down = []  # down_proj
+            for name in subset:
+                if name in self.svd_components[layer_idx]:
+                    if 'down' in name.lower():
+                        mlp_down.append(name)
+                    else:
+                        attn_mlp_first.append(name)
 
-            def make_hook(name):
-                def hook(module, inp, out):
-                    # Sample tokens to reduce memory
-                    x = inp[0].detach().float()  # (batch, seq, hidden)
-                    seq_len = x.shape[1]
+            # Helper function to run calibration on a set of projections
+            def calibrate_projections(proj_names: list, capture_fresh: bool = False):
+                nonlocal layer, inps, attention_masks, position_ids
 
-                    # Get valid token indices from attention mask
-                    mask = current_mask['mask']
-                    if mask is not None and mask.shape[1] == seq_len:
-                        # mask shape: (1, seq) or (1, 1, seq, seq) for causal
-                        if mask.dim() == 4:
-                            # Causal mask: use diagonal or first row
-                            valid_mask = mask[0, 0, 0, :] > 0.5
+                if not proj_names:
+                    return 0.0, 0  # total_improvement, count
+
+                layer_inputs = {name: [] for name in proj_names}
+                handles = []
+                current_mask = {'mask': None}
+
+                def make_hook(name):
+                    def hook(module, inp, out):
+                        x = inp[0].detach().float()
+
+                        # Handle both 2D (batch*seq, hidden) and 3D (batch, seq, hidden)
+                        if x.dim() == 2:
+                            # 2D input: (N, hidden) - no token dimension to sample
+                            # Just store directly
+                            layer_inputs[name].append(x.cpu())
+                            return
+
+                        # 3D input: (batch, seq, hidden)
+                        seq_len = x.shape[1]
+
+                        # Get valid token indices from attention mask
+                        mask = current_mask['mask']
+                        valid_indices = None
+
+                        if mask is not None:
+                            # Handle different mask formats
+                            if mask.dim() == 4:
+                                # 4D causal mask: (batch, 1, seq, seq) - additive format
+                                # Valid tokens have mask value >= -1.0 (close to 0)
+                                # Invalid tokens have -inf or very large negative
+                                mask_row = mask[0, 0, 0, :]  # First row
+                                valid_mask = mask_row >= -1.0
+                            elif mask.dim() == 2:
+                                # 2D mask: (batch, seq) - usually 0/1 format
+                                valid_mask = mask[0] > 0.5
+                            else:
+                                valid_mask = None
+
+                            if valid_mask is not None:
+                                valid_indices = torch.where(valid_mask)[0]
+                                # Fallback if no valid tokens found (mask format issue)
+                                if len(valid_indices) == 0:
+                                    valid_indices = None
+
+                        if valid_indices is None:
+                            # Fallback: all tokens are valid
+                            valid_indices = torch.arange(seq_len, device=x.device)
+
+                        # Sample from valid tokens only
+                        num_valid = len(valid_indices)
+                        num_sample = min(tokens_per_seq, num_valid)
+
+                        if num_sample > 0 and num_valid > num_sample:
+                            perm = torch.randperm(num_valid, device=x.device)[:num_sample]
+                            sample_indices = valid_indices[perm]
+                            x = x[:, sample_indices, :]
+                        elif num_sample > 0:
+                            x = x[:, valid_indices, :]
+
+                        if x.numel() > 0:
+                            layer_inputs[name].append(x.cpu())
+                    return hook
+
+                for name in proj_names:
+                    linear = self._get_module_by_name(layer, name)
+                    handle = linear.register_forward_hook(make_hook(name))
+                    handles.append(handle)
+
+                # Forward pass to capture inputs
+                with torch.no_grad():
+                    for j in range(inps.shape[0]):
+                        inp_j = inps[j].unsqueeze(0).float().to(self.device)
+                        mask_j = attention_masks[j].unsqueeze(0).to(self.device)
+                        current_mask['mask'] = mask_j
+                        if position_ids is not None and "opt" not in self.model_name:
+                            pos_j = position_ids[j].unsqueeze(0).to(self.device)
+                            _ = layer(inp_j, attention_mask=mask_j, position_ids=pos_j, use_cache=False)
                         else:
-                            valid_mask = mask[0] > 0.5
-                        valid_indices = torch.where(valid_mask)[0]
-                    else:
-                        # Fallback: all tokens are valid
-                        valid_indices = torch.arange(seq_len, device=x.device)
+                            _ = layer(inp_j, attention_mask=mask_j, use_cache=False)
 
-                    # Sample from valid tokens only
-                    num_valid = len(valid_indices)
-                    num_sample = min(tokens_per_seq, num_valid)
-                    if num_sample > 0 and num_valid > num_sample:
-                        # Random sample from valid indices
-                        perm = torch.randperm(num_valid, device=x.device)[:num_sample]
-                        sample_indices = valid_indices[perm]
-                        x = x[:, sample_indices, :]
-                    elif num_sample > 0:
-                        # Use all valid tokens
-                        x = x[:, valid_indices, :]
+                for handle in handles:
+                    handle.remove()
 
-                    if x.shape[1] > 0:
-                        layer_inputs[name].append(x.cpu())
-                return hook
+                # Calibrate each projection
+                proj_improvement = 0.0
+                proj_count = 0
 
-            for name in layer_inputs:
-                linear = self._get_module_by_name(layer, name)
-                handle = linear.register_forward_hook(make_hook(name))
-                handles.append(handle)
+                for name in proj_names:
+                    if len(layer_inputs.get(name, [])) == 0:
+                        continue
 
-            # Single forward pass to capture all inputs
-            with torch.no_grad():
-                for j in range(inps.shape[0]):
-                    inp_j = inps[j].unsqueeze(0).float().to(self.device)
-                    mask_j = attention_masks[j].unsqueeze(0).to(self.device)
-                    # Pass mask to hook via closure
-                    current_mask['mask'] = mask_j
-                    if position_ids is not None and "opt" not in self.model_name:
-                        pos_j = position_ids[j].unsqueeze(0).to(self.device)
-                        _ = layer(inp_j, attention_mask=mask_j, position_ids=pos_j, use_cache=False)
-                    else:
-                        _ = layer(inp_j, attention_mask=mask_j, use_cache=False)
+                    U_r, S_r, VT_r, bias = self.svd_components[layer_idx][name]
+                    rank = len(S_r)
+                    original_linear = self._get_module_by_name(layer, name)
 
-            # Remove all hooks
-            for handle in handles:
-                handle.remove()
-
-            # ALS calibration for each linear layer
-            for name in list(layer_inputs.keys()):
-                if len(layer_inputs[name]) == 0:
+                    # Stack inputs
+                    X = torch.cat([x.reshape(-1, x.shape[-1]) for x in layer_inputs[name]], dim=0).to(self.device)
                     del layer_inputs[name]
-                    continue
 
-                U_r, S_r, VT_r, bias = self.svd_components[layer_idx][name]
-                rank = len(S_r)
+                    # Teacher signal
+                    W = original_linear.weight.data.float().to(self.device)
+                    Y = X @ W.T
 
-                original_linear = self._get_module_by_name(layer, name)
+                    # SVD components
+                    U = U_r.float().to(self.device)
+                    S = S_r.float().to(self.device)
+                    V = VT_r.T.float().to(self.device)
 
-                # Stack all inputs and move to GPU (sampled tokens)
-                X = torch.cat([x.reshape(-1, x.shape[-1]) for x in layer_inputs[name]], dim=0).to(self.device)
-                del layer_inputs[name]
+                    # Loss before
+                    W_before = (U * S) @ VT_r.float().to(self.device)
+                    loss_before = ((X @ W_before.T - Y) ** 2).mean().item()
+                    del W_before
 
-                # Get original weight and target outputs (teacher signal)
-                W = original_linear.weight.data.float().to(self.device)
-                Y = X @ W.T  # Target outputs (N, out_dim)
+                    reg = 1e-6
 
-                # Move SVD components to device
-                U = U_r.float().to(self.device)  # (out_dim, r)
-                S = S_r.float().to(self.device)  # (r,)
-                V = VT_r.T.float().to(self.device)  # (in_dim, r)
+                    # ALS iterations
+                    for als_iter in range(num_iters):
+                        # Step A: Fix V, S, solve U
+                        Z = (X @ V) * S
+                        U_T_new = torch.linalg.lstsq(Z, Y).solution
+                        U = U_T_new.T
+                        del Z, U_T_new
 
-                # Compute loss before ALS
-                W_before = (U * S) @ VT_r.float().to(self.device)
-                loss_before = ((X @ W_before.T - Y) ** 2).mean().item()
-                del W_before
+                        # Step B: Fix U, S, solve V
+                        U_s = U * S
+                        G = U_s.T @ U_s + reg * torch.eye(rank, device=self.device)
+                        Z_target = torch.linalg.solve(G, (Y @ U_s).T).T
+                        V = torch.linalg.lstsq(X, Z_target).solution
+                        del U_s, G, Z_target
 
-                # Regularization for numerical stability
-                reg = 1e-6
+                    # Step C: Fix U, V, solve D
+                    if update_sigma:
+                        A = X @ V
+                        YB = Y @ U
+                        h = (A * YB).sum(dim=0)
+                        AtA = A.T @ A
+                        BtB = U.T @ U
+                        G = AtA * BtB
+                        d = torch.linalg.solve(G + reg * torch.eye(rank, device=self.device), h)
+                        sign = torch.sign(d + 1e-12)
+                        U = U * sign
+                        S = torch.abs(d)
+                        del A, YB, h, AtA, BtB, G, d, sign
 
-                # ALS iterations
-                for als_iter in range(num_iters):
-                    # ===== Step A: Fix V, Σ, solve U =====
-                    # Z @ U^T = Y where Z = X @ V @ diag(S)
-                    Z = (X @ V) * S  # (N, r)
-                    # Use lstsq for better numerical stability
-                    U_T_new = torch.linalg.lstsq(Z, Y).solution  # (r, out_dim)
-                    U = U_T_new.T  # (out_dim, r)
-                    del Z, U_T_new
+                    # Loss after
+                    VT = V.T
+                    W_after = (U * S) @ VT
+                    loss_after = ((X @ W_after.T - Y) ** 2).mean().item()
 
-                    # ===== Step B (FIXED): Fix U, S, solve V correctly =====
-                    # No U orthogonality assumption!
-                    # Let U_s = U * S (out_dim, r)
-                    # Z_target = Y @ U_s @ (U_s^T U_s)^{-1}  (target for X @ V)
-                    U_s = U * S  # (out_dim, r)
-                    G = U_s.T @ U_s + reg * torch.eye(rank, device=self.device)  # (r, r)
-                    # Use solve instead of inv for numerical stability
-                    # Z_target = (Y @ U_s) @ G^{-1} = solve(G^T, (Y @ U_s)^T)^T = solve(G, (Y @ U_s)^T)^T
-                    Z_target = torch.linalg.solve(G, (Y @ U_s).T).T  # (N, r)
-                    # Solve X @ V = Z_target -> V = lstsq(X, Z_target)
-                    V = torch.linalg.lstsq(X, Z_target).solution  # (in_dim, r)
-                    del U_s, G, Z_target
+                    # Protection for small loss_before
+                    min_loss_threshold = 1e-10
+                    if loss_before > min_loss_threshold:
+                        improvement = (1 - loss_after / loss_before) * 100
+                        improvement = max(-100.0, min(100.0, improvement))
+                        proj_improvement += improvement
+                        proj_count += 1
+                        if layer_idx < 3:
+                            print(f"    L{layer_idx} {name}: before={loss_before:.6f} after={loss_after:.6f} improvement={improvement:.1f}%")
+                    else:
+                        if layer_idx < 3:
+                            print(f"    L{layer_idx} {name}: skipped (loss_before={loss_before:.2e} < threshold)")
 
-                # ===== Step C (FIXED): Fix U, V, solve D using r×r linear system =====
-                if update_sigma:
-                    A = X @ V  # (N, r)
-                    YB = Y @ U  # (N, r)
+                    # Update SVD components
+                    self.svd_components[layer_idx][name] = (U.cpu(), S.cpu(), VT.cpu(),
+                                                            bias.cpu() if bias is not None else None)
 
-                    h = (A * YB).sum(dim=0)  # (r,)
-                    AtA = A.T @ A  # (r, r)
-                    BtB = U.T @ U  # (r, r)
-                    G = AtA * BtB  # Hadamard product (r, r)
+                    # Write back using copy_ (safer than .data replacement)
+                    original_linear.weight.copy_(W_after.to(original_linear.weight.dtype))
 
-                    d = torch.linalg.solve(G + reg * torch.eye(rank, device=self.device), h)
+                    del U, S, V, VT, W_after, X, W, Y
+                    torch.cuda.empty_cache()
 
-                    # FIXED: Absorb sign into U to keep S non-negative
-                    # If d_i < 0, we flip the sign of U[:, i] so that d_i becomes positive
-                    sign = torch.sign(d + 1e-12)  # (r,), avoid sign(0)=0
-                    U = U * sign  # Absorb sign into U columns
-                    S = torch.abs(d)  # Now S is guaranteed positive
-                    del A, YB, h, AtA, BtB, G, d, sign
+                return proj_improvement, proj_count
 
-                # Compute loss after ALS
-                VT = V.T  # (r, in_dim)
-                W_after = (U * S) @ VT
-                loss_after = ((X @ W_after.T - Y) ** 2).mean().item()
+            # First pass: calibrate attention and gate/up projections
+            imp1, cnt1 = calibrate_projections(attn_mlp_first)
+            total_improvement += imp1
+            calibrated_layers += cnt1
 
-                # Protection: skip if loss_before is too small (teacher ≈ student)
-                # This can happen if the truncated SVD is already very close to original
-                min_loss_threshold = 1e-10
-                if loss_before > min_loss_threshold:
-                    improvement = (1 - loss_after / loss_before) * 100
-                    # Clamp improvement to reasonable range to avoid numerical issues
-                    improvement = max(-100.0, min(100.0, improvement))
-                    total_improvement += improvement
-                    calibrated_layers += 1
-
-                    if layer_idx < 3:
-                        print(f"    L{layer_idx} {name}: before={loss_before:.6f} after={loss_after:.6f} improvement={improvement:.1f}%")
-                else:
-                    # loss_before too small, skip this projection
-                    if layer_idx < 3:
-                        print(f"    L{layer_idx} {name}: skipped (loss_before={loss_before:.2e} < threshold)")
-
-                # Update SVD components
-                self.svd_components[layer_idx][name] = (U.cpu(), S.cpu(), VT.cpu(),
-                                                        bias.cpu() if bias is not None else None)
-
-                # ===== CRITICAL: Write updated SVD back to layer for proper forward =====
-                # Reconstruct weight and update the linear layer in place
-                original_linear.weight.data = W_after.to(original_linear.weight.dtype)
-
-                del U, S, V, VT, W_after, X, W, Y
-                torch.cuda.empty_cache()
-
-            # Clear layer inputs
-            del layer_inputs
-            torch.cuda.empty_cache()
+            # Second pass: calibrate down_proj with fresh capture (after gate/up updated)
+            if mlp_down:
+                imp2, cnt2 = calibrate_projections(mlp_down, capture_fresh=True)
+                total_improvement += imp2
+                calibrated_layers += cnt2
 
             # Forward through layer for next layer's input (now using calibrated weights)
             with torch.no_grad():
