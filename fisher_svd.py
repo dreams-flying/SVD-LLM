@@ -1978,10 +1978,12 @@ class FisherAwareSVD:
                     # ===== Step B (FIXED): Fix U, S, solve V correctly =====
                     # No U orthogonality assumption!
                     # Let U_s = U * S (out_dim, r)
-                    # Z = Y @ U_s @ (U_s^T U_s)^{-1}  (target for X @ V)
+                    # Z_target = Y @ U_s @ (U_s^T U_s)^{-1}  (target for X @ V)
                     U_s = U * S  # (out_dim, r)
                     G = U_s.T @ U_s + reg * torch.eye(rank, device=self.device)  # (r, r)
-                    Z_target = (Y @ U_s) @ torch.linalg.inv(G)  # (N, r)
+                    # Use solve instead of inv for numerical stability
+                    # Z_target = (Y @ U_s) @ G^{-1} = solve(G^T, (Y @ U_s)^T)^T = solve(G, (Y @ U_s)^T)^T
+                    Z_target = torch.linalg.solve(G, (Y @ U_s).T).T  # (N, r)
                     # Solve X @ V = Z_target -> V = lstsq(X, Z_target)
                     V = torch.linalg.lstsq(X, Z_target).solution  # (in_dim, r)
                     del U_s, G, Z_target
@@ -1997,8 +1999,13 @@ class FisherAwareSVD:
                     G = AtA * BtB  # Hadamard product (r, r)
 
                     d = torch.linalg.solve(G + reg * torch.eye(rank, device=self.device), h)
-                    S = torch.abs(d)  # Keep positive
-                    del A, YB, h, AtA, BtB, G, d
+
+                    # FIXED: Absorb sign into U to keep S non-negative
+                    # If d_i < 0, we flip the sign of U[:, i] so that d_i becomes positive
+                    sign = torch.sign(d + 1e-12)  # (r,), avoid sign(0)=0
+                    U = U * sign  # Absorb sign into U columns
+                    S = torch.abs(d)  # Now S is guaranteed positive
+                    del A, YB, h, AtA, BtB, G, d, sign
 
                 # Compute loss after ALS
                 VT = V.T  # (r, in_dim)
