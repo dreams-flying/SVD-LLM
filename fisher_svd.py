@@ -16,6 +16,7 @@ Reference: Second-order sensitivity analysis for neural network compression.
 
 import os
 import sys
+import math
 import torch
 import torch.nn as nn
 from tqdm import tqdm
@@ -1739,6 +1740,14 @@ class FisherAwareSVD:
                     W_after = (U_new * S_new) @ VT_new
                     loss_after = ((X @ W_after.T - X @ W.T) ** 2).mean().item()
 
+                    # Check for NaN - skip update if invalid
+                    if torch.isnan(W_after).any() or math.isnan(loss_after):
+                        if layer_idx < 3:
+                            print(f"    L{layer_idx} {name}: skipped (NaN detected)")
+                        del U_new, S_new, VT_new, W_after, X, W, Z
+                        torch.cuda.empty_cache()
+                        continue
+
                     min_loss_threshold = 1e-10
                     if loss_before > min_loss_threshold:
                         improvement = (1 - loss_after / loss_before) * 100
@@ -1751,8 +1760,9 @@ class FisherAwareSVD:
                     self.svd_components[layer_idx][name] = (U_new.cpu(), S_new.cpu(), VT_new.cpu(),
                                                             bias.cpu() if bias is not None else None)
 
-                    # CRITICAL: Write back to layer for proper forward
-                    original_linear.weight.copy_(W_after.to(original_linear.weight.dtype))
+                    # Write back with torch.no_grad() to avoid leaf variable error
+                    with torch.no_grad():
+                        original_linear.weight.copy_(W_after.to(original_linear.weight.dtype))
 
                     del U_new, S_new, VT_new, W_after, X, W, Z
                     torch.cuda.empty_cache()
@@ -2093,6 +2103,14 @@ class FisherAwareSVD:
                     W_after = (U * S) @ VT
                     loss_after = ((X @ W_after.T - Y) ** 2).mean().item()
 
+                    # Check for NaN - skip update if invalid
+                    if torch.isnan(W_after).any() or math.isnan(loss_after):
+                        if layer_idx < 3:
+                            print(f"    L{layer_idx} {name}: skipped (NaN detected)")
+                        del U, S, V, VT, W_after, X, W, Y
+                        torch.cuda.empty_cache()
+                        continue
+
                     # Protection for small loss_before
                     min_loss_threshold = 1e-10
                     if loss_before > min_loss_threshold:
@@ -2110,8 +2128,9 @@ class FisherAwareSVD:
                     self.svd_components[layer_idx][name] = (U.cpu(), S.cpu(), VT.cpu(),
                                                             bias.cpu() if bias is not None else None)
 
-                    # Write back using copy_ (safer than .data replacement)
-                    original_linear.weight.copy_(W_after.to(original_linear.weight.dtype))
+                    # Write back with torch.no_grad() to avoid leaf variable error
+                    with torch.no_grad():
+                        original_linear.weight.copy_(W_after.to(original_linear.weight.dtype))
 
                     del U, S, V, VT, W_after, X, W, Y
                     torch.cuda.empty_cache()
