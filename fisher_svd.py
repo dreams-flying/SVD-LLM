@@ -1743,10 +1743,19 @@ class FisherAwareSVD:
                     W_after = (U_new * S_new) @ VT_new
                     loss_after = ((X @ W_after.T - X @ W.T) ** 2).mean().item()
 
-                    # Check for NaN/Inf - fallback to original SVD components
+                    # Check for NaN/Inf OR if optimization made things worse - fallback to original SVD
+                    use_original = False
                     if torch.isnan(W_after).any() or torch.isinf(W_after).any() or math.isnan(loss_after) or math.isinf(loss_after):
                         if layer_idx < 3:
                             print(f"    L{layer_idx} {name}: numerical issue, using original SVD")
+                        use_original = True
+                    elif loss_after > loss_before and loss_before > 1e-10:
+                        # Optimization made things worse - revert to original
+                        if layer_idx < 3:
+                            print(f"    L{layer_idx} {name}: optimization worsened (before={loss_before:.6f} after={loss_after:.6f}), using original SVD")
+                        use_original = True
+
+                    if use_original:
                         # Restore original components
                         U_new = U_r.clone()
                         S_new = S_r_dev.clone()
@@ -2119,10 +2128,19 @@ class FisherAwareSVD:
                     W_after = (U * S) @ VT
                     loss_after = ((X @ W_after.T - Y) ** 2).mean().item()
 
-                    # Check for NaN/Inf - fallback to original SVD components
+                    # Check for NaN/Inf OR if ALS made things worse - fallback to original SVD
+                    use_original = False
                     if torch.isnan(W_after).any() or torch.isinf(W_after).any() or math.isnan(loss_after) or math.isinf(loss_after):
                         if layer_idx < 3:
                             print(f"    L{layer_idx} {name}: numerical issue, using original SVD")
+                        use_original = True
+                    elif loss_after > loss_before and loss_before > 1e-10:
+                        # ALS made things worse - revert to original
+                        if layer_idx < 3:
+                            print(f"    L{layer_idx} {name}: ALS worsened (before={loss_before:.6f} after={loss_after:.6f}), using original SVD")
+                        use_original = True
+
+                    if use_original:
                         # Restore original components
                         U = U_r.float().to(self.device)
                         S = S_r.float().to(self.device)
