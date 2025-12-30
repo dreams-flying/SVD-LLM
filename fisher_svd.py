@@ -1725,7 +1725,7 @@ class FisherAwareSVD:
                     ZTY_Ur = ZTX @ WTU
                     del ZTX, WTU
 
-                    M_star = torch.linalg.solve(ZTZ, ZTY_Ur)
+                    M_star = torch.linalg.lstsq(ZTZ, ZTY_Ur).solution
                     del ZTZ, ZTY_Ur
 
                     P, Lambda, QT = torch.linalg.svd(M_star, full_matrices=False)
@@ -2070,7 +2070,7 @@ class FisherAwareSVD:
                         # Step B: Fix U, S, solve V
                         U_s = U * S
                         G = U_s.T @ U_s + reg * torch.eye(rank, device=self.device)
-                        Z_target = torch.linalg.solve(G, (Y @ U_s).T).T
+                        Z_target = torch.linalg.lstsq(G, (Y @ U_s).T).solution.T
                         V = torch.linalg.lstsq(X, Z_target).solution
                         del U_s, G, Z_target
 
@@ -2082,7 +2082,7 @@ class FisherAwareSVD:
                         AtA = A.T @ A
                         BtB = U.T @ U
                         G = AtA * BtB
-                        d = torch.linalg.solve(G + reg * torch.eye(rank, device=self.device), h)
+                        d = torch.linalg.lstsq(G + reg * torch.eye(rank, device=self.device), h.unsqueeze(1)).solution.squeeze(1)
                         sign = torch.sign(d + 1e-12)
                         U = U * sign
                         S = torch.abs(d)
