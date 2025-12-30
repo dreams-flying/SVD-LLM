@@ -1488,7 +1488,8 @@ class FisherAwareSVD:
 
         return self.model
 
-    def phase4_calibration(self, calib_loader: List[Dict], num_steps: int = 50) -> None:
+    def phase4_calibration(self, calib_loader: List[Dict], num_steps: int = 50,
+                            token_sample_ratio: float = 0.1) -> None:
         """
         Phase 4: Per-linear-layer calibration within the subspace selected by Phase 3.
 
@@ -1512,8 +1513,9 @@ class FisherAwareSVD:
         Args:
             calib_loader: Calibration data loader
             num_steps: Ignored (kept for API compatibility), uses closed-form solution
+            token_sample_ratio: Ratio of tokens to sample per sequence (default: 0.1)
         """
-        print(f"Phase 4: Per-Linear-Layer Calibration (subspace optimization)...")
+        print(f"Phase 4: Per-Linear-Layer Calibration (subspace optimization, token_sample={token_sample_ratio:.0%})...")
 
         # Move embedding layers to device
         if "opt" in self.model_name:
@@ -1522,11 +1524,11 @@ class FisherAwareSVD:
         else:
             self.model.model.embed_tokens = self.model.model.embed_tokens.to(self.device)
 
-        # Capture inputs to first layer
+        # Capture inputs to first layer - store on CPU to save GPU memory
         dtype = next(iter(self.model.parameters())).dtype
         inps = torch.zeros(
             (len(calib_loader), self.model.seqlen, self.model.config.hidden_size),
-            dtype=dtype, device=self.device
+            dtype=dtype, device='cpu'  # FIXED: Store on CPU
         )
         cache = {'i': 0, 'attention_mask': None, 'position_ids': None}
 
@@ -1536,19 +1538,20 @@ class FisherAwareSVD:
                 self.module = module
 
             def forward(self, inp, **kwargs):
-                inps[cache['i']] = inp.to(inps.device).to(inps.dtype)
+                # FIXED: Use inp[0] to remove batch dimension
+                inps[cache['i']] = inp[0].detach().cpu().to(inps.dtype)
                 cache['i'] += 1
                 if cache['attention_mask'] is None:
-                    cache['attention_mask'] = kwargs['attention_mask']
+                    cache['attention_mask'] = kwargs['attention_mask'].cpu()
                     if 'position_ids' in kwargs:
-                        cache['position_ids'] = kwargs['position_ids']
+                        cache['position_ids'] = kwargs['position_ids'].cpu()
                 else:
                     cache['attention_mask'] = torch.cat(
-                        (cache['attention_mask'], kwargs['attention_mask']), dim=0
+                        (cache['attention_mask'], kwargs['attention_mask'].cpu()), dim=0
                     )
                     if 'position_ids' in kwargs:
                         cache['position_ids'] = torch.cat(
-                            (cache['position_ids'], kwargs['position_ids']), dim=0
+                            (cache['position_ids'], kwargs['position_ids'].cpu()), dim=0
                         )
                 raise ValueError
 
@@ -1575,15 +1578,17 @@ class FisherAwareSVD:
 
         torch.cuda.empty_cache()
 
-        attention_masks = cache['attention_mask'].to(self.device)
+        attention_masks = cache['attention_mask']  # Keep on CPU
         position_ids = cache.get('position_ids', None)
-        if position_ids is not None:
-            position_ids = position_ids.to(self.device)
 
         # Process each layer
         outs = torch.zeros_like(inps)
         total_improvement = 0.0
         calibrated_layers = 0
+
+        # Compute tokens to sample
+        tokens_per_seq = max(1, int(self.model.seqlen * token_sample_ratio))
+        print(f"  Sampling {tokens_per_seq} tokens per sequence")
 
         for layer_idx in tqdm(range(len(self.layers))):
             layer = self.layers[layer_idx].float().to(self.device)
@@ -1593,160 +1598,182 @@ class FisherAwareSVD:
                 with torch.no_grad():
                     for j in range(inps.shape[0]):
                         inp_j = inps[j].unsqueeze(0).float().to(self.device)
-                        mask_j = attention_masks[j].unsqueeze(0).to(self.device)
+                        # FIXED: Use j:j+1 slice to preserve dimensions
+                        mask_j = attention_masks[j:j+1].to(self.device)
                         if position_ids is not None and "opt" not in self.model_name:
-                            pos_j = position_ids[j].unsqueeze(0).to(self.device)
-                            outs[j] = layer(inp_j, attention_mask=mask_j, position_ids=pos_j, use_cache=False)[0].to(dtype)
+                            pos_j = position_ids[j:j+1].to(self.device)
+                            outs[j] = layer(inp_j, attention_mask=mask_j, position_ids=pos_j, use_cache=False)[0].cpu().to(dtype)
                         else:
-                            outs[j] = layer(inp_j, attention_mask=mask_j, use_cache=False)[0].to(dtype)
+                            outs[j] = layer(inp_j, attention_mask=mask_j, use_cache=False)[0].cpu().to(dtype)
                 self.layers[layer_idx] = layer.to(dtype).cpu()
                 inps = outs.clone()
                 torch.cuda.empty_cache()
                 continue
 
-            # Capture ALL linear layer inputs in ONE forward pass
-            # Store on CPU to save GPU memory
+            # Separate projections: attention/gate/up vs down_proj
             subset = find_layers(layer)
-            layer_inputs = {name: [] for name in subset if name in self.svd_components[layer_idx]}
-            handles = []
-
-            def make_hook(name):
-                def hook(module, inp, out):
-                    # Store on CPU to save GPU memory
-                    layer_inputs[name].append(inp[0].detach().float().cpu())
-                return hook
-
-            for name in layer_inputs:
-                linear = self._get_module_by_name(layer, name)
-                handle = linear.register_forward_hook(make_hook(name))
-                handles.append(handle)
-
-            # Single forward pass to capture all inputs
-            with torch.no_grad():
-                for j in range(inps.shape[0]):
-                    inp_j = inps[j].unsqueeze(0).float().to(self.device)
-                    mask_j = attention_masks[j].unsqueeze(0).to(self.device)
-                    if position_ids is not None and "opt" not in self.model_name:
-                        pos_j = position_ids[j].unsqueeze(0).to(self.device)
-                        _ = layer(inp_j, attention_mask=mask_j, position_ids=pos_j, use_cache=False)
+            attn_mlp_first = []
+            mlp_down = []
+            for name in subset:
+                if name in self.svd_components[layer_idx]:
+                    if 'down' in name.lower():
+                        mlp_down.append(name)
                     else:
-                        _ = layer(inp_j, attention_mask=mask_j, use_cache=False)
+                        attn_mlp_first.append(name)
 
-            # Remove all hooks
-            for handle in handles:
-                handle.remove()
+            # Helper function to calibrate a set of projections
+            def calibrate_projections(proj_names: list):
+                nonlocal total_improvement, calibrated_layers
 
-            # Calibrate each linear layer within Fisher-selected subspace
-            for name in list(layer_inputs.keys()):
-                if len(layer_inputs[name]) == 0:
+                if not proj_names:
+                    return
+
+                layer_inputs = {name: [] for name in proj_names}
+                handles = []
+                current_mask = {'mask': None}
+
+                def make_hook(name):
+                    def hook(module, inp, out):
+                        x = inp[0].detach().float()
+
+                        # Handle 2D vs 3D
+                        if x.dim() == 2:
+                            layer_inputs[name].append(x.cpu())
+                            return
+
+                        seq_len = x.shape[1]
+                        mask = current_mask['mask']
+                        valid_indices = None
+
+                        if mask is not None:
+                            if mask.dim() == 4:
+                                mask_row = mask[0, 0, 0, :]
+                                valid_mask = mask_row >= -1.0
+                            elif mask.dim() == 2:
+                                valid_mask = mask[0] > 0.5
+                            else:
+                                valid_mask = None
+
+                            if valid_mask is not None:
+                                valid_indices = torch.where(valid_mask)[0]
+                                if len(valid_indices) == 0:
+                                    valid_indices = None
+
+                        if valid_indices is None:
+                            valid_indices = torch.arange(seq_len, device=x.device)
+
+                        num_valid = len(valid_indices)
+                        num_sample = min(tokens_per_seq, num_valid)
+
+                        if num_sample > 0 and num_valid > num_sample:
+                            perm = torch.randperm(num_valid, device=x.device)[:num_sample]
+                            sample_indices = valid_indices[perm]
+                            x = x[:, sample_indices, :]
+                        elif num_sample > 0:
+                            x = x[:, valid_indices, :]
+
+                        if x.numel() > 0:
+                            layer_inputs[name].append(x.cpu())
+                    return hook
+
+                for name in proj_names:
+                    linear = self._get_module_by_name(layer, name)
+                    handle = linear.register_forward_hook(make_hook(name))
+                    handles.append(handle)
+
+                with torch.no_grad():
+                    for j in range(inps.shape[0]):
+                        inp_j = inps[j].unsqueeze(0).float().to(self.device)
+                        mask_j = attention_masks[j:j+1].to(self.device)
+                        current_mask['mask'] = mask_j
+                        if position_ids is not None and "opt" not in self.model_name:
+                            pos_j = position_ids[j:j+1].to(self.device)
+                            _ = layer(inp_j, attention_mask=mask_j, position_ids=pos_j, use_cache=False)
+                        else:
+                            _ = layer(inp_j, attention_mask=mask_j, use_cache=False)
+
+                for handle in handles:
+                    handle.remove()
+
+                # Calibrate each projection
+                for name in proj_names:
+                    if len(layer_inputs.get(name, [])) == 0:
+                        continue
+
+                    U_r, S_r, VT_r, bias = self.svd_components[layer_idx][name]
+                    rank = len(S_r)
+                    original_linear = self._get_module_by_name(layer, name)
+
+                    X = torch.cat([x.reshape(-1, x.shape[-1]) for x in layer_inputs[name]], dim=0).to(self.device)
                     del layer_inputs[name]
-                    continue
 
-                U_r, S_r, VT_r, bias = self.svd_components[layer_idx][name]
-                rank = len(S_r)
+                    W = original_linear.weight.data.float().to(self.device)
+                    U_r = U_r.float().to(self.device)
+                    VT_r = VT_r.float().to(self.device)
+                    V_r = VT_r.T
 
-                original_linear = self._get_module_by_name(layer, name)
+                    S_r_dev = S_r.float().to(self.device)
+                    W_before = (U_r * S_r_dev) @ VT_r
+                    loss_before = ((X @ W_before.T - X @ W.T) ** 2).mean().item()
+                    del W_before, S_r_dev
 
-                # Stack all inputs and move to GPU (inputs were stored on CPU)
-                X = torch.cat([x.reshape(-1, x.shape[-1]) for x in layer_inputs[name]], dim=0).to(self.device)
-                # Immediately free the CPU copies
-                del layer_inputs[name]
+                    # Subspace optimization
+                    Z = X @ V_r
+                    ZTZ = Z.T @ Z + 1e-6 * torch.eye(rank, device=self.device)
+                    ZTX = Z.T @ X
+                    WTU = W.T @ U_r
+                    ZTY_Ur = ZTX @ WTU
+                    del ZTX, WTU
 
-                # Get original weight
-                W = original_linear.weight.data.float().to(self.device)
+                    M_star = torch.linalg.solve(ZTZ, ZTY_Ur)
+                    del ZTZ, ZTY_Ur
 
-                # Move SVD components to device
-                U_r = U_r.float().to(self.device)
-                VT_r = VT_r.float().to(self.device)
-                V_r = VT_r.T
+                    P, Lambda, QT = torch.linalg.svd(M_star, full_matrices=False)
+                    del M_star
 
-                # Compute loss before calibration
-                S_r_dev = S_r.float().to(self.device)
-                W_before = (U_r * S_r_dev) @ VT_r
-                loss_before = ((X @ W_before.T - X @ W.T) ** 2).mean().item()
-                del W_before, S_r_dev
+                    U_new = U_r @ QT.T
+                    S_new = Lambda
+                    VT_new = P.T @ VT_r
+                    del P, Lambda, QT, U_r, VT_r, V_r
 
-                # === Subspace optimization (closed-form) ===
-                # Memory-efficient computation: avoid storing large intermediate matrices
+                    W_after = (U_new * S_new) @ VT_new
+                    loss_after = ((X @ W_after.T - X @ W.T) ** 2).mean().item()
 
-                # Step 1: Z = X @ V_r (N, rank) - smaller than X
-                Z = X @ V_r
+                    min_loss_threshold = 1e-10
+                    if loss_before > min_loss_threshold:
+                        improvement = (1 - loss_after / loss_before) * 100
+                        improvement = max(-100.0, min(100.0, improvement))
+                        total_improvement += improvement
+                        calibrated_layers += 1
+                        if layer_idx < 3:
+                            print(f"    L{layer_idx} {name}: before={loss_before:.6f} after={loss_after:.6f} improvement={improvement:.1f}%")
 
-                # Step 2: Compute Z^T @ Z (rank × rank - small) and Z^T @ (X @ W^T) @ U_r
-                ZTZ = Z.T @ Z + 1e-6 * torch.eye(rank, device=self.device)
+                    self.svd_components[layer_idx][name] = (U_new.cpu(), S_new.cpu(), VT_new.cpu(),
+                                                            bias.cpu() if bias is not None else None)
 
-                # Compute Z^T @ Y @ U_r = Z^T @ X @ W^T @ U_r in memory-efficient way
-                # = (Z^T @ X) @ (W^T @ U_r)
-                ZTX = Z.T @ X  # (rank, in_features)
-                WTU = W.T @ U_r  # (in_features, rank)
-                ZTY_Ur = ZTX @ WTU  # (rank, rank)
-                del ZTX, WTU
+                    # CRITICAL: Write back to layer for proper forward
+                    original_linear.weight.copy_(W_after.to(original_linear.weight.dtype))
 
-                # Solve for M_star
-                M_star = torch.linalg.solve(ZTZ, ZTY_Ur)
+                    del U_new, S_new, VT_new, W_after, X, W, Z
+                    torch.cuda.empty_cache()
 
-                # Debug: Check if M_star is doing something useful
-                if layer_idx < 3:
-                    # Check condition number of ZTZ
-                    cond = torch.linalg.cond(ZTZ).item()
-                    # Check how far M_star is from identity-scaled matrix
-                    # If M_star ≈ diag(S_r), calibration isn't helping
-                    M_diag = torch.diag(M_star.diag())
-                    off_diag_energy = ((M_star - M_diag) ** 2).sum().item()
-                    diag_energy = (M_star.diag() ** 2).sum().item()
-                    off_diag_ratio = off_diag_energy / (diag_energy + 1e-10) * 100
-                    print(f"    L{layer_idx} {name}: ZTZ cond={cond:.1e}, M off-diag energy={off_diag_ratio:.1f}%")
+            # First pass: attention + gate/up
+            calibrate_projections(attn_mlp_first)
 
-                del ZTZ, ZTY_Ur
-
-                # Step 3: SVD of M_star
-                P, Lambda, QT = torch.linalg.svd(M_star, full_matrices=False)
-                del M_star
-
-                # Step 4: Compute final SVD components
-                # CORRECTED: M_star is actually M^T (from the least squares solution)
-                # M_star = M^T = P @ Λ @ Q^T
-                # Therefore: M = Q @ Λ @ P^T
-                # W' = U_r @ M @ VT_r = U_r @ Q @ Λ @ P^T @ VT_r = (U_r @ Q) @ Λ @ (P^T @ VT_r)
-                U_new = U_r @ QT.T  # QT.T = Q
-                S_new = Lambda
-                VT_new = P.T @ VT_r  # P^T @ VT_r
-                del P, Lambda, QT, U_r, VT_r, V_r
-
-                # Compute loss after calibration
-                W_after = (U_new * S_new) @ VT_new
-                loss_after = ((X @ W_after.T - X @ W.T) ** 2).mean().item()
-                del W_after, X, W, Z
-
-                if loss_before > 0:
-                    improvement = (1 - loss_after / loss_before) * 100
-                    total_improvement += improvement
-                    calibrated_layers += 1
-
-                    # Debug: Show per-layer improvement for first few layers
-                    if layer_idx < 3:
-                        print(f"    L{layer_idx} {name}: before={loss_before:.6f} after={loss_after:.6f} improvement={improvement:.1f}%")
-
-                # Update SVD components
-                self.svd_components[layer_idx][name] = (U_new.cpu(), S_new.cpu(), VT_new.cpu(),
-                                                        bias.cpu() if bias is not None else None)
-                del U_new, S_new, VT_new
-                torch.cuda.empty_cache()
-
-            # Clear layer inputs
-            del layer_inputs
-            torch.cuda.empty_cache()
+            # Second pass: down_proj with fresh capture
+            if mlp_down:
+                calibrate_projections(mlp_down)
 
             # Forward through layer for next layer's input
             with torch.no_grad():
                 for j in range(inps.shape[0]):
                     inp_j = inps[j].unsqueeze(0).float().to(self.device)
-                    mask_j = attention_masks[j].unsqueeze(0).to(self.device)
+                    mask_j = attention_masks[j:j+1].to(self.device)
                     if position_ids is not None and "opt" not in self.model_name:
-                        pos_j = position_ids[j].unsqueeze(0).to(self.device)
-                        outs[j] = layer(inp_j, attention_mask=mask_j, position_ids=pos_j, use_cache=False)[0].to(dtype)
+                        pos_j = position_ids[j:j+1].to(self.device)
+                        outs[j] = layer(inp_j, attention_mask=mask_j, position_ids=pos_j, use_cache=False)[0].cpu().to(dtype)
                     else:
-                        outs[j] = layer(inp_j, attention_mask=mask_j, use_cache=False)[0].to(dtype)
+                        outs[j] = layer(inp_j, attention_mask=mask_j, use_cache=False)[0].cpu().to(dtype)
 
             self.layers[layer_idx] = layer.to(dtype).cpu()
             inps = outs.clone()
