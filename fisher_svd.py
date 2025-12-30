@@ -1730,6 +1730,15 @@ class FisherAwareSVD:
                     loss_before = ((X @ W_before.T - X @ W.T) ** 2).mean().item()
                     del W_before
 
+                    # Skip optimization if loss_before is already very small
+                    skip_threshold = 1e-6
+                    if loss_before < skip_threshold:
+                        if layer_idx < 3:
+                            print(f"    L{layer_idx} {name}: skipped (loss_before={loss_before:.2e} < {skip_threshold:.0e})")
+                        del X, W, U_r, VT_r, V_r, S_r_dev
+                        torch.cuda.empty_cache()
+                        continue
+
                     # Subspace optimization with increased regularization
                     reg = 1e-4
 
@@ -2094,6 +2103,16 @@ class FisherAwareSVD:
                     W_before = (U * S) @ VT_r.float().to(self.device)
                     loss_before = ((X @ W_before.T - Y) ** 2).mean().item()
                     del W_before
+
+                    # Skip ALS if loss_before is already very small - nothing meaningful to optimize
+                    skip_als_threshold = 1e-6
+                    if loss_before < skip_als_threshold:
+                        if layer_idx < 3:
+                            print(f"    L{layer_idx} {name}: skipped ALS (loss_before={loss_before:.2e} < {skip_als_threshold:.0e})")
+                        # Just keep original SVD, no changes needed
+                        del X, W, Y, U, S, V
+                        torch.cuda.empty_cache()
+                        continue
 
                     reg = 1e-4  # Increased regularization for numerical stability
                     max_val = 1e6  # Clamp threshold to prevent value explosion
