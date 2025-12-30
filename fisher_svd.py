@@ -1902,15 +1902,43 @@ class FisherAwareSVD:
             layer_inputs = {name: [] for name in subset if name in self.svd_components[layer_idx]}
             handles = []
 
+            # Store current sample's attention mask for valid token sampling
+            current_mask = {'mask': None}
+
             def make_hook(name):
                 def hook(module, inp, out):
                     # Sample tokens to reduce memory
                     x = inp[0].detach().float()  # (batch, seq, hidden)
-                    # Randomly sample tokens
-                    if x.shape[1] > tokens_per_seq:
-                        indices = torch.randperm(x.shape[1])[:tokens_per_seq]
-                        x = x[:, indices, :]
-                    layer_inputs[name].append(x.cpu())
+                    seq_len = x.shape[1]
+
+                    # Get valid token indices from attention mask
+                    mask = current_mask['mask']
+                    if mask is not None and mask.shape[1] == seq_len:
+                        # mask shape: (1, seq) or (1, 1, seq, seq) for causal
+                        if mask.dim() == 4:
+                            # Causal mask: use diagonal or first row
+                            valid_mask = mask[0, 0, 0, :] > 0.5
+                        else:
+                            valid_mask = mask[0] > 0.5
+                        valid_indices = torch.where(valid_mask)[0]
+                    else:
+                        # Fallback: all tokens are valid
+                        valid_indices = torch.arange(seq_len, device=x.device)
+
+                    # Sample from valid tokens only
+                    num_valid = len(valid_indices)
+                    num_sample = min(tokens_per_seq, num_valid)
+                    if num_sample > 0 and num_valid > num_sample:
+                        # Random sample from valid indices
+                        perm = torch.randperm(num_valid, device=x.device)[:num_sample]
+                        sample_indices = valid_indices[perm]
+                        x = x[:, sample_indices, :]
+                    elif num_sample > 0:
+                        # Use all valid tokens
+                        x = x[:, valid_indices, :]
+
+                    if x.shape[1] > 0:
+                        layer_inputs[name].append(x.cpu())
                 return hook
 
             for name in layer_inputs:
@@ -1923,6 +1951,8 @@ class FisherAwareSVD:
                 for j in range(inps.shape[0]):
                     inp_j = inps[j].unsqueeze(0).float().to(self.device)
                     mask_j = attention_masks[j].unsqueeze(0).to(self.device)
+                    # Pass mask to hook via closure
+                    current_mask['mask'] = mask_j
                     if position_ids is not None and "opt" not in self.model_name:
                         pos_j = position_ids[j].unsqueeze(0).to(self.device)
                         _ = layer(inp_j, attention_mask=mask_j, position_ids=pos_j, use_cache=False)
@@ -2012,13 +2042,22 @@ class FisherAwareSVD:
                 W_after = (U * S) @ VT
                 loss_after = ((X @ W_after.T - Y) ** 2).mean().item()
 
-                if loss_before > 0:
+                # Protection: skip if loss_before is too small (teacher ≈ student)
+                # This can happen if the truncated SVD is already very close to original
+                min_loss_threshold = 1e-10
+                if loss_before > min_loss_threshold:
                     improvement = (1 - loss_after / loss_before) * 100
+                    # Clamp improvement to reasonable range to avoid numerical issues
+                    improvement = max(-100.0, min(100.0, improvement))
                     total_improvement += improvement
                     calibrated_layers += 1
 
                     if layer_idx < 3:
                         print(f"    L{layer_idx} {name}: before={loss_before:.6f} after={loss_after:.6f} improvement={improvement:.1f}%")
+                else:
+                    # loss_before too small, skip this projection
+                    if layer_idx < 3:
+                        print(f"    L{layer_idx} {name}: skipped (loss_before={loss_before:.2e} < threshold)")
 
                 # Update SVD components
                 self.svd_components[layer_idx][name] = (U.cpu(), S.cpu(), VT.cpu(),
