@@ -1377,6 +1377,18 @@ class FisherAwareSVD:
                 if actual_rank == 0:
                     continue
 
+                # Check for NaN/Inf in SVD components - skip if corrupted
+                if torch.isnan(U).any() or torch.isnan(S).any() or torch.isnan(VT).any():
+                    print(f"  Warning: Layer {layer_idx} {name} has NaN in SVD components, skipping")
+                    continue
+                if torch.isinf(U).any() or torch.isinf(S).any() or torch.isinf(VT).any():
+                    print(f"  Warning: Layer {layer_idx} {name} has Inf in SVD components, skipping")
+                    continue
+                # Ensure S is positive (required for sqrt)
+                if (S < 0).any():
+                    print(f"  Warning: Layer {layer_idx} {name} has negative S values, clamping")
+                    S = torch.clamp(S, min=1e-8)
+
                 # Debug: print first layer's compression
                 if layer_idx == 0 and replaced_count < 2:
                     print(f"  Layer {layer_idx} {name}: rank {original_rank} -> {actual_rank}")
@@ -2195,6 +2207,12 @@ class FisherAwareSVD:
                         outs[j] = layer(inp_j, attention_mask=mask_j, position_ids=pos_j, use_cache=False)[0].cpu().to(dtype)
                     else:
                         outs[j] = layer(inp_j, attention_mask=mask_j, use_cache=False)[0].cpu().to(dtype)
+
+            # Check for NaN/Inf in layer output - this indicates calibration corrupted the layer
+            if torch.isnan(outs).any() or torch.isinf(outs).any():
+                print(f"  ERROR: Layer {layer_idx} output contains NaN/Inf! Calibration may have corrupted weights.")
+                # Replace NaN/Inf with zeros to prevent propagation (though model is likely damaged)
+                outs = torch.nan_to_num(outs, nan=0.0, posinf=0.0, neginf=0.0)
 
             self.layers[layer_idx] = layer.to(dtype).cpu()
             inps = outs.clone()
