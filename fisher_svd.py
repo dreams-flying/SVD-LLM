@@ -1713,14 +1713,16 @@ class FisherAwareSVD:
                     VT_r = VT_r.float().to(self.device)
                     V_r = VT_r.T
 
-                    S_r_dev = S_r.float().to(self.device)
+                    S_r_dev = S_r.float().to(self.device)  # Keep for fallback
                     W_before = (U_r * S_r_dev) @ VT_r
                     loss_before = ((X @ W_before.T - X @ W.T) ** 2).mean().item()
-                    del W_before, S_r_dev
+                    del W_before
 
-                    # Subspace optimization
+                    # Subspace optimization with increased regularization
+                    reg = 1e-4
+
                     Z = X @ V_r
-                    ZTZ = Z.T @ Z + 1e-6 * torch.eye(rank, device=self.device)
+                    ZTZ = Z.T @ Z + reg * torch.eye(rank, device=self.device)
                     ZTX = Z.T @ X
                     WTU = W.T @ U_r
                     ZTY_Ur = ZTX @ WTU
@@ -1733,20 +1735,25 @@ class FisherAwareSVD:
                     del M_star
 
                     U_new = U_r @ QT.T
-                    S_new = Lambda
+                    # Clamp S to reasonable range
+                    S_new = torch.clamp(Lambda, min=1e-8, max=1e6)
                     VT_new = P.T @ VT_r
-                    del P, Lambda, QT, U_r, VT_r, V_r
+                    del P, Lambda, QT
 
                     W_after = (U_new * S_new) @ VT_new
                     loss_after = ((X @ W_after.T - X @ W.T) ** 2).mean().item()
 
-                    # Check for NaN - skip update if invalid
-                    if torch.isnan(W_after).any() or math.isnan(loss_after):
+                    # Check for NaN/Inf - fallback to original SVD components
+                    if torch.isnan(W_after).any() or torch.isinf(W_after).any() or math.isnan(loss_after) or math.isinf(loss_after):
                         if layer_idx < 3:
-                            print(f"    L{layer_idx} {name}: skipped (NaN detected)")
-                        del U_new, S_new, VT_new, W_after, X, W, Z
-                        torch.cuda.empty_cache()
-                        continue
+                            print(f"    L{layer_idx} {name}: numerical issue, using original SVD")
+                        # Restore original components
+                        U_new = U_r.clone()
+                        S_new = S_r_dev.clone()
+                        VT_new = VT_r.clone()
+                        W_after = (U_new * S_new) @ VT_new
+                        loss_after = loss_before
+                    del U_r, VT_r, V_r, S_r_dev
 
                     min_loss_threshold = 1e-10
                     if loss_before > min_loss_threshold:
@@ -2067,21 +2074,29 @@ class FisherAwareSVD:
                     loss_before = ((X @ W_before.T - Y) ** 2).mean().item()
                     del W_before
 
-                    reg = 1e-6
+                    reg = 1e-4  # Increased regularization for numerical stability
+                    max_val = 1e6  # Clamp threshold to prevent value explosion
 
                     # ALS iterations
                     for als_iter in range(num_iters):
-                        # Step A: Fix V, S, solve U
+                        # Step A: Fix V, S, solve U (with regularization)
                         Z = (X @ V) * S
-                        U_T_new = torch.linalg.lstsq(Z, Y).solution
+                        # Regularized least squares: solve (Z^T Z + λI)^{-1} Z^T Y
+                        ZTZ = Z.T @ Z + reg * torch.eye(rank, device=self.device)
+                        ZTY = Z.T @ Y
+                        U_T_new = torch.linalg.lstsq(ZTZ, ZTY).solution
                         U = U_T_new.T
-                        del Z, U_T_new
+                        # Clamp to prevent explosion
+                        U = torch.clamp(U, -max_val, max_val)
+                        del Z, ZTZ, ZTY, U_T_new
 
-                        # Step B: Fix U, S, solve V
+                        # Step B: Fix U, S, solve V (with regularization)
                         U_s = U * S
                         G = U_s.T @ U_s + reg * torch.eye(rank, device=self.device)
                         Z_target = torch.linalg.lstsq(G, (Y @ U_s).T).solution.T
-                        V = torch.linalg.lstsq(X, Z_target).solution
+                        V = torch.linalg.lstsq(X.T @ X + reg * torch.eye(X.shape[1], device=self.device), X.T @ Z_target).solution
+                        # Clamp to prevent explosion
+                        V = torch.clamp(V, -max_val, max_val)
                         del U_s, G, Z_target
 
                     # Step C: Fix U, V, solve D
@@ -2095,7 +2110,8 @@ class FisherAwareSVD:
                         d = torch.linalg.lstsq(G + reg * torch.eye(rank, device=self.device), h.unsqueeze(1)).solution.squeeze(1)
                         sign = torch.sign(d + 1e-12)
                         U = U * sign
-                        S = torch.abs(d)
+                        # Clamp S to reasonable range (prevent extreme values)
+                        S = torch.clamp(torch.abs(d), min=1e-8, max=max_val)
                         del A, YB, h, AtA, BtB, G, d, sign
 
                     # Loss after
@@ -2103,13 +2119,16 @@ class FisherAwareSVD:
                     W_after = (U * S) @ VT
                     loss_after = ((X @ W_after.T - Y) ** 2).mean().item()
 
-                    # Check for NaN - skip update if invalid
-                    if torch.isnan(W_after).any() or math.isnan(loss_after):
+                    # Check for NaN/Inf - fallback to original SVD components
+                    if torch.isnan(W_after).any() or torch.isinf(W_after).any() or math.isnan(loss_after) or math.isinf(loss_after):
                         if layer_idx < 3:
-                            print(f"    L{layer_idx} {name}: skipped (NaN detected)")
-                        del U, S, V, VT, W_after, X, W, Y
-                        torch.cuda.empty_cache()
-                        continue
+                            print(f"    L{layer_idx} {name}: numerical issue, using original SVD")
+                        # Restore original components
+                        U = U_r.float().to(self.device)
+                        S = S_r.float().to(self.device)
+                        VT = VT_r.float().to(self.device)
+                        W_after = (U * S) @ VT
+                        loss_after = loss_before  # No change
 
                     # Protection for small loss_before
                     min_loss_threshold = 1e-10
