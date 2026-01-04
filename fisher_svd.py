@@ -1764,7 +1764,7 @@ class FisherAwareSVD:
                     W_after = (U_new * S_new) @ VT_new
                     loss_after = ((X @ W_after.T - X @ W.T) ** 2).mean().item()
 
-                    # Check for NaN/Inf OR if optimization made things worse - fallback to original SVD
+                    # Check for NaN/Inf OR if optimization made things worse OR extreme weights - fallback to original SVD
                     use_original = False
                     if torch.isnan(W_after).any() or torch.isinf(W_after).any() or math.isnan(loss_after) or math.isinf(loss_after):
                         if layer_idx < 3:
@@ -1775,6 +1775,17 @@ class FisherAwareSVD:
                         if layer_idx < 3:
                             print(f"    L{layer_idx} {name}: optimization worsened (before={loss_before:.6f} after={loss_after:.6f}), using original SVD")
                         use_original = True
+                    else:
+                        # Additional check: ensure weights are not too extreme compared to original
+                        W_orig = (U_r * S_r_dev) @ VT_r
+                        orig_max = W_orig.abs().max().item()
+                        new_max = W_after.abs().max().item()
+                        # If new weights are more than 10x larger than original, revert
+                        if orig_max > 0 and new_max > 10 * orig_max:
+                            if layer_idx < 3:
+                                print(f"    L{layer_idx} {name}: extreme weights (orig_max={orig_max:.2f}, new_max={new_max:.2f}), using original SVD")
+                            use_original = True
+                        del W_orig
 
                     if use_original:
                         # Restore original components
@@ -2159,7 +2170,7 @@ class FisherAwareSVD:
                     W_after = (U * S) @ VT
                     loss_after = ((X @ W_after.T - Y) ** 2).mean().item()
 
-                    # Check for NaN/Inf OR if ALS made things worse - fallback to original SVD
+                    # Check for NaN/Inf OR if ALS made things worse OR extreme weights - fallback to original SVD
                     use_original = False
                     if torch.isnan(W_after).any() or torch.isinf(W_after).any() or math.isnan(loss_after) or math.isinf(loss_after):
                         if layer_idx < 3:
@@ -2170,6 +2181,17 @@ class FisherAwareSVD:
                         if layer_idx < 3:
                             print(f"    L{layer_idx} {name}: ALS worsened (before={loss_before:.6f} after={loss_after:.6f}), using original SVD")
                         use_original = True
+                    else:
+                        # Additional check: ensure weights are not too extreme compared to original
+                        W_orig = (U_r.float().to(self.device) * S_r.float().to(self.device)) @ VT_r.float().to(self.device)
+                        orig_max = W_orig.abs().max().item()
+                        new_max = W_after.abs().max().item()
+                        # If new weights are more than 10x larger than original, revert
+                        if orig_max > 0 and new_max > 10 * orig_max:
+                            if layer_idx < 3:
+                                print(f"    L{layer_idx} {name}: extreme weights (orig_max={orig_max:.2f}, new_max={new_max:.2f}), using original SVD")
+                            use_original = True
+                        del W_orig
 
                     if use_original:
                         # Restore original components
