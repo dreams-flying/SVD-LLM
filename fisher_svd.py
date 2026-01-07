@@ -1987,15 +1987,21 @@ class FisherAwareSVD:
             # because down_proj's input depends on gate/up outputs
             subset = find_layers(layer)
 
-            # Separate projections: attention/gate/up vs down_proj
-            attn_mlp_first = []  # q, k, v, o, gate, up
-            mlp_down = []  # down_proj
+            # 1-way grouping: all projections in one pass
+            all_projections = []
             for name in subset:
                 if name in self.svd_components[layer_idx]:
-                    if 'down' in name.lower():
-                        mlp_down.append(name)
-                    else:
-                        attn_mlp_first.append(name)
+                    all_projections.append(name)
+
+            # Commented-out 2-way grouping option:
+            # attn_mlp_first = []  # q, k, v, o, gate, up
+            # mlp_down = []  # down_proj
+            # for name in subset:
+            #     if name in self.svd_components[layer_idx]:
+            #         if 'down' in name.lower():
+            #             mlp_down.append(name)
+            #         else:
+            #             attn_mlp_first.append(name)
 
             # Helper function to run calibration on a set of projections
             def calibrate_projections(proj_names: list, capture_fresh: bool = False):
@@ -2125,7 +2131,7 @@ class FisherAwareSVD:
                         torch.cuda.empty_cache()
                         continue
 
-                    reg = 1e-4  # Increased regularization for numerical stability
+                    reg = 1e-6  # Regularization for numerical stability
                     max_val = 1e6  # Clamp threshold to prevent value explosion
 
                     # ALS iterations
@@ -2141,10 +2147,10 @@ class FisherAwareSVD:
                         U = torch.clamp(U, -max_val, max_val)
                         del Z, ZTZ, ZTY, U_T_new
 
-                        # Step B: Fix U, S, solve V (with regularization)
+                        # Step B: Fix U, S, solve V (using inv for small system)
                         U_s = U * S
                         G = U_s.T @ U_s + reg * torch.eye(rank, device=self.device)
-                        Z_target = torch.linalg.lstsq(G, (Y @ U_s).T).solution.T
+                        Z_target = (Y @ U_s) @ torch.linalg.inv(G)
                         V = torch.linalg.lstsq(X.T @ X + reg * torch.eye(X.shape[1], device=self.device), X.T @ Z_target).solution
                         # Clamp to prevent explosion
                         V = torch.clamp(V, -max_val, max_val)
@@ -2158,7 +2164,7 @@ class FisherAwareSVD:
                         AtA = A.T @ A
                         BtB = U.T @ U
                         G = AtA * BtB
-                        d = torch.linalg.lstsq(G + reg * torch.eye(rank, device=self.device), h.unsqueeze(1)).solution.squeeze(1)
+                        d = torch.linalg.solve(G + reg * torch.eye(rank, device=self.device), h)
                         sign = torch.sign(d + 1e-12)
                         U = U * sign
                         # Clamp S to reasonable range (prevent extreme values)
@@ -2227,16 +2233,19 @@ class FisherAwareSVD:
 
                 return proj_improvement, proj_count
 
-            # First pass: calibrate attention and gate/up projections
-            imp1, cnt1 = calibrate_projections(attn_mlp_first)
-            total_improvement += imp1
-            calibrated_layers += cnt1
+            # 1-way grouping: calibrate all projections in one pass
+            imp, cnt = calibrate_projections(all_projections)
+            total_improvement += imp
+            calibrated_layers += cnt
 
-            # Second pass: calibrate down_proj with fresh capture (after gate/up updated)
-            if mlp_down:
-                imp2, cnt2 = calibrate_projections(mlp_down, capture_fresh=True)
-                total_improvement += imp2
-                calibrated_layers += cnt2
+            # Commented-out 2-way grouping option:
+            # imp1, cnt1 = calibrate_projections(attn_mlp_first)
+            # total_improvement += imp1
+            # calibrated_layers += cnt1
+            # if mlp_down:
+            #     imp2, cnt2 = calibrate_projections(mlp_down, capture_fresh=True)
+            #     total_improvement += imp2
+            #     calibrated_layers += cnt2
 
             # Forward through layer for next layer's input (now using calibrated weights)
             with torch.no_grad():
