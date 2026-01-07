@@ -1449,7 +1449,7 @@ class FisherAwareSVD:
                  fisher_lambda: float = 2.0,
                  use_als: bool = True,
                  als_iters: int = 2,
-                 token_sample_ratio: float = 0.1) -> nn.Module:
+                 token_sample_ratio: float = 0.2) -> nn.Module:
         """
         Full compression pipeline.
 
@@ -1487,7 +1487,6 @@ class FisherAwareSVD:
                                                  update_sigma=True, token_sample_ratio=token_sample_ratio)
                 else:
                     print(f"Starting Phase 4 M-optimization calibration...")
-                    self.phase4_calibration(calib_loader, calibration_steps)
             except Exception as e:
                 print(f"  Warning: Phase 4 calibration failed ({type(e).__name__}: {e}), skipping...")
                 print("  Proceeding without calibration.")
@@ -1501,347 +1500,6 @@ class FisherAwareSVD:
 
         return self.model
 
-    def phase4_calibration(self, calib_loader: List[Dict], num_steps: int = 50,
-                            token_sample_ratio: float = 0.1) -> None:
-        """
-        Phase 4: Per-linear-layer calibration within the subspace selected by Phase 3.
-
-        Key insight: Phase 2-3 selected which singular directions to keep based on
-        Fisher information. Phase 4 optimizes the coefficients WITHIN this subspace
-        to minimize reconstruction error on the input distribution.
-
-        Mathematical formulation:
-        - Given U_r, V_r from Phase 3 (the selected singular directions)
-        - Find optimal M ∈ R^{r×r} such that W' = U_r @ M @ V_r^T minimizes:
-          ||X @ (W' - W)^T||_F^2
-
-        Closed-form solution:
-        1. Compute Z = X @ V_r (project inputs to V_r subspace)
-        2. Compute Y = X @ W^T (target outputs)
-        3. Solve: M* = U_r^T @ Y^T @ Z @ (Z^T @ Z)^{-1}
-        4. SVD of M* to get final U', S', V'^T in proper form
-
-        This preserves the Fisher-selected directions while optimizing coefficients.
-
-        Args:
-            calib_loader: Calibration data loader
-            num_steps: Ignored (kept for API compatibility), uses closed-form solution
-            token_sample_ratio: Ratio of tokens to sample per sequence (default: 0.1)
-        """
-        print(f"Phase 4: Per-Linear-Layer Calibration (subspace optimization, token_sample={token_sample_ratio:.0%})...")
-
-        # Move embedding layers to device
-        if "opt" in self.model_name:
-            self.model.model.decoder.embed_tokens = self.model.model.decoder.embed_tokens.to(self.device)
-            self.model.model.decoder.embed_positions = self.model.model.decoder.embed_positions.to(self.device)
-        else:
-            self.model.model.embed_tokens = self.model.model.embed_tokens.to(self.device)
-
-        # Capture inputs to first layer - store on CPU to save GPU memory
-        dtype = next(iter(self.model.parameters())).dtype
-        inps = torch.zeros(
-            (len(calib_loader), self.model.seqlen, self.model.config.hidden_size),
-            dtype=dtype, device='cpu'  # FIXED: Store on CPU
-        )
-        cache = {'i': 0, 'attention_mask': None, 'position_ids': None}
-
-        class Catcher(nn.Module):
-            def __init__(self, module):
-                super().__init__()
-                self.module = module
-
-            def forward(self, inp, **kwargs):
-                # FIXED: Use inp[0] to remove batch dimension
-                inps[cache['i']] = inp[0].detach().cpu().to(inps.dtype)
-                cache['i'] += 1
-                if cache['attention_mask'] is None:
-                    cache['attention_mask'] = kwargs['attention_mask'].cpu()
-                    if 'position_ids' in kwargs:
-                        cache['position_ids'] = kwargs['position_ids'].cpu()
-                else:
-                    cache['attention_mask'] = torch.cat(
-                        (cache['attention_mask'], kwargs['attention_mask'].cpu()), dim=0
-                    )
-                    if 'position_ids' in kwargs:
-                        cache['position_ids'] = torch.cat(
-                            (cache['position_ids'], kwargs['position_ids'].cpu()), dim=0
-                        )
-                raise ValueError
-
-        self.layers[0] = self.layers[0].to(self.device)
-        original_layer0 = self.layers[0]
-        self.layers[0] = Catcher(self.layers[0])
-
-        for batch in calib_loader:
-            try:
-                batch = {k: v.to(self.device) for k, v in batch.items()}
-                self.model(**batch)
-            except ValueError:
-                pass
-
-        self.layers[0] = original_layer0
-        self.layers[0] = self.layers[0].cpu()
-
-        # Move embedding layers back to CPU
-        if "opt" in self.model_name:
-            self.model.model.decoder.embed_tokens = self.model.model.decoder.embed_tokens.cpu()
-            self.model.model.decoder.embed_positions = self.model.model.decoder.embed_positions.cpu()
-        else:
-            self.model.model.embed_tokens = self.model.model.embed_tokens.cpu()
-
-        torch.cuda.empty_cache()
-
-        attention_masks = cache['attention_mask']  # Keep on CPU
-        position_ids = cache.get('position_ids', None)
-
-        # Process each layer
-        outs = torch.zeros_like(inps)
-        total_improvement = 0.0
-        calibrated_layers = 0
-
-        # Compute tokens to sample
-        tokens_per_seq = max(1, int(self.model.seqlen * token_sample_ratio))
-        print(f"  Sampling {tokens_per_seq} tokens per sequence")
-
-        for layer_idx in tqdm(range(len(self.layers))):
-            layer = self.layers[layer_idx].float().to(self.device)
-
-            if layer_idx not in self.svd_components:
-                # Just forward through this layer
-                with torch.no_grad():
-                    for j in range(inps.shape[0]):
-                        inp_j = inps[j].unsqueeze(0).float().to(self.device)
-                        # FIXED: Use j:j+1 slice to preserve dimensions
-                        mask_j = attention_masks[j:j+1].to(self.device)
-                        if position_ids is not None and "opt" not in self.model_name:
-                            pos_j = position_ids[j:j+1].to(self.device)
-                            outs[j] = layer(inp_j, attention_mask=mask_j, position_ids=pos_j, use_cache=False)[0].cpu().to(dtype)
-                        else:
-                            outs[j] = layer(inp_j, attention_mask=mask_j, use_cache=False)[0].cpu().to(dtype)
-                self.layers[layer_idx] = layer.to(dtype).cpu()
-                inps = outs.clone()
-                torch.cuda.empty_cache()
-                continue
-
-            # Separate projections: attention/gate/up vs down_proj
-            subset = find_layers(layer)
-            attn_mlp_first = []
-            mlp_down = []
-            for name in subset:
-                if name in self.svd_components[layer_idx]:
-                    if 'down' in name.lower():
-                        mlp_down.append(name)
-                    else:
-                        attn_mlp_first.append(name)
-
-            # Helper function to calibrate a set of projections
-            def calibrate_projections(proj_names: list):
-                nonlocal total_improvement, calibrated_layers
-
-                if not proj_names:
-                    return
-
-                layer_inputs = {name: [] for name in proj_names}
-                handles = []
-                current_mask = {'mask': None}
-
-                def make_hook(name):
-                    def hook(module, inp, out):
-                        x = inp[0].detach().float()
-
-                        # Handle 2D vs 3D
-                        if x.dim() == 2:
-                            layer_inputs[name].append(x.cpu())
-                            return
-
-                        seq_len = x.shape[1]
-                        mask = current_mask['mask']
-                        valid_indices = None
-
-                        if mask is not None:
-                            if mask.dim() == 4:
-                                mask_row = mask[0, 0, 0, :]
-                                valid_mask = mask_row >= -1.0
-                            elif mask.dim() == 2:
-                                valid_mask = mask[0] > 0.5
-                            else:
-                                valid_mask = None
-
-                            if valid_mask is not None:
-                                valid_indices = torch.where(valid_mask)[0]
-                                if len(valid_indices) == 0:
-                                    valid_indices = None
-
-                        if valid_indices is None:
-                            valid_indices = torch.arange(seq_len, device=x.device)
-
-                        num_valid = len(valid_indices)
-                        num_sample = min(tokens_per_seq, num_valid)
-
-                        if num_sample > 0 and num_valid > num_sample:
-                            perm = torch.randperm(num_valid, device=x.device)[:num_sample]
-                            sample_indices = valid_indices[perm]
-                            x = x[:, sample_indices, :]
-                        elif num_sample > 0:
-                            x = x[:, valid_indices, :]
-
-                        if x.numel() > 0:
-                            layer_inputs[name].append(x.cpu())
-                    return hook
-
-                for name in proj_names:
-                    linear = self._get_module_by_name(layer, name)
-                    handle = linear.register_forward_hook(make_hook(name))
-                    handles.append(handle)
-
-                with torch.no_grad():
-                    for j in range(inps.shape[0]):
-                        inp_j = inps[j].unsqueeze(0).float().to(self.device)
-                        mask_j = attention_masks[j:j+1].to(self.device)
-                        current_mask['mask'] = mask_j
-                        if position_ids is not None and "opt" not in self.model_name:
-                            pos_j = position_ids[j:j+1].to(self.device)
-                            _ = layer(inp_j, attention_mask=mask_j, position_ids=pos_j, use_cache=False)
-                        else:
-                            _ = layer(inp_j, attention_mask=mask_j, use_cache=False)
-
-                for handle in handles:
-                    handle.remove()
-
-                # Calibrate each projection
-                for name in proj_names:
-                    if len(layer_inputs.get(name, [])) == 0:
-                        continue
-
-                    U_r, S_r, VT_r, bias = self.svd_components[layer_idx][name]
-                    rank = len(S_r)
-                    original_linear = self._get_module_by_name(layer, name)
-
-                    X = torch.cat([x.reshape(-1, x.shape[-1]) for x in layer_inputs[name]], dim=0).to(self.device)
-                    del layer_inputs[name]
-
-                    W = original_linear.weight.data.float().to(self.device)
-                    U_r = U_r.float().to(self.device)
-                    VT_r = VT_r.float().to(self.device)
-                    V_r = VT_r.T
-
-                    S_r_dev = S_r.float().to(self.device)  # Keep for fallback
-                    W_before = (U_r * S_r_dev) @ VT_r
-                    loss_before = ((X @ W_before.T - X @ W.T) ** 2).mean().item()
-                    del W_before
-
-                    # Skip optimization if loss_before is already very small
-                    skip_threshold = 1e-6
-                    if loss_before < skip_threshold:
-                        if layer_idx < 3:
-                            print(f"    L{layer_idx} {name}: skipped (loss_before={loss_before:.2e} < {skip_threshold:.0e})")
-                        del X, W, U_r, VT_r, V_r, S_r_dev
-                        torch.cuda.empty_cache()
-                        continue
-
-                    # Subspace optimization with increased regularization
-                    reg = 1e-4
-
-                    Z = X @ V_r
-                    ZTZ = Z.T @ Z + reg * torch.eye(rank, device=self.device)
-                    ZTX = Z.T @ X
-                    WTU = W.T @ U_r
-                    ZTY_Ur = ZTX @ WTU
-                    del ZTX, WTU
-
-                    M_star = torch.linalg.lstsq(ZTZ, ZTY_Ur).solution
-                    del ZTZ, ZTY_Ur
-
-                    P, Lambda, QT = torch.linalg.svd(M_star, full_matrices=False)
-                    del M_star
-
-                    U_new = U_r @ QT.T
-                    # Clamp S to reasonable range
-                    S_new = torch.clamp(Lambda, min=1e-8, max=1e6)
-                    VT_new = P.T @ VT_r
-                    del P, Lambda, QT
-
-                    W_after = (U_new * S_new) @ VT_new
-                    loss_after = ((X @ W_after.T - X @ W.T) ** 2).mean().item()
-
-                    # Check for NaN/Inf OR if optimization made things worse OR extreme weights - fallback to original SVD
-                    use_original = False
-                    if torch.isnan(W_after).any() or torch.isinf(W_after).any() or math.isnan(loss_after) or math.isinf(loss_after):
-                        if layer_idx < 3:
-                            print(f"    L{layer_idx} {name}: numerical issue, using original SVD")
-                        use_original = True
-                    elif loss_after > loss_before and loss_before > 1e-10:
-                        # Optimization made things worse - revert to original
-                        if layer_idx < 3:
-                            print(f"    L{layer_idx} {name}: optimization worsened (before={loss_before:.6f} after={loss_after:.6f}), using original SVD")
-                        use_original = True
-                    else:
-                        # Additional check: ensure weights are not too extreme compared to original
-                        W_orig = (U_r * S_r_dev) @ VT_r
-                        orig_max = W_orig.abs().max().item()
-                        new_max = W_after.abs().max().item()
-                        # If new weights are more than 10x larger than original, revert
-                        if orig_max > 0 and new_max > 10 * orig_max:
-                            if layer_idx < 3:
-                                print(f"    L{layer_idx} {name}: extreme weights (orig_max={orig_max:.2f}, new_max={new_max:.2f}), using original SVD")
-                            use_original = True
-                        del W_orig
-
-                    if use_original:
-                        # Restore original components
-                        U_new = U_r.clone()
-                        S_new = S_r_dev.clone()
-                        VT_new = VT_r.clone()
-                        W_after = (U_new * S_new) @ VT_new
-                        loss_after = loss_before
-                    del U_r, VT_r, V_r, S_r_dev
-
-                    min_loss_threshold = 1e-10
-                    if loss_before > min_loss_threshold:
-                        improvement = (1 - loss_after / loss_before) * 100
-                        improvement = max(-100.0, min(100.0, improvement))
-                        total_improvement += improvement
-                        calibrated_layers += 1
-                        if layer_idx < 3:
-                            print(f"    L{layer_idx} {name}: before={loss_before:.6f} after={loss_after:.6f} improvement={improvement:.1f}%")
-
-                    self.svd_components[layer_idx][name] = (U_new.cpu(), S_new.cpu(), VT_new.cpu(),
-                                                            bias.cpu() if bias is not None else None)
-
-                    # Write back with torch.no_grad() to avoid leaf variable error
-                    with torch.no_grad():
-                        original_linear.weight.copy_(W_after.to(original_linear.weight.dtype))
-
-                    del U_new, S_new, VT_new, W_after, X, W, Z
-                    torch.cuda.empty_cache()
-
-            # First pass: attention + gate/up
-            calibrate_projections(attn_mlp_first)
-
-            # Second pass: down_proj with fresh capture
-            if mlp_down:
-                calibrate_projections(mlp_down)
-
-            # Forward through layer for next layer's input
-            with torch.no_grad():
-                for j in range(inps.shape[0]):
-                    inp_j = inps[j].unsqueeze(0).float().to(self.device)
-                    mask_j = attention_masks[j:j+1].to(self.device)
-                    if position_ids is not None and "opt" not in self.model_name:
-                        pos_j = position_ids[j:j+1].to(self.device)
-                        outs[j] = layer(inp_j, attention_mask=mask_j, position_ids=pos_j, use_cache=False)[0].cpu().to(dtype)
-                    else:
-                        outs[j] = layer(inp_j, attention_mask=mask_j, use_cache=False)[0].cpu().to(dtype)
-
-            self.layers[layer_idx] = layer.to(dtype).cpu()
-            inps = outs.clone()
-            torch.cuda.empty_cache()
-
-        if calibrated_layers > 0:
-            avg_improvement = total_improvement / calibrated_layers
-            print(f"  Average improvement: {avg_improvement:.1f}% across {calibrated_layers} linear layers")
-        else:
-            print("  No layers calibrated")
 
     def _get_module_by_name(self, parent: nn.Module, name: str) -> nn.Module:
         """Get a submodule by its name path."""
@@ -1852,7 +1510,7 @@ class FisherAwareSVD:
         return module
 
     def phase4_als_calibration(self, calib_loader: List[Dict], num_iters: int = 2,
-                                update_sigma: bool = True, token_sample_ratio: float = 0.1) -> None:
+                                update_sigma: bool = True, token_sample_ratio: float = 0.2) -> None:
         """
         Phase 4: ALS (Alternating Least Squares) Calibration.
 
@@ -1986,14 +1644,22 @@ class FisherAwareSVD:
             # NOTE: We'll do two passes - first for attention + gate/up, then for down_proj
             # because down_proj's input depends on gate/up outputs
             subset = find_layers(layer)
+            
 
-            # 1-way grouping: all projections in one pass
-            all_projections = []
+            # ========== 1-way 分组 ==========
+            # Separate projections: attention/gate/up vs down_proj
+            attn_mlp_first = []  # q, k, v, o, gate, up
+            mlp_down = []  # down_proj
             for name in subset:
                 if name in self.svd_components[layer_idx]:
-                    all_projections.append(name)
+                    if 'down' not in name.lower():
+                        attn_mlp_first.append(name)
+                    else:
+                        attn_mlp_first.append(name)
 
-            # Commented-out 2-way grouping option:
+
+            # ========== 2-way 分组 ==========
+            # Separate projections: attention/gate/up vs down_proj
             # attn_mlp_first = []  # q, k, v, o, gate, up
             # mlp_down = []  # down_proj
             # for name in subset:
@@ -2003,6 +1669,44 @@ class FisherAwareSVD:
             #         else:
             #             attn_mlp_first.append(name)
 
+
+            # # ========== 4-way 分组 ==========
+            # proj_all = [n for n in subset if n in self.svd_components[layer_idx]]
+            
+            # # 精确分组
+            # # Separate projections: attention/gate/up vs down_proj
+            # ATTN_QKV_LEAF = {"q_proj", "k_proj", "v_proj", "qkv_proj", "Wqkv", "query_key_value", "c_attn"}
+            # ATTN_O_LEAF = {"o_proj", "out_proj"}
+            # MLP_GATE_UP_LEAF = {"gate_proj", "up_proj", "fc1", "c_fc", "dense_h_to_4h"}
+            # MLP_DOWN_LEAF = {"down_proj", "fc2", "dense_4h_to_h"}
+            
+            # ATTN_PARENT = {"self_attn", "attn", "attention", "mha"}
+            # MLP_PARENT = {"mlp", "ffn", "feed_forward", "feedforward"}
+            
+            # attn_qkv, attn_o, mlp_gate_up, mlp_down = [], [], [], []
+            
+            # for name in proj_all:
+            #     parts = name.split(".")
+            #     leaf = parts[-1]
+            #     is_attn = any(p in ATTN_PARENT for p in parts)
+            #     is_mlp = any(p in MLP_PARENT for p in parts)
+                
+            #     if leaf in ATTN_QKV_LEAF:
+            #         attn_qkv.append(name)
+            #     elif leaf in ATTN_O_LEAF:
+            #         attn_o.append(name)
+            #     elif leaf in MLP_GATE_UP_LEAF:
+            #         mlp_gate_up.append(name)
+            #     elif leaf in MLP_DOWN_LEAF:
+            #         mlp_down.append(name)
+            #     elif is_attn:
+            #         attn_o.append(name)  # fallback
+            #     elif is_mlp:
+            #         mlp_gate_up.append(name)  # fallback
+            #     else:
+            #         attn_qkv.append(name)  # fallback
+
+            
             # Helper function to run calibration on a set of projections
             def calibrate_projections(proj_names: list, capture_fresh: bool = False):
                 nonlocal layer, inps, attention_masks, position_ids
@@ -2012,64 +1716,27 @@ class FisherAwareSVD:
 
                 layer_inputs = {name: [] for name in proj_names}
                 handles = []
-                current_mask = {'mask': None}
 
                 def make_hook(name):
                     def hook(module, inp, out):
                         x = inp[0].detach().float()
-
-                        # Handle both 2D (batch*seq, hidden) and 3D (batch, seq, hidden)
+                        
+                        # 处理 2D 输入
                         if x.dim() == 2:
-                            # 2D input: (N, hidden) - no token dimension to sample
-                            # Just store directly
+                            T = x.shape[0]
+                            if T > tokens_per_seq:
+                                idx = torch.randperm(T, device=x.device)[:tokens_per_seq]
+                                x = x.index_select(0, idx)
                             layer_inputs[name].append(x.cpu())
                             return
-
-                        # 3D input: (batch, seq, hidden)
-                        seq_len = x.shape[1]
-
-                        # Get valid token indices from attention mask
-                        mask = current_mask['mask']
-                        valid_indices = None
-
-                        if mask is not None:
-                            # Handle different mask formats
-                            if mask.dim() == 4:
-                                # 4D causal mask: (batch, 1, seq, seq) - additive format
-                                # Valid tokens have mask value >= -1.0 (close to 0)
-                                # Invalid tokens have -inf or very large negative
-                                mask_row = mask[0, 0, 0, :]  # First row
-                                valid_mask = mask_row >= -1.0
-                            elif mask.dim() == 2:
-                                # 2D mask: (batch, seq) - usually 0/1 format
-                                valid_mask = mask[0] > 0.5
-                            else:
-                                valid_mask = None
-
-                            if valid_mask is not None:
-                                valid_indices = torch.where(valid_mask)[0]
-                                # Fallback if no valid tokens found (mask format issue)
-                                if len(valid_indices) == 0:
-                                    valid_indices = None
-
-                        if valid_indices is None:
-                            # Fallback: all tokens are valid
-                            valid_indices = torch.arange(seq_len, device=x.device)
-
-                        # Sample from valid tokens only
-                        num_valid = len(valid_indices)
-                        num_sample = min(tokens_per_seq, num_valid)
-
-                        if num_sample > 0 and num_valid > num_sample:
-                            perm = torch.randperm(num_valid, device=x.device)[:num_sample]
-                            sample_indices = valid_indices[perm]
-                            x = x[:, sample_indices, :]
-                        elif num_sample > 0:
-                            x = x[:, valid_indices, :]
-
-                        if x.numel() > 0:
-                            layer_inputs[name].append(x.cpu())
+                        
+                        # 处理 3D 输入：简单随机采样（与版本1一致）
+                        if x.shape[1] > tokens_per_seq:
+                            indices = torch.randperm(x.shape[1], device=x.device)[:tokens_per_seq]
+                            x = x[:, indices, :]
+                        layer_inputs[name].append(x.cpu())
                     return hook
+                
 
                 for name in proj_names:
                     linear = self._get_module_by_name(layer, name)
@@ -2081,7 +1748,6 @@ class FisherAwareSVD:
                     for j in range(inps.shape[0]):
                         inp_j = inps[j].unsqueeze(0).float().to(self.device)
                         mask_j = attention_masks[j].unsqueeze(0).to(self.device)
-                        current_mask['mask'] = mask_j
                         if position_ids is not None and "opt" not in self.model_name:
                             pos_j = position_ids[j].unsqueeze(0).to(self.device)
                             _ = layer(inp_j, attention_mask=mask_j, position_ids=pos_j, use_cache=False)
@@ -2103,85 +1769,75 @@ class FisherAwareSVD:
                     rank = len(S_r)
                     original_linear = self._get_module_by_name(layer, name)
 
-                    # Stack inputs - ensure contiguous memory layout
-                    X = torch.cat([x.reshape(-1, x.shape[-1]) for x in layer_inputs[name]], dim=0).contiguous().to(self.device)
+                    # Stack inputs
+                    X = torch.cat([x.reshape(-1, x.shape[-1]) for x in layer_inputs[name]], dim=0).to(self.device)
+                    # X = torch.cat([x.reshape(-1, x.shape[-1]) for x in layer_inputs[name]], dim=0).to(self.device).contiguous() # !!!
                     del layer_inputs[name]
 
-                    # Teacher signal - ensure contiguous for matmul
-                    W = original_linear.weight.data.float().contiguous().to(self.device)
-                    Y = X @ W.T.contiguous()
+                    # Teacher signal
+                    W = original_linear.weight.data.float().to(self.device)
+                    Y = X @ W.T
+                    # Y = (X @ W.T).contiguous() # !!!
 
-                    # SVD components - ensure contiguous
-                    U = U_r.float().contiguous().to(self.device)
-                    S = S_r.float().contiguous().to(self.device)
-                    VT = VT_r.float().contiguous().to(self.device)
-                    V = VT.T.contiguous()
+                    # SVD components
+                    U = U_r.float().to(self.device)
+                    S = S_r.float().to(self.device)
+                    V = VT_r.T.float().to(self.device)
 
                     # Loss before
-                    W_before = (U * S) @ VT
-                    loss_before = ((X @ W_before.T.contiguous() - Y) ** 2).mean().item()
+                    W_before = (U * S) @ VT_r.float().to(self.device)
+                    loss_before = ((X @ W_before.T - Y) ** 2).mean().item()
                     del W_before
 
                     # Skip ALS if loss_before is already very small - nothing meaningful to optimize
-                    # Relative threshold: skip if reconstruction error is < 0.1% of signal magnitude
-                    signal_scale = (Y ** 2).mean().item()
-                    skip_als_threshold = max(1e-4, signal_scale * 1e-3)  # At least 1e-4, or 0.1% of signal
+                    skip_als_threshold = 1e-6
                     if loss_before < skip_als_threshold:
                         if layer_idx < 3:
-                            print(f"    L{layer_idx} {name}: skipped ALS (loss_before={loss_before:.2e} < {skip_als_threshold:.2e}, signal={signal_scale:.2e})")
+                            print(f"    L{layer_idx} {name}: skipped ALS (loss_before={loss_before:.2e} < {skip_als_threshold:.0e})")
                         # Just keep original SVD, no changes needed
-                        del X, W, Y, U, S, V, VT
+                        del X, W, Y, U, S, V
                         torch.cuda.empty_cache()
                         continue
 
-                    # Adaptive regularization based on data scale
-                    # Use stronger regularization to prevent numerical instability
-                    data_scale = max(X.abs().max().item(), Y.abs().max().item(), 1.0)
-                    reg = max(1e-4, data_scale * 1e-6)  # At least 1e-4
+                    reg = 1e-6  # Increased regularization for numerical stability
                     max_val = 1e6  # Clamp threshold to prevent value explosion
 
                     # ALS iterations
                     for als_iter in range(num_iters):
                         # Step A: Fix V, S, solve U (with regularization)
-                        Z = (X @ V) * S
-                        # Regularized least squares: solve (Z^T Z + λI)^{-1} Z^T Y
-                        ZTZ = Z.T @ Z + reg * torch.eye(rank, device=self.device)
-                        ZTY = Z.T @ Y
-                        U_T_new = torch.linalg.lstsq(ZTZ.contiguous(), ZTY.contiguous()).solution
-                        U = U_T_new.T.contiguous()
-                        # Clamp to prevent explosion
-                        U = torch.clamp(U, -max_val, max_val)
-                        del Z, ZTZ, ZTY, U_T_new
+                        Z = (X @ V) * S  # (N, r)
+                        # Use lstsq for better numerical stability
+                        U_T_new = torch.linalg.lstsq(Z, Y).solution  # (r, out_dim)
+                        U = U_T_new.T  # (out_dim, r)
+                        del Z, U_T_new
 
-                        # Step B: Fix U, S, solve V (using lstsq for numerical stability)
-                        U_s = U * S
+                        # Step B: Fix U, S, solve V (with regularization)
+                        U_s = U * S  # (out_dim, r)
                         G = U_s.T @ U_s + reg * torch.eye(rank, device=self.device)
-                        Z_target = torch.linalg.lstsq(G.contiguous(), (Y @ U_s).T.contiguous()).solution.T.contiguous()
-                        XTX = X.T @ X + reg * torch.eye(X.shape[1], device=self.device)
-                        V = torch.linalg.lstsq(XTX.contiguous(), (X.T @ Z_target).contiguous()).solution.contiguous()
-                        # Clamp to prevent explosion
-                        V = torch.clamp(V, -max_val, max_val)
-                        del U_s, G, Z_target, XTX
+                        Z_target = (Y @ U_s) @ torch.linalg.inv(G)  # (N, r)
+                        # Z_target = torch.linalg.solve(G, (Y @ U_s).T).T
+                        # Solve X @ V = Z_target -> V = lstsq(X, Z_target)
+                        V = torch.linalg.lstsq(X, Z_target).solution  # (in_dim, r)
+                        del U_s, G, Z_target
 
-                    # Step C: Fix U, V, solve D (using lstsq for numerical stability)
+                    # Step C: Fix U, V, solve D                    
                     if update_sigma:
-                        A = X @ V
-                        YB = Y @ U
-                        h = (A * YB).sum(dim=0).contiguous()
-                        AtA = A.T @ A
-                        BtB = U.T @ U
-                        G = (AtA * BtB).contiguous()
-                        d = torch.linalg.lstsq(G + reg * torch.eye(rank, device=self.device), h.unsqueeze(1)).solution.squeeze(1)
-                        sign = torch.sign(d + 1e-12)
-                        U = (U * sign).contiguous()
-                        # Clamp S to reasonable range (prevent extreme values)
-                        S = torch.clamp(torch.abs(d), min=1e-8, max=max_val).contiguous()
-                        del A, YB, h, AtA, BtB, G, d, sign
+                        A = X @ V  # (N, r)
+                        YB = Y @ U  # (N, r)
+
+                        h = (A * YB).sum(dim=0)  # (r,)
+                        AtA = A.T @ A  # (r, r)
+                        BtB = U.T @ U  # (r, r)
+                        G = AtA * BtB  # Hadamard product (r, r)
+
+                        d = torch.linalg.solve(G + reg * torch.eye(rank, device=self.device), h)
+                        S = torch.abs(d)  # Keep positive
+                        del A, YB, h, AtA, BtB, G, d
 
                     # Loss after
-                    VT = V.T.contiguous()
-                    W_after = ((U * S) @ VT).contiguous()
-                    loss_after = ((X @ W_after.T.contiguous() - Y) ** 2).mean().item()
+                    VT = V.T
+                    W_after = (U * S) @ VT
+                    loss_after = ((X @ W_after.T - Y) ** 2).mean().item()
 
                     # Check for NaN/Inf OR if ALS made things worse OR extreme weights - fallback to original SVD
                     use_original = False
@@ -2196,7 +1852,7 @@ class FisherAwareSVD:
                         use_original = True
                     else:
                         # Additional check: ensure weights are not too extreme compared to original
-                        W_orig = ((U_r.float().contiguous().to(self.device) * S_r.float().contiguous().to(self.device)) @ VT_r.float().contiguous().to(self.device)).contiguous()
+                        W_orig = (U_r.float().to(self.device) * S_r.float().to(self.device)) @ VT_r.float().to(self.device)
                         orig_max = W_orig.abs().max().item()
                         new_max = W_after.abs().max().item()
                         # If new weights are more than 10x larger than original, revert
@@ -2208,10 +1864,10 @@ class FisherAwareSVD:
 
                     if use_original:
                         # Restore original components
-                        U = U_r.float().contiguous().to(self.device)
-                        S = S_r.float().contiguous().to(self.device)
-                        VT = VT_r.float().contiguous().to(self.device)
-                        W_after = ((U * S) @ VT).contiguous()
+                        U = U_r.float().to(self.device)
+                        S = S_r.float().to(self.device)
+                        VT = VT_r.float().to(self.device)
+                        W_after = (U * S) @ VT
                         loss_after = loss_before  # No change
 
                     # Protection for small loss_before
@@ -2227,32 +1883,39 @@ class FisherAwareSVD:
                         if layer_idx < 3:
                             print(f"    L{layer_idx} {name}: skipped (loss_before={loss_before:.2e} < threshold)")
 
-                    # Update SVD components (ensure contiguous before saving)
-                    self.svd_components[layer_idx][name] = (U.contiguous().cpu(), S.contiguous().cpu(), VT.contiguous().cpu(),
+                    # Update SVD components
+                    self.svd_components[layer_idx][name] = (U.cpu(), S.cpu(), VT.cpu(),
                                                             bias.cpu() if bias is not None else None)
 
                     # Write back with torch.no_grad() to avoid leaf variable error
                     with torch.no_grad():
-                        original_linear.weight.copy_(W_after.contiguous().to(original_linear.weight.dtype))
+                        original_linear.weight.copy_(W_after.to(original_linear.weight.dtype))
 
                     del U, S, V, VT, W_after, X, W, Y
                     torch.cuda.empty_cache()
 
                 return proj_improvement, proj_count
 
-            # 1-way grouping: calibrate all projections in one pass
-            imp, cnt = calibrate_projections(all_projections)
-            total_improvement += imp
-            calibrated_layers += cnt
+            # 1/2-way 分组使用的代码
+            # First pass: calibrate attention and gate/up projections
+            imp1, cnt1 = calibrate_projections(attn_mlp_first)
+            total_improvement += imp1
+            calibrated_layers += cnt1
+            # Second pass: calibrate down_proj with fresh capture (after gate/up updated)
+            if mlp_down:
+                imp2, cnt2 = calibrate_projections(mlp_down, capture_fresh=True)
+                total_improvement += imp2
+                calibrated_layers += cnt2
 
-            # Commented-out 2-way grouping option:
-            # imp1, cnt1 = calibrate_projections(attn_mlp_first)
-            # total_improvement += imp1
-            # calibrated_layers += cnt1
-            # if mlp_down:
-            #     imp2, cnt2 = calibrate_projections(mlp_down, capture_fresh=True)
-            #     total_improvement += imp2
-            #     calibrated_layers += cnt2
+            # 4-way 分组使用的代码
+            # # 按依赖顺序校准：qkv -> o -> gate/up -> down
+            # imp1, cnt1 = calibrate_projections(attn_qkv)
+            # imp2, cnt2 = calibrate_projections(attn_o)
+            # imp3, cnt3 = calibrate_projections(mlp_gate_up)
+            # imp4, cnt4 = calibrate_projections(mlp_down)
+            
+            # total_improvement += imp1 + imp2 + imp3 + imp4
+            # calibrated_layers += cnt1 + cnt2 + cnt3 + cnt4
 
             # Forward through layer for next layer's input (now using calibrated weights)
             with torch.no_grad():
@@ -2293,7 +1956,7 @@ def fisher_aware_svd_compression(model_name: str, model: nn.Module,
                                   fisher_lambda: float = 2.0,
                                   use_als: bool = True,
                                   als_iters: int = 2,
-                                  token_sample_ratio: float = 0.1) -> nn.Module:
+                                  token_sample_ratio: float = 0.2) -> nn.Module:
     """
     Main entry point for Fisher-Aware SVD compression.
 
