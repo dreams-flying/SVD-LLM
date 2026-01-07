@@ -2123,16 +2123,21 @@ class FisherAwareSVD:
                     del W_before
 
                     # Skip ALS if loss_before is already very small - nothing meaningful to optimize
-                    skip_als_threshold = 1e-6
+                    # Relative threshold: skip if reconstruction error is < 0.1% of signal magnitude
+                    signal_scale = (Y ** 2).mean().item()
+                    skip_als_threshold = max(1e-4, signal_scale * 1e-3)  # At least 1e-4, or 0.1% of signal
                     if loss_before < skip_als_threshold:
                         if layer_idx < 3:
-                            print(f"    L{layer_idx} {name}: skipped ALS (loss_before={loss_before:.2e} < {skip_als_threshold:.0e})")
+                            print(f"    L{layer_idx} {name}: skipped ALS (loss_before={loss_before:.2e} < {skip_als_threshold:.2e}, signal={signal_scale:.2e})")
                         # Just keep original SVD, no changes needed
-                        del X, W, Y, U, S, V
+                        del X, W, Y, U, S, V, VT
                         torch.cuda.empty_cache()
                         continue
 
-                    reg = 1e-6  # Regularization for numerical stability
+                    # Adaptive regularization based on data scale
+                    # Use stronger regularization to prevent numerical instability
+                    data_scale = max(X.abs().max().item(), Y.abs().max().item(), 1.0)
+                    reg = max(1e-4, data_scale * 1e-6)  # At least 1e-4
                     max_val = 1e6  # Clamp threshold to prevent value explosion
 
                     # ALS iterations
@@ -2148,17 +2153,17 @@ class FisherAwareSVD:
                         U = torch.clamp(U, -max_val, max_val)
                         del Z, ZTZ, ZTY, U_T_new
 
-                        # Step B: Fix U, S, solve V (using inv for small system)
+                        # Step B: Fix U, S, solve V (using lstsq for numerical stability)
                         U_s = U * S
                         G = U_s.T @ U_s + reg * torch.eye(rank, device=self.device)
-                        Z_target = ((Y @ U_s) @ torch.linalg.inv(G.contiguous())).contiguous()
+                        Z_target = torch.linalg.lstsq(G.contiguous(), (Y @ U_s).T.contiguous()).solution.T.contiguous()
                         XTX = X.T @ X + reg * torch.eye(X.shape[1], device=self.device)
                         V = torch.linalg.lstsq(XTX.contiguous(), (X.T @ Z_target).contiguous()).solution.contiguous()
                         # Clamp to prevent explosion
                         V = torch.clamp(V, -max_val, max_val)
                         del U_s, G, Z_target, XTX
 
-                    # Step C: Fix U, V, solve D
+                    # Step C: Fix U, V, solve D (using lstsq for numerical stability)
                     if update_sigma:
                         A = X @ V
                         YB = Y @ U
@@ -2166,7 +2171,7 @@ class FisherAwareSVD:
                         AtA = A.T @ A
                         BtB = U.T @ U
                         G = (AtA * BtB).contiguous()
-                        d = torch.linalg.solve(G + reg * torch.eye(rank, device=self.device), h)
+                        d = torch.linalg.lstsq(G + reg * torch.eye(rank, device=self.device), h.unsqueeze(1)).solution.squeeze(1)
                         sign = torch.sign(d + 1e-12)
                         U = (U * sign).contiguous()
                         # Clamp S to reasonable range (prevent extreme values)
