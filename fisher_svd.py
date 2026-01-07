@@ -2103,22 +2103,23 @@ class FisherAwareSVD:
                     rank = len(S_r)
                     original_linear = self._get_module_by_name(layer, name)
 
-                    # Stack inputs
-                    X = torch.cat([x.reshape(-1, x.shape[-1]) for x in layer_inputs[name]], dim=0).to(self.device)
+                    # Stack inputs - ensure contiguous memory layout
+                    X = torch.cat([x.reshape(-1, x.shape[-1]) for x in layer_inputs[name]], dim=0).contiguous().to(self.device)
                     del layer_inputs[name]
 
-                    # Teacher signal
-                    W = original_linear.weight.data.float().to(self.device)
-                    Y = X @ W.T
+                    # Teacher signal - ensure contiguous for matmul
+                    W = original_linear.weight.data.float().contiguous().to(self.device)
+                    Y = X @ W.T.contiguous()
 
-                    # SVD components
-                    U = U_r.float().to(self.device)
-                    S = S_r.float().to(self.device)
-                    V = VT_r.T.float().to(self.device)
+                    # SVD components - ensure contiguous
+                    U = U_r.float().contiguous().to(self.device)
+                    S = S_r.float().contiguous().to(self.device)
+                    VT = VT_r.float().contiguous().to(self.device)
+                    V = VT.T.contiguous()
 
                     # Loss before
-                    W_before = (U * S) @ VT_r.float().to(self.device)
-                    loss_before = ((X @ W_before.T - Y) ** 2).mean().item()
+                    W_before = (U * S) @ VT
+                    loss_before = ((X @ W_before.T.contiguous() - Y) ** 2).mean().item()
                     del W_before
 
                     # Skip ALS if loss_before is already very small - nothing meaningful to optimize
@@ -2141,8 +2142,8 @@ class FisherAwareSVD:
                         # Regularized least squares: solve (Z^T Z + λI)^{-1} Z^T Y
                         ZTZ = Z.T @ Z + reg * torch.eye(rank, device=self.device)
                         ZTY = Z.T @ Y
-                        U_T_new = torch.linalg.lstsq(ZTZ, ZTY).solution
-                        U = U_T_new.T
+                        U_T_new = torch.linalg.lstsq(ZTZ.contiguous(), ZTY.contiguous()).solution
+                        U = U_T_new.T.contiguous()
                         # Clamp to prevent explosion
                         U = torch.clamp(U, -max_val, max_val)
                         del Z, ZTZ, ZTY, U_T_new
@@ -2150,31 +2151,32 @@ class FisherAwareSVD:
                         # Step B: Fix U, S, solve V (using inv for small system)
                         U_s = U * S
                         G = U_s.T @ U_s + reg * torch.eye(rank, device=self.device)
-                        Z_target = (Y @ U_s) @ torch.linalg.inv(G)
-                        V = torch.linalg.lstsq(X.T @ X + reg * torch.eye(X.shape[1], device=self.device), X.T @ Z_target).solution
+                        Z_target = ((Y @ U_s) @ torch.linalg.inv(G.contiguous())).contiguous()
+                        XTX = X.T @ X + reg * torch.eye(X.shape[1], device=self.device)
+                        V = torch.linalg.lstsq(XTX.contiguous(), (X.T @ Z_target).contiguous()).solution.contiguous()
                         # Clamp to prevent explosion
                         V = torch.clamp(V, -max_val, max_val)
-                        del U_s, G, Z_target
+                        del U_s, G, Z_target, XTX
 
                     # Step C: Fix U, V, solve D
                     if update_sigma:
                         A = X @ V
                         YB = Y @ U
-                        h = (A * YB).sum(dim=0)
+                        h = (A * YB).sum(dim=0).contiguous()
                         AtA = A.T @ A
                         BtB = U.T @ U
-                        G = AtA * BtB
+                        G = (AtA * BtB).contiguous()
                         d = torch.linalg.solve(G + reg * torch.eye(rank, device=self.device), h)
                         sign = torch.sign(d + 1e-12)
-                        U = U * sign
+                        U = (U * sign).contiguous()
                         # Clamp S to reasonable range (prevent extreme values)
-                        S = torch.clamp(torch.abs(d), min=1e-8, max=max_val)
+                        S = torch.clamp(torch.abs(d), min=1e-8, max=max_val).contiguous()
                         del A, YB, h, AtA, BtB, G, d, sign
 
                     # Loss after
-                    VT = V.T
-                    W_after = (U * S) @ VT
-                    loss_after = ((X @ W_after.T - Y) ** 2).mean().item()
+                    VT = V.T.contiguous()
+                    W_after = ((U * S) @ VT).contiguous()
+                    loss_after = ((X @ W_after.T.contiguous() - Y) ** 2).mean().item()
 
                     # Check for NaN/Inf OR if ALS made things worse OR extreme weights - fallback to original SVD
                     use_original = False
@@ -2189,7 +2191,7 @@ class FisherAwareSVD:
                         use_original = True
                     else:
                         # Additional check: ensure weights are not too extreme compared to original
-                        W_orig = (U_r.float().to(self.device) * S_r.float().to(self.device)) @ VT_r.float().to(self.device)
+                        W_orig = ((U_r.float().contiguous().to(self.device) * S_r.float().contiguous().to(self.device)) @ VT_r.float().contiguous().to(self.device)).contiguous()
                         orig_max = W_orig.abs().max().item()
                         new_max = W_after.abs().max().item()
                         # If new weights are more than 10x larger than original, revert
@@ -2201,10 +2203,10 @@ class FisherAwareSVD:
 
                     if use_original:
                         # Restore original components
-                        U = U_r.float().to(self.device)
-                        S = S_r.float().to(self.device)
-                        VT = VT_r.float().to(self.device)
-                        W_after = (U * S) @ VT
+                        U = U_r.float().contiguous().to(self.device)
+                        S = S_r.float().contiguous().to(self.device)
+                        VT = VT_r.float().contiguous().to(self.device)
+                        W_after = ((U * S) @ VT).contiguous()
                         loss_after = loss_before  # No change
 
                     # Protection for small loss_before
@@ -2220,13 +2222,13 @@ class FisherAwareSVD:
                         if layer_idx < 3:
                             print(f"    L{layer_idx} {name}: skipped (loss_before={loss_before:.2e} < threshold)")
 
-                    # Update SVD components
-                    self.svd_components[layer_idx][name] = (U.cpu(), S.cpu(), VT.cpu(),
+                    # Update SVD components (ensure contiguous before saving)
+                    self.svd_components[layer_idx][name] = (U.contiguous().cpu(), S.contiguous().cpu(), VT.contiguous().cpu(),
                                                             bias.cpu() if bias is not None else None)
 
                     # Write back with torch.no_grad() to avoid leaf variable error
                     with torch.no_grad():
-                        original_linear.weight.copy_(W_after.to(original_linear.weight.dtype))
+                        original_linear.weight.copy_(W_after.contiguous().to(original_linear.weight.dtype))
 
                     del U, S, V, VT, W_after, X, W, Y
                     torch.cuda.empty_cache()
