@@ -85,6 +85,71 @@ class SVDLinear(nn.Module):
         return self.u_proj(self.v_proj(x))
 
 
+class SVDLinearTrainable(nn.Module):
+    """
+    A trainable low-rank linear layer for Phase 5 distillation fine-tuning.
+
+    W = U @ diag(S) @ VT where U, S, VT are all trainable parameters.
+    The rank is fixed, but values can be optimized to minimize distillation loss.
+
+    This is essentially a LoRA-like structure, but initialized from SVD instead of random.
+    """
+
+    def __init__(self, U: torch.Tensor, S: torch.Tensor, VT: torch.Tensor,
+                 bias: Optional[torch.Tensor] = None, train_bias: bool = False):
+        super().__init__()
+        # U: (out_features, rank), S: (rank,), VT: (rank, in_features)
+        self.U = nn.Parameter(U.float())
+        self.S = nn.Parameter(S.float())
+        self.VT = nn.Parameter(VT.float())
+
+        if bias is not None:
+            self.bias = nn.Parameter(bias.float(), requires_grad=train_bias)
+        else:
+            self.register_parameter('bias', None)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # W = U @ diag(S) @ VT
+        # Forward: x @ W^T = x @ VT^T @ diag(S) @ U^T
+        original_dtype = x.dtype
+        x = x.float()
+
+        # Efficient computation: x @ V @ diag(S) @ U^T
+        out = torch.matmul(x, self.VT.T)  # x @ V: (batch, seq, rank)
+        out = out * self.S                 # element-wise: (batch, seq, rank)
+        out = torch.matmul(out, self.U.T)  # @ U^T: (batch, seq, out_features)
+
+        if self.bias is not None:
+            out = out + self.bias
+
+        return out.to(original_dtype)
+
+    @torch.no_grad()
+    def get_weight(self) -> torch.Tensor:
+        """Reconstruct the full weight matrix W = U @ diag(S) @ VT"""
+        return (self.U * self.S) @ self.VT
+
+    @torch.no_grad()
+    def merge_to_linear(self) -> nn.Linear:
+        """Convert to a standard nn.Linear for inference efficiency."""
+        weight = self.get_weight()
+        out_features, in_features = self.U.shape[0], self.VT.shape[1]
+        linear = nn.Linear(in_features, out_features, bias=self.bias is not None)
+        linear.weight.data = weight.to(linear.weight.dtype)
+        if self.bias is not None:
+            linear.bias.data = self.bias.to(linear.bias.dtype)
+        return linear
+
+    def get_svd_components(self) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+        """Return current U, S, VT, bias values (detached, on CPU)."""
+        return (
+            self.U.data.cpu(),
+            self.S.data.cpu(),
+            self.VT.data.cpu(),
+            self.bias.data.cpu() if self.bias is not None else None
+        )
+
+
 class FisherAwareSVD:
     """
     Fisher-Aware SVD compression for LLMs.
@@ -1449,7 +1514,14 @@ class FisherAwareSVD:
                  fisher_lambda: float = 2.0,
                  use_als: bool = True,
                  als_iters: int = 2,
-                 token_sample_ratio: float = 0.2) -> nn.Module:
+                 token_sample_ratio: float = 0.2,
+                 use_distillation: bool = False,
+                 distill_steps: int = 2000,
+                 distill_lr: float = 1e-4,
+                 distill_temperature: float = 2.0,
+                 teacher_model_path: Optional[str] = None,
+                 use_8bit_teacher: bool = True,
+                 offline_logits_path: Optional[str] = None) -> nn.Module:
         """
         Full compression pipeline.
 
@@ -1465,6 +1537,13 @@ class FisherAwareSVD:
             use_als: Use ALS calibration instead of M-optimization (default: True)
             als_iters: Number of ALS iterations per layer (default: 2)
             token_sample_ratio: Ratio of tokens to sample per sequence for ALS (default: 0.1)
+            use_distillation: Enable Phase 5 distillation fine-tuning (default: False)
+            distill_steps: Number of distillation training steps (default: 2000)
+            distill_lr: Learning rate for distillation (default: 1e-4)
+            distill_temperature: Distillation temperature (default: 2.0)
+            teacher_model_path: Path to teacher model (default: None, uses model_name)
+            use_8bit_teacher: Load teacher in 8-bit to save memory (default: True)
+            offline_logits_path: Path to pre-computed teacher logits (default: None)
 
         Returns:
             Compressed model
@@ -1494,6 +1573,27 @@ class FisherAwareSVD:
                 traceback.print_exc()
         else:
             print("Phase 4: Skipped (calibration_steps=0)")
+
+        # Phase 5: Distillation Fine-tuning (global optimization via knowledge distillation)
+        if use_distillation:
+            try:
+                self.phase5_distillation_finetuning(
+                    train_loader=calib_loader,
+                    teacher_model_path=teacher_model_path,
+                    num_steps=distill_steps,
+                    lr=distill_lr,
+                    temperature=distill_temperature,
+                    use_8bit_teacher=use_8bit_teacher,
+                    offline_logits_path=offline_logits_path,
+                    gradient_checkpointing=True,
+                )
+            except Exception as e:
+                print(f"  Warning: Phase 5 distillation failed ({type(e).__name__}: {e}), skipping...")
+                print("  Proceeding without distillation.")
+                import traceback
+                traceback.print_exc()
+        else:
+            print("Phase 5: Skipped (use_distillation=False)")
 
         # Apply compression to model
         self.apply_compression(ratio)
@@ -1944,6 +2044,320 @@ class FisherAwareSVD:
         else:
             print("  No layers calibrated")
 
+    def _get_parent_module_and_name(self, root_module: nn.Module, target_name: str) -> Tuple[nn.Module, str]:
+        """
+        Get parent module and child name for a nested module path.
+        e.g., target_name = "self_attn.q_proj" returns (self_attn_module, "q_proj")
+        """
+        parts = target_name.split(".")
+        parent = root_module
+        for part in parts[:-1]:
+            parent = getattr(parent, part)
+        return parent, parts[-1]
+
+    def phase5_distillation_finetuning(self, train_loader: List[Dict],
+                                        teacher_model_path: Optional[str] = None,
+                                        num_steps: int = 2000,
+                                        lr: float = 1e-4,
+                                        temperature: float = 2.0,
+                                        use_8bit_teacher: bool = True,
+                                        offline_logits_path: Optional[str] = None,
+                                        gradient_checkpointing: bool = True,
+                                        warmup_ratio: float = 0.1,
+                                        save_interval: int = 500) -> None:
+        """
+        Phase 5: Global Distillation Fine-tuning.
+
+        This phase performs knowledge distillation from the original (teacher) model
+        to the compressed (student) model. Only the SVD factors (U, S, V) are trained,
+        keeping the rank fixed while optimizing for global task loss.
+
+        Memory Optimizations:
+        1. 8-bit quantized teacher model (using bitsandbytes)
+        2. Offline distillation mode (pre-computed teacher logits)
+        3. Gradient checkpointing for student model
+        4. Mixed precision training (autocast)
+
+        Args:
+            train_loader: Training data loader
+            teacher_model_path: Path to teacher model (if None, uses model_name to reload)
+            num_steps: Number of training steps (default: 2000)
+            lr: Learning rate (default: 1e-4)
+            temperature: Distillation temperature (default: 2.0, higher = softer distribution)
+            use_8bit_teacher: Load teacher in 8-bit to save memory (default: True)
+            offline_logits_path: Path to pre-computed teacher logits (if provided, skips teacher loading)
+            gradient_checkpointing: Enable gradient checkpointing for student (default: True)
+            warmup_ratio: Warmup ratio for learning rate scheduler (default: 0.1)
+            save_interval: Save checkpoint every N steps (default: 500)
+        """
+        import torch.nn.functional as F
+        from torch.optim import AdamW
+        from torch.cuda.amp import autocast, GradScaler
+
+        print(f"Phase 5: Distillation Fine-tuning ({num_steps} steps, lr={lr}, T={temperature})...")
+
+        # ================================================================
+        # Step 1: Prepare Teacher Model (with memory optimization)
+        # ================================================================
+        teacher_model = None
+        offline_logits = None
+        use_offline = offline_logits_path is not None
+
+        if use_offline:
+            print(f"  Loading pre-computed teacher logits from {offline_logits_path}...")
+            if os.path.exists(offline_logits_path):
+                offline_logits = torch.load(offline_logits_path)
+                print(f"  Loaded {len(offline_logits)} pre-computed logits")
+            else:
+                print(f"  WARNING: Offline logits file not found, falling back to online distillation")
+                use_offline = False
+
+        if not use_offline:
+            print("  Loading teacher model...")
+            try:
+                if use_8bit_teacher:
+                    try:
+                        import bitsandbytes as bnb
+                        from transformers import AutoModelForCausalLM, BitsAndBytesConfig
+
+                        quantization_config = BitsAndBytesConfig(
+                            load_in_8bit=True,
+                            llm_int8_threshold=6.0,
+                        )
+
+                        model_path = teacher_model_path if teacher_model_path else self.model_name
+                        teacher_model = AutoModelForCausalLM.from_pretrained(
+                            model_path,
+                            quantization_config=quantization_config,
+                            device_map="auto",
+                            torch_dtype=torch.float16,
+                        )
+                        print("  Teacher loaded in 8-bit mode (memory efficient)")
+                    except ImportError:
+                        print("  bitsandbytes not available, loading teacher in fp16...")
+                        use_8bit_teacher = False
+                    except Exception as e:
+                        print(f"  8-bit loading failed ({e}), falling back to fp16...")
+                        use_8bit_teacher = False
+
+                if not use_8bit_teacher:
+                    from transformers import AutoModelForCausalLM
+                    model_path = teacher_model_path if teacher_model_path else self.model_name
+                    teacher_model = AutoModelForCausalLM.from_pretrained(
+                        model_path,
+                        torch_dtype=torch.float16,
+                        device_map="auto",
+                    )
+                    print("  Teacher loaded in fp16 mode")
+
+                teacher_model.eval()
+                for p in teacher_model.parameters():
+                    p.requires_grad = False
+
+            except Exception as e:
+                print(f"  ERROR: Failed to load teacher model: {e}")
+                print("  Skipping Phase 5 distillation.")
+                return
+
+        # ================================================================
+        # Step 2: Convert Student Layers to Trainable SVD Modules
+        # ================================================================
+        print("  Converting compressed layers to trainable SVD modules...")
+        trainable_params = []
+        svd_modules = {}
+
+        for layer_idx in range(len(self.layers)):
+            if layer_idx not in self.svd_components:
+                continue
+
+            layer = self.layers[layer_idx]
+            subset = find_layers(layer)
+
+            for name in subset:
+                if name not in self.svd_components[layer_idx]:
+                    continue
+
+                U, S, VT, bias = self.svd_components[layer_idx][name]
+                svd_layer = SVDLinearTrainable(U, S, VT, bias).to(self.device)
+                svd_modules[(layer_idx, name)] = svd_layer
+
+                parent, child_name = self._get_parent_module_and_name(layer, name)
+                setattr(parent, child_name, svd_layer)
+
+                trainable_params.extend([svd_layer.U, svd_layer.S, svd_layer.VT])
+                if svd_layer.bias is not None and svd_layer.bias.requires_grad:
+                    trainable_params.append(svd_layer.bias)
+
+        print(f"  Converted {len(svd_modules)} layers, {len(trainable_params)} trainable parameters")
+
+        for name, param in self.model.named_parameters():
+            is_svd_param = any(x in name for x in ['U', 'S', 'VT'])
+            param.requires_grad = is_svd_param
+
+        if gradient_checkpointing and hasattr(self.model, 'gradient_checkpointing_enable'):
+            self.model.gradient_checkpointing_enable()
+            print("  Gradient checkpointing enabled for student")
+
+        # ================================================================
+        # Step 3: Setup Optimizer and Scheduler
+        # ================================================================
+        optimizer = AdamW(trainable_params, lr=lr, weight_decay=0.01)
+        warmup_steps = int(num_steps * warmup_ratio)
+
+        def lr_lambda(step):
+            if step < warmup_steps:
+                return step / max(1, warmup_steps)
+            progress = (step - warmup_steps) / max(1, num_steps - warmup_steps)
+            return 0.5 * (1 + math.cos(math.pi * progress))
+
+        scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+        scaler = GradScaler()
+
+        # ================================================================
+        # Step 4: Training Loop
+        # ================================================================
+        self.model.train()
+        self.model = self.model.to(self.device)
+
+        data_iter = iter(train_loader)
+        total_loss = 0.0
+        best_loss = float('inf')
+
+        pbar = tqdm(range(num_steps), desc="Distillation")
+        for step in pbar:
+            try:
+                batch = next(data_iter)
+            except StopIteration:
+                data_iter = iter(train_loader)
+                batch = next(data_iter)
+
+            batch = {k: v.to(self.device) for k, v in batch.items()}
+
+            if use_offline and offline_logits is not None:
+                batch_idx = step % len(offline_logits)
+                teacher_logits = offline_logits[batch_idx].to(self.device)
+            else:
+                with torch.no_grad():
+                    with autocast():
+                        teacher_outputs = teacher_model(**batch)
+                        teacher_logits = teacher_outputs.logits.float()
+
+            optimizer.zero_grad()
+
+            with autocast():
+                student_outputs = self.model(**batch)
+                student_logits = student_outputs.logits.float()
+
+                loss = F.kl_div(
+                    F.log_softmax(student_logits / temperature, dim=-1),
+                    F.softmax(teacher_logits / temperature, dim=-1),
+                    reduction='batchmean'
+                ) * (temperature ** 2)
+
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=1.0)
+            scaler.step(optimizer)
+            scaler.update()
+            scheduler.step()
+
+            loss_val = loss.item()
+            total_loss += loss_val
+
+            if loss_val < best_loss:
+                best_loss = loss_val
+
+            pbar.set_postfix({
+                'loss': f'{loss_val:.4f}',
+                'best': f'{best_loss:.4f}',
+                'lr': f'{scheduler.get_last_lr()[0]:.2e}'
+            })
+
+            if save_interval > 0 and (step + 1) % save_interval == 0:
+                avg_loss = total_loss / (step + 1)
+                print(f"\n  Step {step+1}: avg_loss={avg_loss:.4f}, best_loss={best_loss:.4f}")
+
+        avg_loss = total_loss / num_steps
+        print(f"  Distillation complete. Average loss: {avg_loss:.4f}, Best loss: {best_loss:.4f}")
+
+        # ================================================================
+        # Step 5: Merge SVD Layers Back and Update Components
+        # ================================================================
+        print("  Merging trained SVD layers back...")
+        self.model.eval()
+
+        if gradient_checkpointing and hasattr(self.model, 'gradient_checkpointing_disable'):
+            self.model.gradient_checkpointing_disable()
+
+        with torch.no_grad():
+            for (layer_idx, name), svd_layer in svd_modules.items():
+                layer = self.layers[layer_idx]
+                self.svd_components[layer_idx][name] = svd_layer.get_svd_components()
+
+                dense_layer = svd_layer.merge_to_linear()
+                parent, child_name = self._get_parent_module_and_name(layer, name)
+                setattr(parent, child_name, dense_layer.to(self.device))
+
+        if teacher_model is not None:
+            del teacher_model
+        torch.cuda.empty_cache()
+
+        print("  Phase 5 complete.")
+
+    def precompute_teacher_logits(self, train_loader: List[Dict],
+                                   teacher_model_path: Optional[str] = None,
+                                   save_path: str = "teacher_logits.pt",
+                                   use_8bit: bool = True) -> str:
+        """
+        Pre-compute and save teacher logits for offline distillation.
+        """
+        from torch.cuda.amp import autocast
+
+        print(f"Pre-computing teacher logits...")
+
+        try:
+            if use_8bit:
+                import bitsandbytes as bnb
+                from transformers import AutoModelForCausalLM, BitsAndBytesConfig
+
+                quantization_config = BitsAndBytesConfig(load_in_8bit=True)
+                model_path = teacher_model_path if teacher_model_path else self.model_name
+                teacher_model = AutoModelForCausalLM.from_pretrained(
+                    model_path,
+                    quantization_config=quantization_config,
+                    device_map="auto",
+                    torch_dtype=torch.float16,
+                )
+            else:
+                from transformers import AutoModelForCausalLM
+                model_path = teacher_model_path if teacher_model_path else self.model_name
+                teacher_model = AutoModelForCausalLM.from_pretrained(
+                    model_path,
+                    torch_dtype=torch.float16,
+                    device_map="auto",
+                )
+
+            teacher_model.eval()
+        except Exception as e:
+            print(f"  ERROR: Failed to load teacher model: {e}")
+            return None
+
+        all_logits = []
+        with torch.no_grad():
+            for batch in tqdm(train_loader, desc="Computing teacher logits"):
+                batch = {k: v.to(self.device) for k, v in batch.items()}
+                with autocast():
+                    outputs = teacher_model(**batch)
+                    all_logits.append(outputs.logits.cpu().half())
+
+        torch.save(all_logits, save_path)
+        print(f"  Saved {len(all_logits)} logits to {save_path}")
+
+        del teacher_model
+        torch.cuda.empty_cache()
+
+        return save_path
+
 
 def fisher_aware_svd_compression(model_name: str, model: nn.Module,
                                   calib_loader: List[Dict], ratio: float,
@@ -1956,7 +2370,14 @@ def fisher_aware_svd_compression(model_name: str, model: nn.Module,
                                   fisher_lambda: float = 2.0,
                                   use_als: bool = True,
                                   als_iters: int = 2,
-                                  token_sample_ratio: float = 0.2) -> nn.Module:
+                                  token_sample_ratio: float = 0.2,
+                                  use_distillation: bool = False,
+                                  distill_steps: int = 2000,
+                                  distill_lr: float = 1e-4,
+                                  distill_temperature: float = 2.0,
+                                  teacher_model_path: Optional[str] = None,
+                                  use_8bit_teacher: bool = True,
+                                  offline_logits_path: Optional[str] = None) -> nn.Module:
     """
     Main entry point for Fisher-Aware SVD compression.
 
@@ -1982,6 +2403,13 @@ def fisher_aware_svd_compression(model_name: str, model: nn.Module,
         use_als: Use ALS calibration instead of M-optimization (default: True)
         als_iters: Number of ALS iterations per layer (default: 2)
         token_sample_ratio: Ratio of tokens to sample per sequence for ALS (default: 0.1)
+        use_distillation: Enable Phase 5 distillation fine-tuning (default: False)
+        distill_steps: Number of distillation training steps (default: 2000)
+        distill_lr: Learning rate for distillation (default: 1e-4)
+        distill_temperature: Distillation temperature (default: 2.0)
+        teacher_model_path: Path to teacher model (default: None, uses model_name)
+        use_8bit_teacher: Load teacher in 8-bit to save memory (default: True)
+        offline_logits_path: Path to pre-computed teacher logits (default: None)
 
     Returns:
         Compressed model
@@ -1992,12 +2420,20 @@ def fisher_aware_svd_compression(model_name: str, model: nn.Module,
     print(f"  Fisher λ: {fisher_lambda} (log-space formula)")
     print(f"  Min rank: {min_rank} (adaptive f_min and max_factor)")
     print(f"  Phase 4: {'ALS' if use_als else 'M-optimization'} ({als_iters} iterations, {token_sample_ratio:.0%} tokens)" if use_als else "  Phase 4: M-optimization")
+    print(f"  Phase 5: {'Distillation' if use_distillation else 'Disabled'}" + (f" ({distill_steps} steps, lr={distill_lr}, T={distill_temperature})" if use_distillation else ""))
 
     compressor = FisherAwareSVD(model, model_name, device, num_gpus=num_gpus)
     return compressor.compress(calib_loader, ratio, whitening_mat, use_low_resource,
                                calibration_steps, min_rank=min_rank, fisher_lambda=fisher_lambda,
                                use_als=use_als, als_iters=als_iters,
-                               token_sample_ratio=token_sample_ratio)
+                               token_sample_ratio=token_sample_ratio,
+                               use_distillation=use_distillation,
+                               distill_steps=distill_steps,
+                               distill_lr=distill_lr,
+                               distill_temperature=distill_temperature,
+                               teacher_model_path=teacher_model_path,
+                               use_8bit_teacher=use_8bit_teacher,
+                               offline_logits_path=offline_logits_path)
 
 
 if __name__ == '__main__':
