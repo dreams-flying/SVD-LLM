@@ -2196,20 +2196,39 @@ class FisherAwareSVD:
 
         print(f"  Converted {len(svd_modules)} layers, {len(trainable_params)} trainable parameters")
 
-        # Fix Issue B: Don't use name-based detection, use trainable_params set directly
-        # First freeze all parameters
+        # Fix: Proper parameter freezing/unfreezing
+        # Step 1: First freeze ALL parameters in the model
         for param in self.model.parameters():
             param.requires_grad = False
 
-        # Then unfreeze only trainable_params (U, S, VT, and optionally bias)
-        trainable_param_set = set(id(p) for p in trainable_params)
-        for param in self.model.parameters():
-            if id(param) in trainable_param_set:
-                param.requires_grad = True
+        # Step 2: Explicitly set requires_grad=True for SVD parameters
+        # (Don't rely on id() comparison which can be fragile)
+        for (layer_idx, name), svd_layer in svd_modules.items():
+            svd_layer.U.requires_grad = True
+            svd_layer.S.requires_grad = True
+            svd_layer.VT.requires_grad = True
+            # Note: bias.requires_grad is controlled by train_bias in constructor
 
+        # Verify trainable parameters
+        num_trainable = sum(1 for p in self.model.parameters() if p.requires_grad)
+        print(f"  Verified {num_trainable} parameters with requires_grad=True")
+
+        # Fix: Gradient checkpointing with use_reentrant=False (required for this use case)
+        # With use_reentrant=True (default), gradient checkpointing requires inputs to have
+        # requires_grad=True, which fails because embeddings are frozen.
+        # use_reentrant=False handles this correctly.
         if gradient_checkpointing and hasattr(self.model, 'gradient_checkpointing_enable'):
-            self.model.gradient_checkpointing_enable()
-            print("  Gradient checkpointing enabled for student")
+            try:
+                # Try to enable with use_reentrant=False (PyTorch 2.x)
+                self.model.gradient_checkpointing_enable(
+                    gradient_checkpointing_kwargs={"use_reentrant": False}
+                )
+                print("  Gradient checkpointing enabled (use_reentrant=False)")
+            except TypeError:
+                # Older version doesn't support gradient_checkpointing_kwargs
+                print("  Warning: Cannot use use_reentrant=False, disabling gradient checkpointing")
+                print("  (This may use more GPU memory)")
+                gradient_checkpointing = False
 
         # ================================================================
         # Step 3: Setup Optimizer and Scheduler
@@ -2232,6 +2251,28 @@ class FisherAwareSVD:
         self.model.train()
         self.model = self.model.to(self.device)
 
+        # Verification: Do a test forward pass to check gradients
+        print("  Verifying gradient flow...")
+        test_batch = next(iter(train_loader))
+        test_batch = {k: v.to(self.device) for k, v in test_batch.items()}
+        with autocast():
+            test_out = self.model(**test_batch)
+            test_logits = test_out.logits
+        if not test_logits.requires_grad:
+            print("  WARNING: test_logits.requires_grad=False!")
+            print("  This may cause training to fail.")
+            # Check which SVD layers have trainable parameters
+            for (layer_idx, name), svd_layer in svd_modules.items():
+                u_grad = svd_layer.U.requires_grad
+                s_grad = svd_layer.S.requires_grad
+                vt_grad = svd_layer.VT.requires_grad
+                if not (u_grad and s_grad and vt_grad):
+                    print(f"    Layer {layer_idx}.{name}: U={u_grad}, S={s_grad}, VT={vt_grad}")
+        else:
+            print("  Gradient flow verified OK")
+        del test_out, test_logits, test_batch
+        torch.cuda.empty_cache()
+
         data_iter = iter(train_loader)
         total_loss = 0.0
         best_loss = float('inf')
@@ -2248,12 +2289,12 @@ class FisherAwareSVD:
 
             if use_offline and offline_logits is not None:
                 batch_idx = step % len(offline_logits)
-                teacher_logits = offline_logits[batch_idx].to(self.device)
+                teacher_logits = offline_logits[batch_idx].to(self.device).detach()
             else:
                 with torch.no_grad():
                     with autocast():
                         teacher_outputs = teacher_model(**batch)
-                        teacher_logits = teacher_outputs.logits.float()
+                        teacher_logits = teacher_outputs.logits.float().detach()
 
             optimizer.zero_grad()
 
@@ -2297,6 +2338,17 @@ class FisherAwareSVD:
                 else:
                     # No mask, use batchmean
                     loss = kl_per_token.mean() * (temperature ** 2)
+
+            # Sanity check: verify loss has gradient before backward
+            if not loss.requires_grad:
+                if step == 0:
+                    print(f"  ERROR: loss.requires_grad=False!")
+                    print(f"    student_logits.requires_grad={student_logits.requires_grad}")
+                    print(f"    shift_student_logits.requires_grad={shift_student_logits.requires_grad}")
+                    # Check if any trainable param has requires_grad
+                    has_grad = any(p.requires_grad for p in trainable_params)
+                    print(f"    Any trainable param has requires_grad: {has_grad}")
+                raise RuntimeError("Loss does not require grad - check SVD layer parameters")
 
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
