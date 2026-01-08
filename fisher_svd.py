@@ -198,14 +198,17 @@ class SVDLinearWithDenseBlocks(nn.Module):
 def select_residual_blocks(W: torch.Tensor, U: torch.Tensor, S: torch.Tensor,
                            VT: torch.Tensor, block_size: int, budget_blocks: int,
                            importance_weights: Optional[torch.Tensor] = None,
-                           top_per_row: int = 8) -> List[Dict]:
+                           top_per_row: int = 8,
+                           layer_factor: float = 1.0) -> List[Dict]:
     """
     Select high-importance residual blocks for W - U @ diag(S) @ VT.
 
-    Optimized implementation:
+    Fully optimized implementation:
     - One GEMM per row-tile (not per block)
+    - No col-loop: reshape + batch energy computation
     - No .item() in loops (avoid GPU sync)
     - Clone only top_per_row blocks (not all blocks then filter)
+    - Stores actual row_end/col_end for edge blocks
 
     Args:
         W: Original weight matrix [out, in]
@@ -216,22 +219,41 @@ def select_residual_blocks(W: torch.Tensor, U: torch.Tensor, S: torch.Tensor,
         budget_blocks: Maximum number of blocks to select
         importance_weights: Optional per-output importance weights [out]
         top_per_row: Max candidates per row-tile to reduce search space
+        layer_factor: Multiplier for scores (for cross-layer balancing)
 
     Returns:
-        List of {"row": int, "col": int, "val": Tensor[b,b], "score": float}
+        List of {"row": int, "col": int, "row_end": int, "col_end": int,
+                 "val": Tensor[b,b], "score": float}
         NOTE: Returns score so Phase3b can use Fisher-weighted scores directly
     """
     m, n = W.shape
     b = block_size
     device = W.device
-    dtype = W.dtype
+    orig_dtype = W.dtype
 
     # Number of row/col tiles
     n_row_tiles = (m + b - 1) // b
     n_col_tiles = (n + b - 1) // b
 
-    # Pre-compute US = U @ diag(S) for efficiency
-    US = U * S  # [m, k]
+    # Padded dimensions (for reshape)
+    n_padded = n_col_tiles * b
+
+    # Pre-compute US = U @ diag(S) for efficiency (in float32 for stability)
+    US = (U * S).float()  # [m, k]
+    VT_f = VT.float()
+    W_f = W.float()
+
+    # Pre-compute importance weights per row-tile (on GPU, no .item())
+    if importance_weights is not None:
+        imp = importance_weights.float().to(device)
+        # Compute mean importance for each row-tile
+        row_weights = torch.zeros(n_row_tiles, device=device, dtype=torch.float32)
+        for ri in range(n_row_tiles):
+            row_start = ri * b
+            row_end = min(row_start + b, m)
+            row_weights[ri] = imp[row_start:row_end].mean()
+    else:
+        row_weights = torch.ones(n_row_tiles, device=device, dtype=torch.float32)
 
     candidates = []
 
@@ -241,51 +263,32 @@ def select_residual_blocks(W: torch.Tensor, U: torch.Tensor, S: torch.Tensor,
         actual_row_size = row_end - row_start
 
         # === ONE GEMM per row-tile: compute entire row's approximation ===
-        # US_row: [actual_row_size, k]
-        # W_approx_row = US_row @ VT → [actual_row_size, n]
-        US_row = US[row_start:row_end, :]
-        W_approx_row = US_row @ VT  # Single GEMM for entire row
+        US_row = US[row_start:row_end, :]  # [actual_row_size, k]
+        W_approx_row = US_row @ VT_f  # [actual_row_size, n]
+        W_row = W_f[row_start:row_end, :]
 
-        # Original row
-        W_row = W[row_start:row_end, :]
-
-        # Residual row (compute once, then slice into blocks)
+        # Residual row
         R_row = W_row - W_approx_row  # [actual_row_size, n]
 
-        # === Compute block energies WITHOUT .item() ===
-        # Reshape residual row into blocks and compute Frobenius norm^2 per block
-        # We'll compute scores for all col-tiles at once on GPU
+        # === NO COL-LOOP: Reshape to compute all block energies at once ===
+        # Pad to [b, n_padded] for clean reshape
+        R_row_padded = torch.zeros(b, n_padded, device=device, dtype=torch.float32)
+        R_row_padded[:actual_row_size, :n] = R_row
 
-        # Pad R_row to full block size if needed (for row dimension)
-        if actual_row_size < b:
-            R_row_padded = torch.zeros(b, n, device=device, dtype=dtype)
-            R_row_padded[:actual_row_size, :] = R_row
-            R_row = R_row_padded
+        # Reshape: [b, n_col_tiles, b] -> permute -> [n_col_tiles, b, b]
+        R_blocks = R_row_padded.view(b, n_col_tiles, b).permute(1, 0, 2)
 
-        # Compute energy for each col-tile (all on GPU, no .item())
-        # block_energies[ci] = ||R_row[:, ci*b:(ci+1)*b]||_F^2
-        block_energies = torch.zeros(n_col_tiles, device=device, dtype=dtype)
+        # Compute energy for all blocks at once: [n_col_tiles]
+        block_energies = (R_blocks ** 2).sum(dim=(1, 2))
 
-        for ci in range(n_col_tiles):
-            col_start = ci * b
-            col_end = min(col_start + b, n)
-            R_block = R_row[:, col_start:col_end]
-            block_energies[ci] = (R_block ** 2).sum()
+        # Apply row importance weight and layer_factor
+        weighted_energies = block_energies * row_weights[ri] * layer_factor
 
-        # Apply row importance weight (Fisher-based)
-        if importance_weights is not None:
-            row_weight = importance_weights[row_start:min(row_end, m)].mean()
-        else:
-            row_weight = torch.tensor(1.0, device=device, dtype=dtype)
-
-        weighted_energies = block_energies * row_weight
-
-        # === Select top_per_row using torch.topk (no Python sorting) ===
+        # === Select top_per_row using torch.topk ===
         k = min(top_per_row, n_col_tiles)
         top_scores, top_indices = torch.topk(weighted_energies, k)
 
-        # === Clone ONLY the top_per_row blocks (not all) ===
-        # Convert to CPU only once at the end
+        # === Clone ONLY the top_per_row blocks ===
         top_scores_cpu = top_scores.cpu().tolist()
         top_indices_cpu = top_indices.cpu().tolist()
 
@@ -295,29 +298,23 @@ def select_residual_blocks(W: torch.Tensor, U: torch.Tensor, S: torch.Tensor,
 
             col_start = ci * b
             col_end = min(col_start + b, n)
-            actual_col_size = col_end - col_start
 
-            # Extract and pad the residual block
-            R_block = R_row[:, col_start:col_end].clone()
-
-            # Pad column dimension if needed
-            if actual_col_size < b:
-                R_padded = torch.zeros(b, b, device=device, dtype=dtype)
-                R_padded[:, :actual_col_size] = R_block
-                R_block = R_padded
+            # Extract the residual block (already padded in R_blocks)
+            R_block = R_blocks[ci].clone()
 
             candidates.append({
                 "score": score,
                 "row": row_start,
                 "col": col_start,
-                "val": R_block.cpu()  # Move to CPU to save GPU memory
+                "row_end": row_end,
+                "col_end": col_end,
+                "val": R_block.to(orig_dtype).cpu()  # Back to orig dtype, move to CPU
             })
 
     # Global selection: top budget_blocks by score
     candidates.sort(key=lambda x: -x["score"])
     selected = candidates[:budget_blocks]
 
-    # Return WITH score field so Phase3b can use Fisher-weighted scores
     return selected
 
 
@@ -1650,16 +1647,24 @@ class FisherAwareSVD:
         This allows using smaller rank k while compensating with critical residual blocks,
         effectively breaking the k(m+n) parameter constraint.
 
+        Optimizations:
+        - Uses layer_factor for cross-layer balancing (like Phase3)
+        - Uses heap with candidate cap to avoid memory explosion
+        - Limits candidates per projection to 2x average budget share
+
         Args:
             block_budget_ratio: Fraction of original params to spend on residual blocks (default: 2%)
             block_size: Size of each block (default: 16)
             top_per_row: Max candidate blocks per row-tile to limit search (default: 8)
         """
+        import heapq
+
         print(f"Phase 3b: Residual Block Selection (budget={block_budget_ratio:.1%}, block_size={block_size})...")
 
         # Initialize residual block storage
         self.residual_blocks = {}
         self.block_size = block_size
+        num_layers = len(self.layers)
 
         # Calculate total parameter budget for blocks
         total_original_params = sum(
@@ -1678,12 +1683,28 @@ class FisherAwareSVD:
             print("  No blocks to select (budget too small)")
             return
 
-        # Collect all candidate blocks across all projections
-        all_candidates = []
+        # Count projections for per-projection candidate cap
+        num_projections = sum(
+            1 for layer_idx in self.svd_components
+            for name in self.svd_components[layer_idx]
+            if layer_idx in self.original_weights and name in self.original_weights[layer_idx]
+        )
+
+        # Candidate cap per projection: 2x fair share (to allow some flexibility)
+        cand_cap_per_proj = max(100, (total_block_budget * 2) // max(1, num_projections))
+
+        # Use a min-heap to keep top-K globally (heap stores (-score, block) for max behavior)
+        # Limit heap size to total_block_budget to save memory
+        heap = []
+        total_candidates_seen = 0
 
         for layer_idx in self.svd_components:
             if layer_idx not in self.original_weights:
                 continue
+
+            # Layer factor: later layers get higher weight (range 0.5 to 1.5)
+            layer_position = layer_idx / (num_layers - 1) if num_layers > 1 else 0.5
+            layer_factor = 0.5 + layer_position
 
             for name in self.svd_components[layer_idx]:
                 if name not in self.original_weights[layer_idx]:
@@ -1693,43 +1714,58 @@ class FisherAwareSVD:
                 W = self.original_weights[layer_idx][name]
                 U, S, VT, bias = self.svd_components[layer_idx][name]
 
+                # Move to GPU for computation
+                device = 'cuda' if torch.cuda.is_available() else 'cpu'
+                W_gpu = W.to(device)
+                U_gpu = U.to(device)
+                S_gpu = S.to(device)
+                VT_gpu = VT.to(device)
+
                 # Get importance weight from Fisher if available
                 importance_weights = None
                 if hasattr(self, 'fisher_info') and layer_idx in self.fisher_info:
                     if name in self.fisher_info[layer_idx]:
-                        # Use Fisher info as row importance
                         fisher = self.fisher_info[layer_idx][name]
                         if len(fisher.shape) == 2:
-                            importance_weights = fisher.sum(dim=1)  # Sum over columns
+                            importance_weights = fisher.sum(dim=1).to(device)
                         else:
-                            importance_weights = fisher
+                            importance_weights = fisher.to(device)
 
-                # Select candidate blocks for this projection
+                # Select candidate blocks for this projection with layer_factor
                 blocks = select_residual_blocks(
-                    W, U, S, VT,
+                    W_gpu, U_gpu, S_gpu, VT_gpu,
                     block_size=block_size,
-                    budget_blocks=total_block_budget,  # Each projection gets full budget as candidates
+                    budget_blocks=cand_cap_per_proj,  # Limit candidates per projection
                     importance_weights=importance_weights,
-                    top_per_row=top_per_row
+                    top_per_row=top_per_row,
+                    layer_factor=layer_factor
                 )
 
+                total_candidates_seen += len(blocks)
+
+                # Add to global heap (use negative score for min-heap → max behavior)
                 for blk in blocks:
                     blk["layer_idx"] = layer_idx
                     blk["name"] = name
-                    all_candidates.append(blk)
 
-        if len(all_candidates) == 0:
+                    if len(heap) < total_block_budget:
+                        heapq.heappush(heap, (blk["score"], blk))
+                    elif blk["score"] > heap[0][0]:
+                        heapq.heapreplace(heap, (blk["score"], blk))
+
+                # Clear GPU memory
+                del W_gpu, U_gpu, S_gpu, VT_gpu
+                if importance_weights is not None:
+                    del importance_weights
+                torch.cuda.empty_cache()
+
+        if len(heap) == 0:
             print("  No residual block candidates found")
             return
 
-        # NOTE: Scores are already computed in select_residual_blocks with Fisher weights
-        # DO NOT recalculate here - that would lose the Fisher importance weighting!
-
-        all_candidates.sort(key=lambda x: -x["score"])
-
-        # Select top blocks globally
-        selected = all_candidates[:total_block_budget]
-        print(f"  Selected {len(selected)} blocks from {len(all_candidates)} candidates")
+        # Extract selected blocks from heap
+        selected = [blk for _, blk in heap]
+        print(f"  Selected {len(selected)} blocks from {total_candidates_seen} candidates (heap-based)")
 
         # Organize by (layer_idx, name)
         for blk in selected:
@@ -1739,6 +1775,8 @@ class FisherAwareSVD:
             self.residual_blocks[key].append({
                 "row": blk["row"],
                 "col": blk["col"],
+                "row_end": blk.get("row_end", blk["row"] + block_size),
+                "col_end": blk.get("col_end", blk["col"] + block_size),
                 "val": blk["val"]
             })
 
@@ -1758,7 +1796,8 @@ class FisherAwareSVD:
         if layer_block_counts:
             min_layer = min(layer_block_counts.items(), key=lambda x: x[1])
             max_layer = max(layer_block_counts.items(), key=lambda x: x[1])
-            print(f"  Block distribution: Layer {min_layer[0]} has {min_layer[1]}, Layer {max_layer[0]} has {max_layer[1]}")
+            avg_blocks = sum(layer_block_counts.values()) / len(layer_block_counts)
+            print(f"  Block distribution: min={min_layer[1]} (L{min_layer[0]}), max={max_layer[1]} (L{max_layer[0]}), avg={avg_blocks:.0f}")
 
     def apply_compression(self, ratio: float, use_residual_blocks: bool = True) -> None:
         """
