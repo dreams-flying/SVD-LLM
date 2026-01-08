@@ -2121,6 +2121,12 @@ class FisherAwareSVD:
         if not use_offline:
             print("  Loading teacher model...")
             try:
+                # Use specific device to avoid multi-GPU distribution conflicts
+                # For 8-bit, we need device_map but can specify the target device
+                teacher_device_map = {
+                    "": self.device  # Map all modules to self.device
+                }
+
                 if use_8bit_teacher:
                     try:
                         import bitsandbytes as bnb
@@ -2135,10 +2141,10 @@ class FisherAwareSVD:
                         teacher_model = AutoModelForCausalLM.from_pretrained(
                             model_path,
                             quantization_config=quantization_config,
-                            device_map="auto",
+                            device_map=teacher_device_map,
                             torch_dtype=torch.float16,
                         )
-                        print("  Teacher loaded in 8-bit mode (memory efficient)")
+                        print(f"  Teacher loaded in 8-bit mode on {self.device}")
                     except ImportError:
                         print("  bitsandbytes not available, loading teacher in fp16...")
                         use_8bit_teacher = False
@@ -2152,9 +2158,8 @@ class FisherAwareSVD:
                     teacher_model = AutoModelForCausalLM.from_pretrained(
                         model_path,
                         torch_dtype=torch.float16,
-                        device_map="auto",
-                    )
-                    print("  Teacher loaded in fp16 mode")
+                    ).to(self.device)
+                    print(f"  Teacher loaded in fp16 mode on {self.device}")
 
                 teacher_model.eval()
                 for p in teacher_model.parameters():
@@ -2166,7 +2171,45 @@ class FisherAwareSVD:
                 return
 
         # ================================================================
-        # Step 2: Convert Student Layers to Trainable SVD Modules
+        # Step 2: Consolidate Model to Single GPU (required for distillation)
+        # ================================================================
+        print(f"  Consolidating model to {self.device} for distillation...")
+
+        # Remove device transfer hooks if multi-GPU was used
+        if self.use_multi_gpu:
+            self._remove_device_hooks()
+            self.use_multi_gpu = False
+
+        # Move entire model to single device (handles both single and multi-GPU cases)
+        self.model = self.model.to(self.device)
+
+        # Verify all parameters and buffers are on the correct device
+        target_device = torch.device(self.device)
+        fixes_needed = 0
+
+        for name, param in self.model.named_parameters():
+            if param.device != target_device:
+                param.data = param.data.to(target_device)
+                fixes_needed += 1
+
+        for name, buffer in self.model.named_buffers():
+            if buffer is not None and buffer.device != target_device:
+                # Buffers need to be set via the module
+                parts = name.rsplit('.', 1)
+                if len(parts) == 2:
+                    parent_name, buffer_name = parts
+                    parent = self.model
+                    for part in parent_name.split('.'):
+                        parent = getattr(parent, part)
+                    setattr(parent, buffer_name, buffer.to(target_device))
+                fixes_needed += 1
+
+        if fixes_needed > 0:
+            print(f"  Fixed {fixes_needed} tensors with device mismatch")
+        print(f"  Model on {self.device}")
+
+        # ================================================================
+        # Step 3: Convert Student Layers to Trainable SVD Modules
         # ================================================================
         print("  Converting compressed layers to trainable SVD modules...")
         trainable_params = []
@@ -2197,11 +2240,11 @@ class FisherAwareSVD:
         print(f"  Converted {len(svd_modules)} layers, {len(trainable_params)} trainable parameters")
 
         # Fix: Proper parameter freezing/unfreezing
-        # Step 1: First freeze ALL parameters in the model
+        # (a) First freeze ALL parameters in the model
         for param in self.model.parameters():
             param.requires_grad = False
 
-        # Step 2: Explicitly set requires_grad=True for SVD parameters
+        # (b) Explicitly set requires_grad=True for SVD parameters
         # (Don't rely on id() comparison which can be fragile)
         for (layer_idx, name), svd_layer in svd_modules.items():
             svd_layer.U.requires_grad = True
@@ -2231,7 +2274,7 @@ class FisherAwareSVD:
                 gradient_checkpointing = False
 
         # ================================================================
-        # Step 3: Setup Optimizer and Scheduler
+        # Step 4: Setup Optimizer and Scheduler
         # ================================================================
         optimizer = AdamW(trainable_params, lr=lr, weight_decay=0.01)
         warmup_steps = int(num_steps * warmup_ratio)
@@ -2246,7 +2289,7 @@ class FisherAwareSVD:
         scaler = GradScaler()
 
         # ================================================================
-        # Step 4: Training Loop
+        # Step 5: Training Loop
         # ================================================================
         self.model.train()
         self.model = self.model.to(self.device)
@@ -2406,7 +2449,7 @@ class FisherAwareSVD:
         print(f"  Distillation complete. Average loss: {avg_loss:.4f}, Best loss: {best_loss:.4f}")
 
         # ================================================================
-        # Step 5: Merge SVD Layers Back and Update Components
+        # Step 6: Merge SVD Layers Back and Update Components
         # ================================================================
         print("  Merging trained SVD layers back...")
         self.model.eval()
