@@ -202,6 +202,11 @@ def select_residual_blocks(W: torch.Tensor, U: torch.Tensor, S: torch.Tensor,
     """
     Select high-importance residual blocks for W - U @ diag(S) @ VT.
 
+    Optimized implementation:
+    - One GEMM per row-tile (not per block)
+    - No .item() in loops (avoid GPU sync)
+    - Clone only top_per_row blocks (not all blocks then filter)
+
     Args:
         W: Original weight matrix [out, in]
         U: Left singular vectors [out, k]
@@ -213,18 +218,20 @@ def select_residual_blocks(W: torch.Tensor, U: torch.Tensor, S: torch.Tensor,
         top_per_row: Max candidates per row-tile to reduce search space
 
     Returns:
-        List of {"row": int, "col": int, "val": Tensor[b,b]}
+        List of {"row": int, "col": int, "val": Tensor[b,b], "score": float}
+        NOTE: Returns score so Phase3b can use Fisher-weighted scores directly
     """
     m, n = W.shape
     b = block_size
     device = W.device
+    dtype = W.dtype
 
     # Number of row/col tiles
     n_row_tiles = (m + b - 1) // b
     n_col_tiles = (n + b - 1) // b
 
-    # Reconstruct low-rank approximation (we'll compute block-by-block to save memory)
-    # W_approx = U @ diag(S) @ VT, but we compute per-block
+    # Pre-compute US = U @ diag(S) for efficiency
+    US = U * S  # [m, k]
 
     candidates = []
 
@@ -233,61 +240,85 @@ def select_residual_blocks(W: torch.Tensor, U: torch.Tensor, S: torch.Tensor,
         row_end = min(row_start + b, m)
         actual_row_size = row_end - row_start
 
-        # U slice for this row tile
-        U_block = U[row_start:row_end, :]  # [actual_row_size, k]
-        US_block = U_block * S  # [actual_row_size, k]
+        # === ONE GEMM per row-tile: compute entire row's approximation ===
+        # US_row: [actual_row_size, k]
+        # W_approx_row = US_row @ VT → [actual_row_size, n]
+        US_row = US[row_start:row_end, :]
+        W_approx_row = US_row @ VT  # Single GEMM for entire row
 
-        # Importance weight for this row tile
-        if importance_weights is not None:
-            row_weight = importance_weights[row_start:row_end].mean().item()
-        else:
-            row_weight = 1.0
+        # Original row
+        W_row = W[row_start:row_end, :]
 
-        row_scores = []
+        # Residual row (compute once, then slice into blocks)
+        R_row = W_row - W_approx_row  # [actual_row_size, n]
+
+        # === Compute block energies WITHOUT .item() ===
+        # Reshape residual row into blocks and compute Frobenius norm^2 per block
+        # We'll compute scores for all col-tiles at once on GPU
+
+        # Pad R_row to full block size if needed (for row dimension)
+        if actual_row_size < b:
+            R_row_padded = torch.zeros(b, n, device=device, dtype=dtype)
+            R_row_padded[:actual_row_size, :] = R_row
+            R_row = R_row_padded
+
+        # Compute energy for each col-tile (all on GPU, no .item())
+        # block_energies[ci] = ||R_row[:, ci*b:(ci+1)*b]||_F^2
+        block_energies = torch.zeros(n_col_tiles, device=device, dtype=dtype)
 
         for ci in range(n_col_tiles):
             col_start = ci * b
             col_end = min(col_start + b, n)
+            R_block = R_row[:, col_start:col_end]
+            block_energies[ci] = (R_block ** 2).sum()
+
+        # Apply row importance weight (Fisher-based)
+        if importance_weights is not None:
+            row_weight = importance_weights[row_start:min(row_end, m)].mean()
+        else:
+            row_weight = torch.tensor(1.0, device=device, dtype=dtype)
+
+        weighted_energies = block_energies * row_weight
+
+        # === Select top_per_row using torch.topk (no Python sorting) ===
+        k = min(top_per_row, n_col_tiles)
+        top_scores, top_indices = torch.topk(weighted_energies, k)
+
+        # === Clone ONLY the top_per_row blocks (not all) ===
+        # Convert to CPU only once at the end
+        top_scores_cpu = top_scores.cpu().tolist()
+        top_indices_cpu = top_indices.cpu().tolist()
+
+        for score, ci in zip(top_scores_cpu, top_indices_cpu):
+            if score <= 0:
+                continue
+
+            col_start = ci * b
+            col_end = min(col_start + b, n)
             actual_col_size = col_end - col_start
 
-            # Extract original block
-            W_block = W[row_start:row_end, col_start:col_end]
+            # Extract and pad the residual block
+            R_block = R_row[:, col_start:col_end].clone()
 
-            # Compute low-rank approximation for this block
-            VT_block = VT[:, col_start:col_end]  # [k, actual_col_size]
-            W_approx_block = US_block @ VT_block  # [actual_row_size, actual_col_size]
-
-            # Residual block
-            R_block = W_block - W_approx_block
-
-            # Pad to full block size if needed
-            if actual_row_size < b or actual_col_size < b:
-                R_padded = torch.zeros(b, b, device=device, dtype=R_block.dtype)
-                R_padded[:actual_row_size, :actual_col_size] = R_block
+            # Pad column dimension if needed
+            if actual_col_size < b:
+                R_padded = torch.zeros(b, b, device=device, dtype=dtype)
+                R_padded[:, :actual_col_size] = R_block
                 R_block = R_padded
 
-            # Score: Frobenius norm squared * importance weight
-            score = (R_block ** 2).sum().item() * row_weight
-
-            if score > 0:
-                row_scores.append((score, row_start, col_start, R_block.clone()))
-
-        # Keep top_per_row candidates from this row tile
-        row_scores.sort(key=lambda x: -x[0])
-        for score, r, c, val in row_scores[:top_per_row]:
             candidates.append({
                 "score": score,
-                "row": r,
-                "col": c,
-                "val": val
+                "row": row_start,
+                "col": col_start,
+                "val": R_block.cpu()  # Move to CPU to save GPU memory
             })
 
     # Global selection: top budget_blocks by score
     candidates.sort(key=lambda x: -x["score"])
     selected = candidates[:budget_blocks]
 
-    # Return without score field
-    return [{"row": blk["row"], "col": blk["col"], "val": blk["val"]} for blk in selected]
+    # Return WITH score field so Phase3b can use Fisher-weighted scores
+    return selected
 
 
 class SVDLinearTrainable(nn.Module):
@@ -1691,11 +1722,8 @@ class FisherAwareSVD:
             print("  No residual block candidates found")
             return
 
-        # Sort by score (computed in select_residual_blocks, need to recompute here)
-        # Actually we need to re-score globally - let's compute scores
-        for blk in all_candidates:
-            score = (blk["val"] ** 2).sum().item()
-            blk["score"] = score
+        # NOTE: Scores are already computed in select_residual_blocks with Fisher weights
+        # DO NOT recalculate here - that would lose the Fisher importance weighting!
 
         all_candidates.sort(key=lambda x: -x["score"])
 
