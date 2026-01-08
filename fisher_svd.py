@@ -1521,7 +1521,8 @@ class FisherAwareSVD:
                  distill_temperature: float = 2.0,
                  teacher_model_path: Optional[str] = None,
                  use_8bit_teacher: bool = True,
-                 offline_logits_path: Optional[str] = None) -> nn.Module:
+                 offline_logits_path: Optional[str] = None,
+                 distill_checkpoint_dir: Optional[str] = None) -> nn.Module:
         """
         Full compression pipeline.
 
@@ -1544,6 +1545,7 @@ class FisherAwareSVD:
             teacher_model_path: Path to teacher model (default: None, uses model_name)
             use_8bit_teacher: Load teacher in 8-bit to save memory (default: True)
             offline_logits_path: Path to pre-computed teacher logits (default: None)
+            distill_checkpoint_dir: Directory to save distillation checkpoints (default: None)
 
         Returns:
             Compressed model
@@ -1586,6 +1588,7 @@ class FisherAwareSVD:
                     use_8bit_teacher=use_8bit_teacher,
                     offline_logits_path=offline_logits_path,
                     gradient_checkpointing=True,
+                    checkpoint_dir=distill_checkpoint_dir,
                 )
             except Exception as e:
                 print(f"  Warning: Phase 5 distillation failed ({type(e).__name__}: {e}), skipping...")
@@ -2064,7 +2067,8 @@ class FisherAwareSVD:
                                         offline_logits_path: Optional[str] = None,
                                         gradient_checkpointing: bool = True,
                                         warmup_ratio: float = 0.1,
-                                        save_interval: int = 500) -> None:
+                                        save_interval: int = 500,
+                                        checkpoint_dir: Optional[str] = None) -> None:
         """
         Phase 5: Global Distillation Fine-tuning.
 
@@ -2088,8 +2092,10 @@ class FisherAwareSVD:
             offline_logits_path: Path to pre-computed teacher logits (if provided, skips teacher loading)
             gradient_checkpointing: Enable gradient checkpointing for student (default: True)
             warmup_ratio: Warmup ratio for learning rate scheduler (default: 0.1)
-            save_interval: Save checkpoint every N steps (default: 500)
+            save_interval: Save checkpoint every N steps (default: 500, 0 to disable)
+            checkpoint_dir: Directory to save checkpoints (default: None, uses current directory)
         """
+        import os
         import torch.nn.functional as F
         from torch.optim import AdamW
         from torch.cuda.amp import autocast, GradScaler
@@ -2190,9 +2196,16 @@ class FisherAwareSVD:
 
         print(f"  Converted {len(svd_modules)} layers, {len(trainable_params)} trainable parameters")
 
-        for name, param in self.model.named_parameters():
-            is_svd_param = any(x in name for x in ['U', 'S', 'VT'])
-            param.requires_grad = is_svd_param
+        # Fix Issue B: Don't use name-based detection, use trainable_params set directly
+        # First freeze all parameters
+        for param in self.model.parameters():
+            param.requires_grad = False
+
+        # Then unfreeze only trainable_params (U, S, VT, and optionally bias)
+        trainable_param_set = set(id(p) for p in trainable_params)
+        for param in self.model.parameters():
+            if id(param) in trainable_param_set:
+                param.requires_grad = True
 
         if gradient_checkpointing and hasattr(self.model, 'gradient_checkpointing_enable'):
             self.model.gradient_checkpointing_enable()
@@ -2248,11 +2261,42 @@ class FisherAwareSVD:
                 student_outputs = self.model(**batch)
                 student_logits = student_outputs.logits.float()
 
-                loss = F.kl_div(
-                    F.log_softmax(student_logits / temperature, dim=-1),
-                    F.softmax(teacher_logits / temperature, dim=-1),
-                    reduction='batchmean'
-                ) * (temperature ** 2)
+                # Fix Issue E: Apply causal LM shift and attention mask
+                # Shift logits for causal LM: predict next token
+                # student_logits[:, :-1] predicts tokens at positions 1, 2, ..., seq_len-1
+                # teacher_logits[:, :-1] provides target distribution for those positions
+                shift_student_logits = student_logits[:, :-1, :].contiguous()
+                shift_teacher_logits = teacher_logits[:, :-1, :].contiguous()
+
+                # Get attention mask and shift it correspondingly
+                attention_mask = batch.get('attention_mask', None)
+                if attention_mask is not None:
+                    # Shift mask to align with shifted logits (positions 1 to seq_len-1)
+                    shift_mask = attention_mask[:, 1:].contiguous()  # (B, S-1)
+                    # Reshape for broadcasting: (B, S-1) -> (B, S-1, 1)
+                    mask_expanded = shift_mask.unsqueeze(-1).float()
+                else:
+                    mask_expanded = None
+
+                # Compute KL divergence with masking
+                log_probs_student = F.log_softmax(shift_student_logits / temperature, dim=-1)
+                probs_teacher = F.softmax(shift_teacher_logits / temperature, dim=-1)
+
+                # Per-token KL divergence: sum over vocab dimension
+                kl_per_token = F.kl_div(log_probs_student, probs_teacher, reduction='none').sum(dim=-1)  # (B, S-1)
+
+                if mask_expanded is not None:
+                    # Mask out padding tokens
+                    kl_per_token = kl_per_token * shift_mask.float()
+                    # Compute mean over valid tokens only
+                    num_valid_tokens = shift_mask.sum()
+                    if num_valid_tokens > 0:
+                        loss = (kl_per_token.sum() / num_valid_tokens) * (temperature ** 2)
+                    else:
+                        loss = kl_per_token.sum() * 0.0  # No valid tokens, zero loss
+                else:
+                    # No mask, use batchmean
+                    loss = kl_per_token.mean() * (temperature ** 2)
 
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
@@ -2276,6 +2320,35 @@ class FisherAwareSVD:
             if save_interval > 0 and (step + 1) % save_interval == 0:
                 avg_loss = total_loss / (step + 1)
                 print(f"\n  Step {step+1}: avg_loss={avg_loss:.4f}, best_loss={best_loss:.4f}")
+
+                # Fix Issue D: Actually save checkpoint
+                ckpt_dir = checkpoint_dir if checkpoint_dir else "."
+                os.makedirs(ckpt_dir, exist_ok=True)
+
+                # Save SVD modules state (much smaller than full model)
+                svd_state = {
+                    (layer_idx, name): {
+                        'U': svd_layer.U.data.cpu(),
+                        'S': svd_layer.S.data.cpu(),
+                        'VT': svd_layer.VT.data.cpu(),
+                        'bias': svd_layer.bias.data.cpu() if svd_layer.bias is not None else None
+                    }
+                    for (layer_idx, name), svd_layer in svd_modules.items()
+                }
+
+                checkpoint = {
+                    'step': step + 1,
+                    'svd_state': svd_state,
+                    'optimizer_state': optimizer.state_dict(),
+                    'scheduler_state': scheduler.state_dict(),
+                    'scaler_state': scaler.state_dict(),
+                    'best_loss': best_loss,
+                    'avg_loss': avg_loss,
+                }
+
+                ckpt_path = os.path.join(ckpt_dir, f"distill_ckpt_step{step+1}.pt")
+                torch.save(checkpoint, ckpt_path)
+                print(f"  Checkpoint saved: {ckpt_path}")
 
         avg_loss = total_loss / num_steps
         print(f"  Distillation complete. Average loss: {avg_loss:.4f}, Best loss: {best_loss:.4f}")
@@ -2377,7 +2450,8 @@ def fisher_aware_svd_compression(model_name: str, model: nn.Module,
                                   distill_temperature: float = 2.0,
                                   teacher_model_path: Optional[str] = None,
                                   use_8bit_teacher: bool = True,
-                                  offline_logits_path: Optional[str] = None) -> nn.Module:
+                                  offline_logits_path: Optional[str] = None,
+                                  distill_checkpoint_dir: Optional[str] = None) -> nn.Module:
     """
     Main entry point for Fisher-Aware SVD compression.
 
@@ -2410,6 +2484,7 @@ def fisher_aware_svd_compression(model_name: str, model: nn.Module,
         teacher_model_path: Path to teacher model (default: None, uses model_name)
         use_8bit_teacher: Load teacher in 8-bit to save memory (default: True)
         offline_logits_path: Path to pre-computed teacher logits (default: None)
+        distill_checkpoint_dir: Directory to save distillation checkpoints (default: None)
 
     Returns:
         Compressed model
@@ -2433,7 +2508,8 @@ def fisher_aware_svd_compression(model_name: str, model: nn.Module,
                                distill_temperature=distill_temperature,
                                teacher_model_path=teacher_model_path,
                                use_8bit_teacher=use_8bit_teacher,
-                               offline_logits_path=offline_logits_path)
+                               offline_logits_path=offline_logits_path,
+                               distill_checkpoint_dir=distill_checkpoint_dir)
 
 
 if __name__ == '__main__':
