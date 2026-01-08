@@ -2367,10 +2367,20 @@ class FisherAwareSVD:
                 else:
                     shift_mask = None
 
-                # Compute KL divergence with masking
+                # Compute KL divergence with numerical stability
+                # Clamp logits to prevent overflow in softmax
+                shift_student_logits = shift_student_logits.clamp(-100, 100)
+                shift_teacher_logits = shift_teacher_logits.clamp(-100, 100)
+
                 log_probs_student = F.log_softmax(shift_student_logits / temperature, dim=-1)
                 probs_teacher = F.softmax(shift_teacher_logits / temperature, dim=-1)
                 del shift_student_logits, shift_teacher_logits  # Free memory
+
+                # Add small epsilon to prevent log(0) in KL divergence
+                # F.kl_div computes: p * (log(p) - log_q), where log_q = log_probs_student
+                # If probs_teacher has zeros, those terms are 0 (0 * anything = 0)
+                # But if log_probs_student has -inf, we need to handle it
+                log_probs_student = log_probs_student.clamp(min=-100)  # Prevent -inf
 
                 # Per-token KL divergence: sum over vocab dimension
                 kl_per_token = F.kl_div(log_probs_student, probs_teacher, reduction='none').sum(dim=-1)
@@ -2390,6 +2400,13 @@ class FisherAwareSVD:
                 # Scale loss for gradient accumulation
                 loss = loss / gradient_accumulation_steps
 
+            # Check for NaN/Inf loss and skip if detected
+            if torch.isnan(loss) or torch.isinf(loss):
+                print(f"\n  WARNING: NaN/Inf loss at step {step}, skipping...")
+                optimizer.zero_grad()  # Clear any accumulated gradients
+                scaler.update()  # Update scaler state
+                continue
+
             # Sanity check on first step
             if step == 0 and not loss.requires_grad:
                 print(f"  ERROR: loss.requires_grad=False!")
@@ -2403,21 +2420,30 @@ class FisherAwareSVD:
             # Update weights only every gradient_accumulation_steps
             if (step + 1) % gradient_accumulation_steps == 0:
                 scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=1.0)
-                scaler.step(optimizer)
-                scaler.update()
-                scheduler.step()
-                optimizer.zero_grad()
+
+                # Check for NaN/Inf gradients
+                grad_norm = torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=1.0)
+                if torch.isnan(grad_norm) or torch.isinf(grad_norm):
+                    print(f"\n  WARNING: NaN/Inf gradients at step {step}, skipping update...")
+                    optimizer.zero_grad()
+                    scaler.update()
+                else:
+                    scaler.step(optimizer)
+                    scaler.update()
+                    scheduler.step()
+                    optimizer.zero_grad()
 
                 # Periodic memory cleanup
                 if (step + 1) % (gradient_accumulation_steps * 10) == 0:
                     torch.cuda.empty_cache()
 
             loss_val = loss.item() * gradient_accumulation_steps  # Unscale for display
-            total_loss += loss_val
 
-            if loss_val < best_loss:
-                best_loss = loss_val
+            # Skip NaN loss in tracking
+            if not (math.isnan(loss_val) or math.isinf(loss_val)):
+                total_loss += loss_val
+                if loss_val < best_loss:
+                    best_loss = loss_val
 
             pbar.set_postfix({
                 'loss': f'{loss_val:.4f}',
