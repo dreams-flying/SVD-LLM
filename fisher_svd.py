@@ -1522,7 +1522,8 @@ class FisherAwareSVD:
                  teacher_model_path: Optional[str] = None,
                  use_8bit_teacher: bool = True,
                  offline_logits_path: Optional[str] = None,
-                 distill_checkpoint_dir: Optional[str] = None) -> nn.Module:
+                 distill_checkpoint_dir: Optional[str] = None,
+                 distill_gradient_accumulation: int = 4) -> nn.Module:
         """
         Full compression pipeline.
 
@@ -1546,6 +1547,7 @@ class FisherAwareSVD:
             use_8bit_teacher: Load teacher in 8-bit to save memory (default: True)
             offline_logits_path: Path to pre-computed teacher logits (default: None)
             distill_checkpoint_dir: Directory to save distillation checkpoints (default: None)
+            distill_gradient_accumulation: Gradient accumulation steps for distillation (default: 4)
 
         Returns:
             Compressed model
@@ -1589,6 +1591,7 @@ class FisherAwareSVD:
                     offline_logits_path=offline_logits_path,
                     gradient_checkpointing=True,
                     checkpoint_dir=distill_checkpoint_dir,
+                    gradient_accumulation_steps=distill_gradient_accumulation,
                 )
             except Exception as e:
                 print(f"  Warning: Phase 5 distillation failed ({type(e).__name__}: {e}), skipping...")
@@ -2068,7 +2071,8 @@ class FisherAwareSVD:
                                         gradient_checkpointing: bool = True,
                                         warmup_ratio: float = 0.1,
                                         save_interval: int = 500,
-                                        checkpoint_dir: Optional[str] = None) -> None:
+                                        checkpoint_dir: Optional[str] = None,
+                                        gradient_accumulation_steps: int = 4) -> None:
         """
         Phase 5: Global Distillation Fine-tuning.
 
@@ -2081,6 +2085,7 @@ class FisherAwareSVD:
         2. Offline distillation mode (pre-computed teacher logits)
         3. Gradient checkpointing for student model
         4. Mixed precision training (autocast)
+        5. Gradient accumulation to reduce peak memory
 
         Args:
             train_loader: Training data loader
@@ -2094,13 +2099,14 @@ class FisherAwareSVD:
             warmup_ratio: Warmup ratio for learning rate scheduler (default: 0.1)
             save_interval: Save checkpoint every N steps (default: 500, 0 to disable)
             checkpoint_dir: Directory to save checkpoints (default: None, uses current directory)
+            gradient_accumulation_steps: Number of steps to accumulate gradients (default: 4)
         """
         import os
         import torch.nn.functional as F
         from torch.optim import AdamW
         from torch.cuda.amp import autocast, GradScaler
 
-        print(f"Phase 5: Distillation Fine-tuning ({num_steps} steps, lr={lr}, T={temperature})...")
+        print(f"Phase 5: Distillation Fine-tuning ({num_steps} steps, lr={lr}, T={temperature}, accum={gradient_accumulation_steps})...")
 
         # ================================================================
         # Step 1: Prepare Teacher Model (with memory optimization)
@@ -2316,9 +2322,11 @@ class FisherAwareSVD:
         del test_out, test_logits, test_batch
         torch.cuda.empty_cache()
 
+        # Initialize training state
         data_iter = iter(train_loader)
         total_loss = 0.0
         best_loss = float('inf')
+        optimizer.zero_grad()  # Initialize gradients for accumulation
 
         pbar = tqdm(range(num_steps), desc="Distillation")
         for step in pbar:
@@ -2330,6 +2338,7 @@ class FisherAwareSVD:
 
             batch = {k: v.to(self.device) for k, v in batch.items()}
 
+            # Get teacher logits
             if use_offline and offline_logits is not None:
                 batch_idx = step % len(offline_logits)
                 teacher_logits = offline_logits[batch_idx].to(self.device).detach()
@@ -2338,69 +2347,73 @@ class FisherAwareSVD:
                     with autocast():
                         teacher_outputs = teacher_model(**batch)
                         teacher_logits = teacher_outputs.logits.float().detach()
+                        del teacher_outputs  # Free memory immediately
 
-            optimizer.zero_grad()
-
+            # Student forward and loss computation
             with autocast():
                 student_outputs = self.model(**batch)
                 student_logits = student_outputs.logits.float()
+                del student_outputs  # Free memory immediately
 
                 # Fix Issue E: Apply causal LM shift and attention mask
-                # Shift logits for causal LM: predict next token
-                # student_logits[:, :-1] predicts tokens at positions 1, 2, ..., seq_len-1
-                # teacher_logits[:, :-1] provides target distribution for those positions
                 shift_student_logits = student_logits[:, :-1, :].contiguous()
                 shift_teacher_logits = teacher_logits[:, :-1, :].contiguous()
+                del student_logits, teacher_logits  # Free memory
 
                 # Get attention mask and shift it correspondingly
                 attention_mask = batch.get('attention_mask', None)
                 if attention_mask is not None:
-                    # Shift mask to align with shifted logits (positions 1 to seq_len-1)
-                    shift_mask = attention_mask[:, 1:].contiguous()  # (B, S-1)
-                    # Reshape for broadcasting: (B, S-1) -> (B, S-1, 1)
-                    mask_expanded = shift_mask.unsqueeze(-1).float()
+                    shift_mask = attention_mask[:, 1:].contiguous()
                 else:
-                    mask_expanded = None
+                    shift_mask = None
 
                 # Compute KL divergence with masking
                 log_probs_student = F.log_softmax(shift_student_logits / temperature, dim=-1)
                 probs_teacher = F.softmax(shift_teacher_logits / temperature, dim=-1)
+                del shift_student_logits, shift_teacher_logits  # Free memory
 
                 # Per-token KL divergence: sum over vocab dimension
-                kl_per_token = F.kl_div(log_probs_student, probs_teacher, reduction='none').sum(dim=-1)  # (B, S-1)
+                kl_per_token = F.kl_div(log_probs_student, probs_teacher, reduction='none').sum(dim=-1)
+                del log_probs_student, probs_teacher  # Free memory
 
-                if mask_expanded is not None:
-                    # Mask out padding tokens
+                if shift_mask is not None:
                     kl_per_token = kl_per_token * shift_mask.float()
-                    # Compute mean over valid tokens only
                     num_valid_tokens = shift_mask.sum()
                     if num_valid_tokens > 0:
                         loss = (kl_per_token.sum() / num_valid_tokens) * (temperature ** 2)
                     else:
-                        loss = kl_per_token.sum() * 0.0  # No valid tokens, zero loss
+                        loss = kl_per_token.sum() * 0.0
                 else:
-                    # No mask, use batchmean
                     loss = kl_per_token.mean() * (temperature ** 2)
+                del kl_per_token  # Free memory
 
-            # Sanity check: verify loss has gradient before backward
-            if not loss.requires_grad:
-                if step == 0:
-                    print(f"  ERROR: loss.requires_grad=False!")
-                    print(f"    student_logits.requires_grad={student_logits.requires_grad}")
-                    print(f"    shift_student_logits.requires_grad={shift_student_logits.requires_grad}")
-                    # Check if any trainable param has requires_grad
-                    has_grad = any(p.requires_grad for p in trainable_params)
-                    print(f"    Any trainable param has requires_grad: {has_grad}")
+                # Scale loss for gradient accumulation
+                loss = loss / gradient_accumulation_steps
+
+            # Sanity check on first step
+            if step == 0 and not loss.requires_grad:
+                print(f"  ERROR: loss.requires_grad=False!")
+                has_grad = any(p.requires_grad for p in trainable_params)
+                print(f"    Any trainable param has requires_grad: {has_grad}")
                 raise RuntimeError("Loss does not require grad - check SVD layer parameters")
 
+            # Backward pass (accumulate gradients)
             scaler.scale(loss).backward()
-            scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=1.0)
-            scaler.step(optimizer)
-            scaler.update()
-            scheduler.step()
 
-            loss_val = loss.item()
+            # Update weights only every gradient_accumulation_steps
+            if (step + 1) % gradient_accumulation_steps == 0:
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=1.0)
+                scaler.step(optimizer)
+                scaler.update()
+                scheduler.step()
+                optimizer.zero_grad()
+
+                # Periodic memory cleanup
+                if (step + 1) % (gradient_accumulation_steps * 10) == 0:
+                    torch.cuda.empty_cache()
+
+            loss_val = loss.item() * gradient_accumulation_steps  # Unscale for display
             total_loss += loss_val
 
             if loss_val < best_loss:
@@ -2546,7 +2559,8 @@ def fisher_aware_svd_compression(model_name: str, model: nn.Module,
                                   teacher_model_path: Optional[str] = None,
                                   use_8bit_teacher: bool = True,
                                   offline_logits_path: Optional[str] = None,
-                                  distill_checkpoint_dir: Optional[str] = None) -> nn.Module:
+                                  distill_checkpoint_dir: Optional[str] = None,
+                                  distill_gradient_accumulation: int = 4) -> nn.Module:
     """
     Main entry point for Fisher-Aware SVD compression.
 
@@ -2580,6 +2594,7 @@ def fisher_aware_svd_compression(model_name: str, model: nn.Module,
         use_8bit_teacher: Load teacher in 8-bit to save memory (default: True)
         offline_logits_path: Path to pre-computed teacher logits (default: None)
         distill_checkpoint_dir: Directory to save distillation checkpoints (default: None)
+        distill_gradient_accumulation: Gradient accumulation steps for distillation (default: 4)
 
     Returns:
         Compressed model
@@ -2604,7 +2619,8 @@ def fisher_aware_svd_compression(model_name: str, model: nn.Module,
                                teacher_model_path=teacher_model_path,
                                use_8bit_teacher=use_8bit_teacher,
                                offline_logits_path=offline_logits_path,
-                               distill_checkpoint_dir=distill_checkpoint_dir)
+                               distill_checkpoint_dir=distill_checkpoint_dir,
+                               distill_gradient_accumulation=distill_gradient_accumulation)
 
 
 if __name__ == '__main__':
