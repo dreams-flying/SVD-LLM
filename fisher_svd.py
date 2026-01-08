@@ -85,6 +85,276 @@ class SVDLinear(nn.Module):
         return self.u_proj(self.v_proj(x))
 
 
+class SVDLinearWithDenseBlocks(nn.Module):
+    """
+    Low-rank SVD + sparse dense blocks for better approximation.
+
+    W ≈ U_k @ Σ_k @ V_k^T + R
+
+    where R is represented as a list of dense blocks (not sparse tensor).
+    Uses bucket-based GEMM + index_add for efficient inference.
+
+    Key insight: Traditional SVD has k(m+n) params, which can exceed mn for large k.
+    This approach uses small k + critical dense blocks to get better accuracy
+    with controlled parameter budget.
+    """
+
+    def __init__(self, v_proj: nn.Linear, u_proj: nn.Linear,
+                 block_size: int = 16,
+                 groups: Optional[List[Dict]] = None):
+        """
+        Args:
+            v_proj: V projection (in_features -> rank)
+            u_proj: U projection (rank -> out_features)
+            block_size: Size of dense blocks (default 16)
+            groups: Pre-packed block groups by col_start, each containing:
+                    {"col": int, "row_index": LongTensor, "blocks_T": Tensor}
+        """
+        super().__init__()
+        self.v_proj = v_proj
+        self.u_proj = u_proj
+        self.block_size = block_size
+        self.num_groups = 0
+
+        if groups is not None:
+            self.num_groups = len(groups)
+            # Register group tensors as buffers for proper device handling
+            for gi, g in enumerate(groups):
+                self.register_buffer(f"g{gi}_col", torch.tensor(g["col"], dtype=torch.long))
+                self.register_buffer(f"g{gi}_row_index", g["row_index"])
+                self.register_buffer(f"g{gi}_blocks_T", g["blocks_T"])
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Low-rank path: same as SVDLinear
+        y = self.u_proj(self.v_proj(x))
+
+        # Residual path: bucket-based dense GEMM + index_add
+        if self.num_groups == 0:
+            return y
+
+        # Reshape for 2D operations
+        orig_shape = y.shape
+        y2d = y.reshape(-1, y.shape[-1])  # [B*S, out]
+        x2d = x.reshape(-1, x.shape[-1])  # [B*S, in]
+        b = self.block_size
+
+        for gi in range(self.num_groups):
+            col = getattr(self, f"g{gi}_col").item()
+            row_index = getattr(self, f"g{gi}_row_index")  # [L]
+            blocks_T = getattr(self, f"g{gi}_blocks_T")    # [b, L]
+
+            # Extract input slice for this column bucket
+            Xc = x2d[:, col:col+b]  # [B*S, b]
+
+            # Single GEMM for all blocks in this bucket
+            out_flat = torch.matmul(Xc, blocks_T)  # [B*S, L]
+
+            # Scatter-add to output
+            y2d.index_add_(1, row_index, out_flat)
+
+        return y2d.reshape(orig_shape)
+
+    @staticmethod
+    def pack_blocks_by_col(blocks: List[Dict], block_size: int, device) -> List[Dict]:
+        """
+        Pack blocks into column-bucket format for efficient inference.
+
+        Args:
+            blocks: List of {"row": int, "col": int, "val": Tensor[b,b]}
+            block_size: Block size
+            device: Target device
+
+        Returns:
+            List of packed groups: {"col": int, "row_index": Tensor, "blocks_T": Tensor}
+        """
+        from collections import defaultdict
+
+        buckets = defaultdict(list)
+        for blk in blocks:
+            buckets[blk["col"]].append(blk)
+
+        groups = []
+        b = block_size
+        ar = torch.arange(b, device=device)
+
+        for col, blks in sorted(buckets.items()):
+            # Build row_index: [g*b] where g = number of blocks in bucket
+            rows = torch.tensor([blk["row"] for blk in blks], device=device)
+            row_index = (rows[:, None] + ar[None, :]).reshape(-1).long()
+
+            # Build blocks_T: [b, g*b]
+            # Each block's transpose is concatenated horizontally
+            blocks_T = torch.cat([blk["val"].to(device).T for blk in blks], dim=1)
+
+            groups.append({
+                "col": col,
+                "row_index": row_index,
+                "blocks_T": blocks_T
+            })
+
+        return groups
+
+
+def select_residual_blocks(W: torch.Tensor, U: torch.Tensor, S: torch.Tensor,
+                           VT: torch.Tensor, block_size: int, budget_blocks: int,
+                           importance_weights: Optional[torch.Tensor] = None,
+                           top_per_row: int = 8) -> List[Dict]:
+    """
+    Select high-importance residual blocks for W - U @ diag(S) @ VT.
+
+    Args:
+        W: Original weight matrix [out, in]
+        U: Left singular vectors [out, k]
+        S: Singular values [k]
+        VT: Right singular vectors transposed [k, in]
+        block_size: Size of blocks
+        budget_blocks: Maximum number of blocks to select
+        importance_weights: Optional per-output importance weights [out]
+        top_per_row: Max candidates per row-tile to reduce search space
+
+    Returns:
+        List of {"row": int, "col": int, "val": Tensor[b,b]}
+    """
+    m, n = W.shape
+    b = block_size
+    device = W.device
+
+    # Number of row/col tiles
+    n_row_tiles = (m + b - 1) // b
+    n_col_tiles = (n + b - 1) // b
+
+    # Reconstruct low-rank approximation (we'll compute block-by-block to save memory)
+    # W_approx = U @ diag(S) @ VT, but we compute per-block
+
+    candidates = []
+
+    for ri in range(n_row_tiles):
+        row_start = ri * b
+        row_end = min(row_start + b, m)
+        actual_row_size = row_end - row_start
+
+        # U slice for this row tile
+        U_block = U[row_start:row_end, :]  # [actual_row_size, k]
+        US_block = U_block * S  # [actual_row_size, k]
+
+        # Importance weight for this row tile
+        if importance_weights is not None:
+            row_weight = importance_weights[row_start:row_end].mean().item()
+        else:
+            row_weight = 1.0
+
+        row_scores = []
+
+        for ci in range(n_col_tiles):
+            col_start = ci * b
+            col_end = min(col_start + b, n)
+            actual_col_size = col_end - col_start
+
+            # Extract original block
+            W_block = W[row_start:row_end, col_start:col_end]
+
+            # Compute low-rank approximation for this block
+            VT_block = VT[:, col_start:col_end]  # [k, actual_col_size]
+            W_approx_block = US_block @ VT_block  # [actual_row_size, actual_col_size]
+
+            # Residual block
+            R_block = W_block - W_approx_block
+
+            # Pad to full block size if needed
+            if actual_row_size < b or actual_col_size < b:
+                R_padded = torch.zeros(b, b, device=device, dtype=R_block.dtype)
+                R_padded[:actual_row_size, :actual_col_size] = R_block
+                R_block = R_padded
+
+            # Score: Frobenius norm squared * importance weight
+            score = (R_block ** 2).sum().item() * row_weight
+
+            if score > 0:
+                row_scores.append((score, row_start, col_start, R_block.clone()))
+
+        # Keep top_per_row candidates from this row tile
+        row_scores.sort(key=lambda x: -x[0])
+        for score, r, c, val in row_scores[:top_per_row]:
+            candidates.append({
+                "score": score,
+                "row": r,
+                "col": c,
+                "val": val
+            })
+
+    # Global selection: top budget_blocks by score
+    candidates.sort(key=lambda x: -x["score"])
+    selected = candidates[:budget_blocks]
+
+    # Return without score field
+    return [{"row": blk["row"], "col": blk["col"], "val": blk["val"]} for blk in selected]
+
+
+class SVDLinearTrainable(nn.Module):
+    """
+    A trainable low-rank linear layer for Phase 5 distillation fine-tuning.
+
+    W = U @ diag(S) @ VT where U, S, VT are all trainable parameters.
+    The rank is fixed, but values can be optimized to minimize distillation loss.
+
+    This is essentially a LoRA-like structure, but initialized from SVD instead of random.
+    """
+
+    def __init__(self, U: torch.Tensor, S: torch.Tensor, VT: torch.Tensor,
+                 bias: Optional[torch.Tensor] = None, train_bias: bool = False):
+        super().__init__()
+        # U: (out_features, rank), S: (rank,), VT: (rank, in_features)
+        self.U = nn.Parameter(U.float())
+        self.S = nn.Parameter(S.float())
+        self.VT = nn.Parameter(VT.float())
+
+        if bias is not None:
+            self.bias = nn.Parameter(bias.float(), requires_grad=train_bias)
+        else:
+            self.register_parameter('bias', None)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # W = U @ diag(S) @ VT
+        # Forward: x @ W^T = x @ VT^T @ diag(S) @ U^T
+        original_dtype = x.dtype
+        x = x.float()
+
+        # Efficient computation: x @ V @ diag(S) @ U^T
+        out = torch.matmul(x, self.VT.T)  # x @ V: (batch, seq, rank)
+        out = out * self.S                 # element-wise: (batch, seq, rank)
+        out = torch.matmul(out, self.U.T)  # @ U^T: (batch, seq, out_features)
+
+        if self.bias is not None:
+            out = out + self.bias
+
+        return out.to(original_dtype)
+
+    @torch.no_grad()
+    def get_weight(self) -> torch.Tensor:
+        """Reconstruct the full weight matrix W = U @ diag(S) @ VT"""
+        return (self.U * self.S) @ self.VT
+
+    @torch.no_grad()
+    def merge_to_linear(self) -> nn.Linear:
+        """Convert to a standard nn.Linear for inference efficiency."""
+        weight = self.get_weight()
+        out_features, in_features = self.U.shape[0], self.VT.shape[1]
+        linear = nn.Linear(in_features, out_features, bias=self.bias is not None)
+        linear.weight.data = weight.to(linear.weight.dtype)
+        if self.bias is not None:
+            linear.bias.data = self.bias.to(linear.bias.dtype)
+        return linear
+
+    def get_svd_components(self) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+        """Return current U, S, VT, bias values (detached, on CPU)."""
+        return (
+            self.U.data.cpu(),
+            self.S.data.cpu(),
+            self.VT.data.cpu(),
+            self.bias.data.cpu() if self.bias is not None else None
+        )
+
+
 class FisherAwareSVD:
     """
     Fisher-Aware SVD compression for LLMs.
@@ -122,23 +392,36 @@ class FisherAwareSVD:
         self.fisher_info: Dict[str, Dict[str, torch.Tensor]] = {}
         self.original_layers: Dict[str, nn.Module] = {}
 
-    def phase1_svd_decomposition(self, whitening_mat: Optional[Dict] = None) -> None:
+    def phase1_svd_decomposition(self, whitening_mat: Optional[Dict] = None,
+                                    store_original_weights: bool = False) -> None:
         """
         Phase 1: Perform SVD decomposition on each linear layer.
 
         Args:
             whitening_mat: Optional whitening matrices from SVD-LLM profiling.
                           If provided, applies whitening before SVD.
+            store_original_weights: If True, store original weights for residual block selection
         """
         print("Phase 1: SVD Decomposition...")
+
+        # Initialize storage for original weights if needed (for residual block selection)
+        if store_original_weights:
+            self.original_weights = {}
 
         for layer_idx in tqdm(range(len(self.layers))):
             layer = self.layers[layer_idx]
             subset = find_layers(layer)
 
             layer_svd = {}
+            if store_original_weights:
+                self.original_weights[layer_idx] = {}
+
             for name, module in subset.items():
                 W = module.weight.data.float()
+
+                # Store original weight if requested (for residual block selection)
+                if store_original_weights:
+                    self.original_weights[layer_idx][name] = W.cpu().clone()
 
                 # Apply whitening if available
                 if whitening_mat is not None and layer_idx in whitening_mat:
@@ -1323,7 +1606,133 @@ class FisherAwareSVD:
         print(f"  Actual compression ratio: {actual_ratio:.2%}")
         print(f"  Kept {kept_count} singular values out of {total_sv_count}")
 
-    def apply_compression(self, ratio: float) -> None:
+    def phase3b_residual_block_selection(self, block_budget_ratio: float = 0.02,
+                                          block_size: int = 16,
+                                          top_per_row: int = 8) -> None:
+        """
+        Phase 3b: Select high-importance residual blocks to complement low-rank SVD.
+
+        After truncation, W ≈ U_k @ S_k @ V_k^T has residual error.
+        We select a small number of dense blocks from R = W - U_k S_k V_k^T
+        that capture the most important remaining information.
+
+        This allows using smaller rank k while compensating with critical residual blocks,
+        effectively breaking the k(m+n) parameter constraint.
+
+        Args:
+            block_budget_ratio: Fraction of original params to spend on residual blocks (default: 2%)
+            block_size: Size of each block (default: 16)
+            top_per_row: Max candidate blocks per row-tile to limit search (default: 8)
+        """
+        print(f"Phase 3b: Residual Block Selection (budget={block_budget_ratio:.1%}, block_size={block_size})...")
+
+        # Initialize residual block storage
+        self.residual_blocks = {}
+        self.block_size = block_size
+
+        # Calculate total parameter budget for blocks
+        total_original_params = sum(
+            self.original_weights[layer_idx][name].numel()
+            for layer_idx in self.original_weights
+            for name in self.original_weights[layer_idx]
+        )
+        block_param_budget = int(total_original_params * block_budget_ratio)
+        params_per_block = block_size * block_size
+
+        # Global block budget
+        total_block_budget = block_param_budget // params_per_block
+        print(f"  Total block budget: {total_block_budget} blocks ({block_param_budget:,} params)")
+
+        if total_block_budget == 0:
+            print("  No blocks to select (budget too small)")
+            return
+
+        # Collect all candidate blocks across all projections
+        all_candidates = []
+
+        for layer_idx in self.svd_components:
+            if layer_idx not in self.original_weights:
+                continue
+
+            for name in self.svd_components[layer_idx]:
+                if name not in self.original_weights[layer_idx]:
+                    continue
+
+                # Get original weight and SVD components
+                W = self.original_weights[layer_idx][name]
+                U, S, VT, bias = self.svd_components[layer_idx][name]
+
+                # Get importance weight from Fisher if available
+                importance_weights = None
+                if hasattr(self, 'fisher_info') and layer_idx in self.fisher_info:
+                    if name in self.fisher_info[layer_idx]:
+                        # Use Fisher info as row importance
+                        fisher = self.fisher_info[layer_idx][name]
+                        if len(fisher.shape) == 2:
+                            importance_weights = fisher.sum(dim=1)  # Sum over columns
+                        else:
+                            importance_weights = fisher
+
+                # Select candidate blocks for this projection
+                blocks = select_residual_blocks(
+                    W, U, S, VT,
+                    block_size=block_size,
+                    budget_blocks=total_block_budget,  # Each projection gets full budget as candidates
+                    importance_weights=importance_weights,
+                    top_per_row=top_per_row
+                )
+
+                for blk in blocks:
+                    blk["layer_idx"] = layer_idx
+                    blk["name"] = name
+                    all_candidates.append(blk)
+
+        if len(all_candidates) == 0:
+            print("  No residual block candidates found")
+            return
+
+        # Sort by score (computed in select_residual_blocks, need to recompute here)
+        # Actually we need to re-score globally - let's compute scores
+        for blk in all_candidates:
+            score = (blk["val"] ** 2).sum().item()
+            blk["score"] = score
+
+        all_candidates.sort(key=lambda x: -x["score"])
+
+        # Select top blocks globally
+        selected = all_candidates[:total_block_budget]
+        print(f"  Selected {len(selected)} blocks from {len(all_candidates)} candidates")
+
+        # Organize by (layer_idx, name)
+        for blk in selected:
+            key = (blk["layer_idx"], blk["name"])
+            if key not in self.residual_blocks:
+                self.residual_blocks[key] = []
+            self.residual_blocks[key].append({
+                "row": blk["row"],
+                "col": blk["col"],
+                "val": blk["val"]
+            })
+
+        # Print statistics
+        total_blocks_used = len(selected)
+        total_block_params = total_blocks_used * params_per_block
+        print(f"  Residual blocks: {total_blocks_used} blocks, {total_block_params:,} params")
+        print(f"  Projections with blocks: {len(self.residual_blocks)}")
+
+        # Show distribution across layers
+        layer_block_counts = {}
+        for (layer_idx, name), blocks in self.residual_blocks.items():
+            if layer_idx not in layer_block_counts:
+                layer_block_counts[layer_idx] = 0
+            layer_block_counts[layer_idx] += len(blocks)
+
+        if layer_block_counts:
+            min_layer = min(layer_block_counts.items(), key=lambda x: x[1])
+            max_layer = max(layer_block_counts.items(), key=lambda x: x[1])
+            print(f"  Block distribution: Layer {min_layer[0]} has {min_layer[1]}, Layer {max_layer[0]} has {max_layer[1]}")
+
+    def apply_compression(self, ratio: float, use_residual_blocks: bool = True) -> None:
         """
         Apply compression to the model by replacing layers with SVD-factorized versions.
 
@@ -1332,13 +1741,23 @@ class FisherAwareSVD:
 
         Args:
             ratio: Compression ratio (0-1) - used only for module creation reference
+            use_residual_blocks: Whether to use residual blocks if available (default: True)
         """
         print("Applying compression to model...")
+
+        # Check if residual blocks are available
+        has_residual_blocks = hasattr(self, 'residual_blocks') and len(self.residual_blocks) > 0
+        if use_residual_blocks and has_residual_blocks:
+            print(f"  Using residual blocks: {len(self.residual_blocks)} projections")
+            block_size = getattr(self, 'block_size', 16)
+        else:
+            has_residual_blocks = False
 
         # First, compute actual ranks for each layer to determine per-layer ratios
         layer_ranks = {}
         total_original_params = 0
         total_compressed_params = 0
+        total_block_params = 0
 
         for layer_idx in self.svd_components:
             layer_ranks[layer_idx] = {}
@@ -1350,10 +1769,19 @@ class FisherAwareSVD:
                 total_original_params += m * n
                 total_compressed_params += actual_rank * (m + n)
 
+                # Count residual block params
+                if has_residual_blocks and (layer_idx, name) in self.residual_blocks:
+                    num_blocks = len(self.residual_blocks[(layer_idx, name)])
+                    total_block_params += num_blocks * block_size * block_size
+
         # Print compression summary
+        total_params = total_compressed_params + total_block_params
         print(f"  Original params: {total_original_params:,}")
-        print(f"  Compressed params: {total_compressed_params:,}")
-        print(f"  Compression ratio: {total_compressed_params / total_original_params:.2%}")
+        print(f"  SVD params: {total_compressed_params:,}")
+        if total_block_params > 0:
+            print(f"  Block params: {total_block_params:,}")
+            print(f"  Total compressed: {total_params:,}")
+        print(f"  Compression ratio: {total_params / total_original_params:.2%}")
 
         replaced_count = 0
         for layer_idx in tqdm(range(len(self.layers))):
@@ -1410,8 +1838,13 @@ class FisherAwareSVD:
                 if bias is not None:
                     u_proj.bias.data = bias.to(dtype)
 
+                # Get residual blocks for this projection if available
+                blocks = None
+                if has_residual_blocks and (layer_idx, name) in self.residual_blocks:
+                    blocks = self.residual_blocks[(layer_idx, name)]
+
                 # Replace in model using a wrapper or direct replacement
-                self._replace_linear_with_svd(layer, name, u_proj, v_proj, layer_idx)
+                self._replace_linear_with_svd(layer, name, u_proj, v_proj, layer_idx, blocks, block_size if has_residual_blocks else 16)
                 replaced_count += 1
 
             torch.cuda.empty_cache()
@@ -1419,9 +1852,11 @@ class FisherAwareSVD:
         print(f"  Replaced {replaced_count} linear layers with SVD factorization")
 
     def _replace_linear_with_svd(self, layer, name: str, u_proj: nn.Linear,
-                                  v_proj: nn.Linear, layer_idx: int) -> None:
+                                  v_proj: nn.Linear, layer_idx: int,
+                                  blocks: Optional[List[Dict]] = None,
+                                  block_size: int = 16) -> None:
         """
-        Replace a linear layer with SVD factorization (V @ U).
+        Replace a linear layer with SVD factorization (V @ U), optionally with residual blocks.
 
         Args:
             layer: The transformer layer
@@ -1429,10 +1864,17 @@ class FisherAwareSVD:
             u_proj: The U projection (rank -> out_features)
             v_proj: The V projection (in_features -> rank)
             layer_idx: Layer index for model-specific handling
+            blocks: Optional list of residual blocks
+            block_size: Block size for residual blocks
         """
-        # Use module-level SVDLinear class for pickle compatibility
-
-        svd_linear = SVDLinear(v_proj, u_proj)
+        # Create appropriate SVD layer based on whether blocks are available
+        if blocks is not None and len(blocks) > 0:
+            # Pack blocks into efficient format
+            device = u_proj.weight.device
+            groups = SVDLinearWithDenseBlocks.pack_blocks_by_col(blocks, block_size, device)
+            svd_linear = SVDLinearWithDenseBlocks(v_proj, u_proj, block_size, groups)
+        else:
+            svd_linear = SVDLinear(v_proj, u_proj)
 
         # Navigate to the correct location and replace
         parts = name.split('.')
@@ -1449,7 +1891,19 @@ class FisherAwareSVD:
                  fisher_lambda: float = 2.0,
                  use_als: bool = True,
                  als_iters: int = 2,
-                 token_sample_ratio: float = 0.2) -> nn.Module:
+                 token_sample_ratio: float = 0.2,
+                 use_residual_blocks: bool = False,
+                 block_budget_ratio: float = 0.02,
+                 block_size: int = 16,
+                 use_distillation: bool = False,
+                 distill_steps: int = 2000,
+                 distill_lr: float = 1e-4,
+                 distill_temperature: float = 2.0,
+                 teacher_model_path: Optional[str] = None,
+                 use_8bit_teacher: bool = True,
+                 offline_logits_path: Optional[str] = None,
+                 distill_checkpoint_dir: Optional[str] = None,
+                 distill_gradient_accumulation: int = 4) -> nn.Module:
         """
         Full compression pipeline.
 
@@ -1465,18 +1919,43 @@ class FisherAwareSVD:
             use_als: Use ALS calibration instead of M-optimization (default: True)
             als_iters: Number of ALS iterations per layer (default: 2)
             token_sample_ratio: Ratio of tokens to sample per sequence for ALS (default: 0.1)
+            use_residual_blocks: Use dense residual blocks to improve accuracy (default: False)
+            block_budget_ratio: Fraction of params for residual blocks (default: 0.02 = 2%)
+            block_size: Size of residual blocks (default: 16)
+            use_distillation: Enable Phase 5 distillation fine-tuning (default: False)
+            distill_steps: Number of distillation training steps (default: 2000)
+            distill_lr: Learning rate for distillation (default: 1e-4)
+            distill_temperature: Distillation temperature (default: 2.0)
+            teacher_model_path: Path to teacher model (default: None, uses model_name)
+            use_8bit_teacher: Load teacher in 8-bit to save memory (default: True)
+            offline_logits_path: Path to pre-computed teacher logits (default: None)
+            distill_checkpoint_dir: Directory to save distillation checkpoints (default: None)
+            distill_gradient_accumulation: Gradient accumulation steps for distillation (default: 4)
 
         Returns:
             Compressed model
         """
         # Phase 1: SVD Decomposition
-        self.phase1_svd_decomposition(whitening_mat)
+        # Store original weights if we'll need them for residual block selection
+        self.phase1_svd_decomposition(whitening_mat, store_original_weights=use_residual_blocks)
 
         # Phase 2: Sensitivity Estimation
         self.phase2_sensitivity_estimation(calib_loader, use_low_resource)
 
         # Phase 3: Global Truncation with adaptive min/max allocation
         self.phase3_global_truncation(ratio, min_rank=min_rank, fisher_lambda=fisher_lambda)
+
+        # Phase 3b: Residual Block Selection (if enabled)
+        if use_residual_blocks:
+            self.phase3b_residual_block_selection(
+                block_budget_ratio=block_budget_ratio,
+                block_size=block_size,
+                top_per_row=8
+            )
+            # Clean up original weights to save memory
+            if hasattr(self, 'original_weights'):
+                del self.original_weights
+                torch.cuda.empty_cache()
 
         # Phase 4: Layer-wise Calibration (optimize SVD factors to minimize reconstruction error)
         if calibration_steps > 0:
