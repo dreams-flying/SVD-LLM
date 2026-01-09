@@ -1691,7 +1691,8 @@ class FisherAwareSVD:
     def phase3b_residual_block_selection(self, block_budget: int = 0,
                                           block_size: int = 16,
                                           top_per_row: int = 8,
-                                          use_fisher_weight: bool = True) -> None:
+                                          use_fisher_weight: bool = True,
+                                          layer_balance: str = "none") -> None:
         """
         Phase 3b: Select high-importance residual blocks to complement low-rank SVD.
 
@@ -1706,7 +1707,6 @@ class FisherAwareSVD:
         reserved budget (block_share of total).
 
         Optimizations:
-        - Uses layer_factor for cross-layer balancing (like Phase3)
         - Uses heap with candidate cap to avoid memory explosion
         - Limits candidates per projection to 2x average budget share
         - Uses BOTH row and column Fisher importance for scoring
@@ -1716,6 +1716,10 @@ class FisherAwareSVD:
             block_size: Size of each block (default: 16)
             top_per_row: Max candidate blocks per row-tile to limit search (default: 8)
             use_fisher_weight: If False, only use Frobenius norm (for debugging)
+            layer_balance: Layer balancing strategy:
+                - "none": No layer bias, pure error*Fisher score (recommended)
+                - "later": Favor later layers (0.5 + position)
+                - "earlier": Favor earlier layers (1.5 - position)
         """
         import heapq
 
@@ -1724,6 +1728,7 @@ class FisherAwareSVD:
 
         print(f"Phase 3b: Residual Block Selection (budget={block_budget:,} params, {total_block_budget} blocks, block_size={block_size})...")
         print(f"  Fisher weighting: {'enabled' if use_fisher_weight else 'DISABLED (debug mode)'}")
+        print(f"  Layer balance: {layer_balance}")
 
         # Initialize residual block storage
         self.residual_blocks = {}
@@ -1764,9 +1769,14 @@ class FisherAwareSVD:
             if layer_idx not in self.original_weights:
                 continue
 
-            # Layer factor: later layers get higher weight (range 0.5 to 1.5)
+            # Layer factor based on layer_balance strategy
             layer_position = layer_idx / (num_layers - 1) if num_layers > 1 else 0.5
-            layer_factor = 0.5 + layer_position
+            if layer_balance == "later":
+                layer_factor = 0.5 + layer_position  # L0=0.5, L31=1.5
+            elif layer_balance == "earlier":
+                layer_factor = 1.5 - layer_position  # L0=1.5, L31=0.5
+            else:  # "none" - recommended
+                layer_factor = 1.0  # No bias, pure error*Fisher score
 
             for name in self.svd_components[layer_idx]:
                 if name not in self.original_weights[layer_idx]:
@@ -2051,6 +2061,7 @@ class FisherAwareSVD:
                  block_share: float = 0.1,
                  block_size: int = 16,
                  use_block_fisher_weight: bool = True,
+                 block_layer_balance: str = "none",
                  use_distillation: bool = False,
                  distill_steps: int = 2000,
                  distill_lr: float = 1e-4,
@@ -2081,6 +2092,10 @@ class FisherAwareSVD:
             block_size: Size of residual blocks (default: 16)
             use_block_fisher_weight: Use Fisher weighting for block selection (default: True)
                                     Set False for debugging (use pure Frobenius norm)
+            block_layer_balance: Layer balance strategy for block selection (default: "none")
+                                - "none": No layer bias, pure error*Fisher score (recommended)
+                                - "later": Favor later layers
+                                - "earlier": Favor earlier layers
             use_distillation: Enable Phase 5 distillation fine-tuning (default: False)
             distill_steps: Number of distillation training steps (default: 2000)
             distill_lr: Learning rate for distillation (default: 1e-4)
@@ -2114,7 +2129,8 @@ class FisherAwareSVD:
                 block_budget=block_budget,
                 block_size=block_size,
                 top_per_row=8,
-                use_fisher_weight=use_block_fisher_weight
+                use_fisher_weight=use_block_fisher_weight,
+                layer_balance=block_layer_balance
             )
             # Clean up original weights to save memory
             if hasattr(self, 'original_weights'):
