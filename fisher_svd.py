@@ -2123,21 +2123,8 @@ class FisherAwareSVD:
             use_residual_blocks=use_residual_blocks, block_share=block_share
         )
 
-        # Phase 3b: Residual Block Selection (if enabled)
-        if use_residual_blocks and block_budget > 0:
-            self.phase3b_residual_block_selection(
-                block_budget=block_budget,
-                block_size=block_size,
-                top_per_row=8,
-                use_fisher_weight=use_block_fisher_weight,
-                layer_balance=block_layer_balance
-            )
-            # Clean up original weights to save memory
-            if hasattr(self, 'original_weights'):
-                del self.original_weights
-                torch.cuda.empty_cache()
-
         # Phase 4: Layer-wise Calibration (optimize SVD factors to minimize reconstruction error)
+        # NOTE: Run BEFORE Phase 3b so blocks capture post-ALS residual
         if calibration_steps > 0:
             try:
                 if use_als:
@@ -2153,6 +2140,21 @@ class FisherAwareSVD:
                 traceback.print_exc()
         else:
             print("Phase 4: Skipped (calibration_steps=0)")
+
+        # Phase 3b: Residual Block Selection (if enabled)
+        # NOTE: Run AFTER Phase 4 so blocks capture post-calibration residual
+        if use_residual_blocks and block_budget > 0:
+            self.phase3b_residual_block_selection(
+                block_budget=block_budget,
+                block_size=block_size,
+                top_per_row=8,
+                use_fisher_weight=use_block_fisher_weight,
+                layer_balance=block_layer_balance
+            )
+            # Clean up original weights to save memory
+            if hasattr(self, 'original_weights'):
+                del self.original_weights
+                torch.cuda.empty_cache()
 
         # Apply compression to model
         self.apply_compression(ratio)
