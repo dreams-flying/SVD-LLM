@@ -1719,9 +1719,10 @@ class FisherAwareSVD:
         # Candidate cap per projection: 2x fair share (to allow some flexibility)
         cand_cap_per_proj = max(100, (total_block_budget * 2) // max(1, num_projections))
 
-        # Use a min-heap to keep top-K globally (heap stores (-score, block) for max behavior)
-        # Limit heap size to total_block_budget to save memory
+        # Use a min-heap to keep top-K globally
+        # Heap stores (score, counter, block) - counter breaks ties to avoid dict comparison
         heap = []
+        heap_counter = 0  # Unique counter to break ties
         total_candidates_seen = 0
 
         for layer_idx in self.svd_components:
@@ -1775,9 +1776,11 @@ class FisherAwareSVD:
                     blk["name"] = name
 
                     if len(heap) < total_block_budget:
-                        heapq.heappush(heap, (blk["score"], blk))
+                        heapq.heappush(heap, (blk["score"], heap_counter, blk))
+                        heap_counter += 1
                     elif blk["score"] > heap[0][0]:
-                        heapq.heapreplace(heap, (blk["score"], blk))
+                        heapq.heapreplace(heap, (blk["score"], heap_counter, blk))
+                        heap_counter += 1
 
                 # Clear GPU memory
                 del W_gpu, U_gpu, S_gpu, VT_gpu
@@ -1789,8 +1792,8 @@ class FisherAwareSVD:
             print("  No residual block candidates found")
             return
 
-        # Extract selected blocks from heap
-        selected = [blk for _, blk in heap]
+        # Extract selected blocks from heap (tuple is (score, counter, blk))
+        selected = [blk for _, _, blk in heap]
         print(f"  Selected {len(selected)} blocks from {total_candidates_seen} candidates (heap-based)")
 
         # Organize by (layer_idx, name)
