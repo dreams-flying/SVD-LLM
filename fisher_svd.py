@@ -155,7 +155,7 @@ class SVDLinearWithDenseBlocks(nn.Module):
         return y2d.reshape(orig_shape)
 
     @staticmethod
-    def pack_blocks_by_col(blocks: List[Dict], block_size: int, device) -> List[Dict]:
+    def pack_blocks_by_col(blocks: List[Dict], block_size: int, device, dtype=None) -> List[Dict]:
         """
         Pack blocks into column-bucket format for efficient inference.
 
@@ -163,6 +163,7 @@ class SVDLinearWithDenseBlocks(nn.Module):
             blocks: List of {"row": int, "col": int, "val": Tensor[b,b]}
             block_size: Block size
             device: Target device
+            dtype: Target dtype (e.g., float16, bfloat16). If None, keeps original dtype.
 
         Returns:
             List of packed groups: {"col": int, "row_index": Tensor, "blocks_T": Tensor}
@@ -184,7 +185,11 @@ class SVDLinearWithDenseBlocks(nn.Module):
 
             # Build blocks_T: [b, g*b]
             # Each block's transpose is concatenated horizontally
-            blocks_T = torch.cat([blk["val"].to(device).T for blk in blks], dim=1)
+            # Convert to target dtype for proper matmul with model activations
+            if dtype is not None:
+                blocks_T = torch.cat([blk["val"].to(device=device, dtype=dtype).T for blk in blks], dim=1)
+            else:
+                blocks_T = torch.cat([blk["val"].to(device).T for blk in blks], dim=1)
 
             groups.append({
                 "col": col,
@@ -1736,6 +1741,16 @@ class FisherAwareSVD:
             if layer_idx in self.original_weights and name in self.original_weights[layer_idx]
         )
 
+        # Estimate max candidates (for logging)
+        # Each projection: n_row_tiles * top_per_row candidates
+        sample_layer = next(iter(self.original_weights.keys()))
+        sample_name = next(iter(self.original_weights[sample_layer].keys()))
+        sample_shape = self.original_weights[sample_layer][sample_name].shape
+        n_row_tiles = (sample_shape[0] + block_size - 1) // block_size
+        max_cand_per_proj = n_row_tiles * top_per_row
+        estimated_max_candidates = num_projections * max_cand_per_proj
+        print(f"  Projections: {num_projections}, max candidates ~{estimated_max_candidates:,}")
+
         # Candidate cap per projection: 2x fair share (to allow some flexibility)
         cand_cap_per_proj = max(100, (total_block_budget * 2) // max(1, num_projections))
 
@@ -1825,6 +1840,10 @@ class FisherAwareSVD:
         selected = [blk for _, _, blk in heap]
         print(f"  Selected {len(selected)} blocks from {total_candidates_seen} candidates (heap-based)")
 
+        # Warning if no filtering happened (budget >= candidates)
+        if len(selected) == total_candidates_seen:
+            print(f"  WARNING: All candidates selected (budget >= candidates). Consider reducing block_share.")
+
         # Organize by (layer_idx, name)
         for blk in selected:
             key = (blk["layer_idx"], blk["name"])
@@ -1846,16 +1865,25 @@ class FisherAwareSVD:
 
         # Show distribution across layers
         layer_block_counts = {}
-        for (layer_idx, name), blocks in self.residual_blocks.items():
+        layer_score_sums = {}
+        for blk in selected:
+            layer_idx = blk["layer_idx"]
             if layer_idx not in layer_block_counts:
                 layer_block_counts[layer_idx] = 0
-            layer_block_counts[layer_idx] += len(blocks)
+                layer_score_sums[layer_idx] = 0.0
+            layer_block_counts[layer_idx] += 1
+            layer_score_sums[layer_idx] += blk["score"]
 
         if layer_block_counts:
             min_layer = min(layer_block_counts.items(), key=lambda x: x[1])
             max_layer = max(layer_block_counts.items(), key=lambda x: x[1])
             avg_blocks = sum(layer_block_counts.values()) / len(layer_block_counts)
             print(f"  Block distribution: min={min_layer[1]} (L{min_layer[0]}), max={max_layer[1]} (L{max_layer[0]}), avg={avg_blocks:.0f}")
+
+            # Show score statistics by layer
+            min_avg_score = min((layer_score_sums[l] / layer_block_counts[l], l) for l in layer_block_counts)
+            max_avg_score = max((layer_score_sums[l] / layer_block_counts[l], l) for l in layer_block_counts)
+            print(f"  Avg score by layer: min={min_avg_score[0]:.2e} (L{min_avg_score[1]}), max={max_avg_score[0]:.2e} (L{max_avg_score[1]})")
 
     def apply_compression(self, ratio: float, use_residual_blocks: bool = True) -> None:
         """
@@ -1995,8 +2023,10 @@ class FisherAwareSVD:
         # Create appropriate SVD layer based on whether blocks are available
         if blocks is not None and len(blocks) > 0:
             # Pack blocks into efficient format
+            # IMPORTANT: Convert blocks to model dtype to avoid dtype mismatch in matmul
             device = u_proj.weight.device
-            groups = SVDLinearWithDenseBlocks.pack_blocks_by_col(blocks, block_size, device)
+            dtype = u_proj.weight.dtype
+            groups = SVDLinearWithDenseBlocks.pack_blocks_by_col(blocks, block_size, device, dtype)
             svd_linear = SVDLinearWithDenseBlocks(v_proj, u_proj, block_size, groups)
         else:
             svd_linear = SVDLinear(v_proj, u_proj)
