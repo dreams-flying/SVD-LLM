@@ -1140,7 +1140,9 @@ class FisherAwareSVD:
             print(f"  Top-{ratio:.0%} overlap (old vs new formula): {overlap_pct:.1f}%")
 
     def phase3_global_truncation(self, ratio: float, min_rank: int = 16,
-                                   fisher_lambda: float = 2.0) -> None:
+                                   fisher_lambda: float = 2.0,
+                                   use_residual_blocks: bool = False,
+                                   block_share: float = 0.1) -> int:
         """
         Phase 3: Global truncation based on importance scores.
 
@@ -1158,8 +1160,15 @@ class FisherAwareSVD:
             min_rank: Minimum rank to keep per layer (default: 16)
             fisher_lambda: Weight for Fisher term in log-space formula (default: 2.0)
                           Higher values give Fisher more influence.
+            use_residual_blocks: If True, reserve block_share of budget for blocks
+            block_share: Fraction of budget to reserve for blocks (default: 0.1 = 10%)
+
+        Returns:
+            remaining_budget: Parameter budget remaining for residual blocks (0 if not used)
         """
         print(f"Phase 3: Global Truncation (target ratio: {ratio:.2%}, min_rank: {min_rank}, λ={fisher_lambda})...")
+        if use_residual_blocks:
+            print(f"  Reserving {block_share:.0%} of budget for residual blocks")
 
         # Compute importance scores using log-space formula
         importance_scores = self.compute_importance_scores(fisher_lambda=fisher_lambda)
@@ -1303,9 +1312,21 @@ class FisherAwareSVD:
                 }
 
         # Target parameter budget
-        target_params = int(total_original_params * ratio)
-        print(f"  Total original params: {total_original_params:,}")
-        print(f"  Target params (ratio={ratio:.0%}): {target_params:,}")
+        total_target_params = int(total_original_params * ratio)
+
+        # If using residual blocks, reserve a portion for them
+        if use_residual_blocks:
+            block_budget = int(total_target_params * block_share)
+            target_params = total_target_params - block_budget
+            print(f"  Total original params: {total_original_params:,}")
+            print(f"  Total target params (ratio={ratio:.0%}): {total_target_params:,}")
+            print(f"  SVD budget ({1-block_share:.0%}): {target_params:,}")
+            print(f"  Block budget ({block_share:.0%}): {block_budget:,}")
+        else:
+            target_params = total_target_params
+            block_budget = 0
+            print(f"  Total original params: {total_original_params:,}")
+            print(f"  Target params (ratio={ratio:.0%}): {target_params:,}")
 
         # ================================================================
         # ADAPTIVE MIN/MAX ALLOCATION (replacing fixed 0.3 and 1.5)
@@ -1631,10 +1652,22 @@ class FisherAwareSVD:
                 kept_params += r * (m + n)
 
         actual_ratio = kept_params / total_original_params
-        print(f"  Actual compression ratio: {actual_ratio:.2%}")
+        print(f"  Actual SVD compression ratio: {actual_ratio:.2%}")
         print(f"  Kept {kept_count} singular values out of {total_sv_count}")
 
-    def phase3b_residual_block_selection(self, block_budget_ratio: float = 0.02,
+        # Store for Phase 3b
+        self._total_original_params = total_original_params
+        self._svd_params_used = kept_params
+
+        # Return remaining budget for blocks
+        if use_residual_blocks:
+            # Actual remaining = block_budget + (target_params - kept_params)
+            actual_remaining = block_budget + max(0, target_params - kept_params)
+            print(f"  Budget for residual blocks: {actual_remaining:,} params")
+            return actual_remaining
+        return 0
+
+    def phase3b_residual_block_selection(self, block_budget: int = 0,
                                           block_size: int = 16,
                                           top_per_row: int = 8) -> None:
         """
@@ -1647,37 +1680,30 @@ class FisherAwareSVD:
         This allows using smaller rank k while compensating with critical residual blocks,
         effectively breaking the k(m+n) parameter constraint.
 
+        NOTE: Budget is unified with Phase 3 - block_budget comes from Phase 3's
+        reserved budget (block_share of total).
+
         Optimizations:
         - Uses layer_factor for cross-layer balancing (like Phase3)
         - Uses heap with candidate cap to avoid memory explosion
         - Limits candidates per projection to 2x average budget share
 
         Args:
-            block_budget_ratio: Fraction of original params to spend on residual blocks (default: 2%)
+            block_budget: Parameter budget for blocks (from Phase 3)
             block_size: Size of each block (default: 16)
             top_per_row: Max candidate blocks per row-tile to limit search (default: 8)
         """
         import heapq
 
-        print(f"Phase 3b: Residual Block Selection (budget={block_budget_ratio:.1%}, block_size={block_size})...")
+        params_per_block = block_size * block_size
+        total_block_budget = block_budget // params_per_block
+
+        print(f"Phase 3b: Residual Block Selection (budget={block_budget:,} params, {total_block_budget} blocks, block_size={block_size})...")
 
         # Initialize residual block storage
         self.residual_blocks = {}
         self.block_size = block_size
         num_layers = len(self.layers)
-
-        # Calculate total parameter budget for blocks
-        total_original_params = sum(
-            self.original_weights[layer_idx][name].numel()
-            for layer_idx in self.original_weights
-            for name in self.original_weights[layer_idx]
-        )
-        block_param_budget = int(total_original_params * block_budget_ratio)
-        params_per_block = block_size * block_size
-
-        # Global block budget
-        total_block_budget = block_param_budget // params_per_block
-        print(f"  Total block budget: {total_block_budget} blocks ({block_param_budget:,} params)")
 
         if total_block_budget == 0:
             print("  No blocks to select (budget too small)")
@@ -1960,7 +1986,7 @@ class FisherAwareSVD:
                  als_iters: int = 2,
                  token_sample_ratio: float = 0.2,
                  use_residual_blocks: bool = False,
-                 block_budget_ratio: float = 0.02,
+                 block_share: float = 0.1,
                  block_size: int = 16,
                  use_distillation: bool = False,
                  distill_steps: int = 2000,
@@ -1987,7 +2013,8 @@ class FisherAwareSVD:
             als_iters: Number of ALS iterations per layer (default: 2)
             token_sample_ratio: Ratio of tokens to sample per sequence for ALS (default: 0.1)
             use_residual_blocks: Use dense residual blocks to improve accuracy (default: False)
-            block_budget_ratio: Fraction of params for residual blocks (default: 0.02 = 2%)
+            block_share: Fraction of total budget for residual blocks (default: 0.1 = 10%)
+                        Budget is unified: SVD gets (1-block_share), blocks get block_share
             block_size: Size of residual blocks (default: 16)
             use_distillation: Enable Phase 5 distillation fine-tuning (default: False)
             distill_steps: Number of distillation training steps (default: 2000)
@@ -2010,12 +2037,16 @@ class FisherAwareSVD:
         self.phase2_sensitivity_estimation(calib_loader, use_low_resource)
 
         # Phase 3: Global Truncation with adaptive min/max allocation
-        self.phase3_global_truncation(ratio, min_rank=min_rank, fisher_lambda=fisher_lambda)
+        # If using residual blocks, budget is unified - Phase 3 reserves block_share for blocks
+        block_budget = self.phase3_global_truncation(
+            ratio, min_rank=min_rank, fisher_lambda=fisher_lambda,
+            use_residual_blocks=use_residual_blocks, block_share=block_share
+        )
 
         # Phase 3b: Residual Block Selection (if enabled)
-        if use_residual_blocks:
+        if use_residual_blocks and block_budget > 0:
             self.phase3b_residual_block_selection(
-                block_budget_ratio=block_budget_ratio,
+                block_budget=block_budget,
                 block_size=block_size,
                 top_per_row=8
             )
