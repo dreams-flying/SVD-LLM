@@ -197,9 +197,11 @@ class SVDLinearWithDenseBlocks(nn.Module):
 
 def select_residual_blocks(W: torch.Tensor, U: torch.Tensor, S: torch.Tensor,
                            VT: torch.Tensor, block_size: int, budget_blocks: int,
-                           importance_weights: Optional[torch.Tensor] = None,
+                           row_importance: Optional[torch.Tensor] = None,
+                           col_importance: Optional[torch.Tensor] = None,
                            top_per_row: int = 8,
-                           layer_factor: float = 1.0) -> List[Dict]:
+                           layer_factor: float = 1.0,
+                           use_fisher_weight: bool = True) -> List[Dict]:
     """
     Select high-importance residual blocks for W - U @ diag(S) @ VT.
 
@@ -209,6 +211,7 @@ def select_residual_blocks(W: torch.Tensor, U: torch.Tensor, S: torch.Tensor,
     - No .item() in loops (avoid GPU sync)
     - Clone only top_per_row blocks (not all blocks then filter)
     - Stores actual row_end/col_end for edge blocks
+    - Uses BOTH row and column importance for scoring
 
     Args:
         W: Original weight matrix [out, in]
@@ -217,9 +220,11 @@ def select_residual_blocks(W: torch.Tensor, U: torch.Tensor, S: torch.Tensor,
         VT: Right singular vectors transposed [k, in]
         block_size: Size of blocks
         budget_blocks: Maximum number of blocks to select
-        importance_weights: Optional per-output importance weights [out]
+        row_importance: Per-output importance weights [out] (Fisher row)
+        col_importance: Per-input importance weights [in] (Fisher col)
         top_per_row: Max candidates per row-tile to reduce search space
         layer_factor: Multiplier for scores (for cross-layer balancing)
+        use_fisher_weight: If False, only use Frobenius norm (for debugging)
 
     Returns:
         List of {"row": int, "col": int, "row_end": int, "col_end": int,
@@ -243,17 +248,26 @@ def select_residual_blocks(W: torch.Tensor, U: torch.Tensor, S: torch.Tensor,
     VT_f = VT.float()
     W_f = W.float()
 
-    # Pre-compute importance weights per row-tile (on GPU, no .item())
-    if importance_weights is not None:
-        imp = importance_weights.float().to(device)
-        # Compute mean importance for each row-tile
+    # Pre-compute importance weights per row-tile and col-tile
+    if use_fisher_weight and row_importance is not None:
+        imp_row = row_importance.float().to(device)
         row_weights = torch.zeros(n_row_tiles, device=device, dtype=torch.float32)
         for ri in range(n_row_tiles):
             row_start = ri * b
             row_end = min(row_start + b, m)
-            row_weights[ri] = imp[row_start:row_end].mean()
+            row_weights[ri] = imp_row[row_start:row_end].mean()
     else:
         row_weights = torch.ones(n_row_tiles, device=device, dtype=torch.float32)
+
+    if use_fisher_weight and col_importance is not None:
+        imp_col = col_importance.float().to(device)
+        col_weights = torch.zeros(n_col_tiles, device=device, dtype=torch.float32)
+        for ci in range(n_col_tiles):
+            col_start = ci * b
+            col_end = min(col_start + b, n)
+            col_weights[ci] = imp_col[col_start:col_end].mean()
+    else:
+        col_weights = torch.ones(n_col_tiles, device=device, dtype=torch.float32)
 
     candidates = []
 
@@ -281,8 +295,10 @@ def select_residual_blocks(W: torch.Tensor, U: torch.Tensor, S: torch.Tensor,
         # Compute energy for all blocks at once: [n_col_tiles]
         block_energies = (R_blocks ** 2).sum(dim=(1, 2))
 
-        # Apply row importance weight and layer_factor
-        weighted_energies = block_energies * row_weights[ri] * layer_factor
+        # Apply importance weights: geometric mean of row and col importance
+        # Score = ||R||_F^2 * sqrt(row_weight * col_weight) * layer_factor
+        combined_weights = torch.sqrt(row_weights[ri] * col_weights) * layer_factor
+        weighted_energies = block_energies * combined_weights
 
         # === Select top_per_row using torch.topk ===
         k = min(top_per_row, n_col_tiles)
@@ -1669,7 +1685,8 @@ class FisherAwareSVD:
 
     def phase3b_residual_block_selection(self, block_budget: int = 0,
                                           block_size: int = 16,
-                                          top_per_row: int = 8) -> None:
+                                          top_per_row: int = 8,
+                                          use_fisher_weight: bool = True) -> None:
         """
         Phase 3b: Select high-importance residual blocks to complement low-rank SVD.
 
@@ -1687,11 +1704,13 @@ class FisherAwareSVD:
         - Uses layer_factor for cross-layer balancing (like Phase3)
         - Uses heap with candidate cap to avoid memory explosion
         - Limits candidates per projection to 2x average budget share
+        - Uses BOTH row and column Fisher importance for scoring
 
         Args:
             block_budget: Parameter budget for blocks (from Phase 3)
             block_size: Size of each block (default: 16)
             top_per_row: Max candidate blocks per row-tile to limit search (default: 8)
+            use_fisher_weight: If False, only use Frobenius norm (for debugging)
         """
         import heapq
 
@@ -1699,6 +1718,7 @@ class FisherAwareSVD:
         total_block_budget = block_budget // params_per_block
 
         print(f"Phase 3b: Residual Block Selection (budget={block_budget:,} params, {total_block_budget} blocks, block_size={block_size})...")
+        print(f"  Fisher weighting: {'enabled' if use_fisher_weight else 'DISABLED (debug mode)'}")
 
         # Initialize residual block storage
         self.residual_blocks = {}
@@ -1748,24 +1768,31 @@ class FisherAwareSVD:
                 S_gpu = S.to(device)
                 VT_gpu = VT.to(device)
 
-                # Get importance weight from Fisher if available
-                importance_weights = None
-                if hasattr(self, 'fisher_info') and layer_idx in self.fisher_info:
+                # Get importance weights from Fisher if available
+                # Extract BOTH row (output) and column (input) importance
+                row_importance = None
+                col_importance = None
+                if use_fisher_weight and hasattr(self, 'fisher_info') and layer_idx in self.fisher_info:
                     if name in self.fisher_info[layer_idx]:
                         fisher = self.fisher_info[layer_idx][name]
                         if len(fisher.shape) == 2:
-                            importance_weights = fisher.sum(dim=1).to(device)
+                            # Fisher is [out, in], get both dimensions
+                            row_importance = fisher.sum(dim=1).to(device)  # Sum over columns -> [out]
+                            col_importance = fisher.sum(dim=0).to(device)  # Sum over rows -> [in]
                         else:
-                            importance_weights = fisher.to(device)
+                            # 1D Fisher, assume it's row importance
+                            row_importance = fisher.to(device)
 
                 # Select candidate blocks for this projection with layer_factor
                 blocks = select_residual_blocks(
                     W_gpu, U_gpu, S_gpu, VT_gpu,
                     block_size=block_size,
                     budget_blocks=cand_cap_per_proj,  # Limit candidates per projection
-                    importance_weights=importance_weights,
+                    row_importance=row_importance,
+                    col_importance=col_importance,
                     top_per_row=top_per_row,
-                    layer_factor=layer_factor
+                    layer_factor=layer_factor,
+                    use_fisher_weight=use_fisher_weight
                 )
 
                 total_candidates_seen += len(blocks)
@@ -1784,8 +1811,10 @@ class FisherAwareSVD:
 
                 # Clear GPU memory
                 del W_gpu, U_gpu, S_gpu, VT_gpu
-                if importance_weights is not None:
-                    del importance_weights
+                if row_importance is not None:
+                    del row_importance
+                if col_importance is not None:
+                    del col_importance
                 torch.cuda.empty_cache()
 
         if len(heap) == 0:
@@ -1991,6 +2020,7 @@ class FisherAwareSVD:
                  use_residual_blocks: bool = False,
                  block_share: float = 0.1,
                  block_size: int = 16,
+                 use_block_fisher_weight: bool = True,
                  use_distillation: bool = False,
                  distill_steps: int = 2000,
                  distill_lr: float = 1e-4,
@@ -2019,6 +2049,8 @@ class FisherAwareSVD:
             block_share: Fraction of total budget for residual blocks (default: 0.1 = 10%)
                         Budget is unified: SVD gets (1-block_share), blocks get block_share
             block_size: Size of residual blocks (default: 16)
+            use_block_fisher_weight: Use Fisher weighting for block selection (default: True)
+                                    Set False for debugging (use pure Frobenius norm)
             use_distillation: Enable Phase 5 distillation fine-tuning (default: False)
             distill_steps: Number of distillation training steps (default: 2000)
             distill_lr: Learning rate for distillation (default: 1e-4)
@@ -2051,7 +2083,8 @@ class FisherAwareSVD:
             self.phase3b_residual_block_selection(
                 block_budget=block_budget,
                 block_size=block_size,
-                top_per_row=8
+                top_per_row=8,
+                use_fisher_weight=use_block_fisher_weight
             )
             # Clean up original weights to save memory
             if hasattr(self, 'original_weights'):
