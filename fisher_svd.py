@@ -1895,6 +1895,313 @@ class FisherAwareSVD:
             max_avg_score = max((layer_score_sums[l] / layer_block_counts[l], l) for l in layer_block_counts)
             print(f"  Avg score by layer: min={min_avg_score[0]:.2e} (L{min_avg_score[1]}), max={max_avg_score[0]:.2e} (L{max_avg_score[1]})")
 
+    def phase3b_omp_block_selection(self, calib_loader: List[Dict],
+                                     block_budget: int = 0,
+                                     block_size: int = 16,
+                                     token_sample_ratio: float = 0.2,
+                                     top_k_per_iter: int = 32) -> None:
+        """
+        OMP-style greedy block selection using activation-space metrics.
+
+        Key improvements over standard selection:
+        1. Activation-space scoring: ||X @ R_block^T||² instead of ||R_block||²
+        2. Greedy selection with residual updating: select best blocks iteratively,
+           update residual after each selection to avoid redundancy
+
+        Algorithm (Orthogonal Matching Pursuit style):
+        1. Compute activation-space residual: R = Y - Y_svd = X @ (W - W_svd)^T
+        2. For each candidate block, compute reduction in residual: ||X_c @ B_opt^T||²
+        3. Select top-k blocks with highest reduction
+        4. Update residual to account for selected blocks
+        5. Repeat until budget exhausted
+
+        Args:
+            calib_loader: Calibration data loader
+            block_budget: Parameter budget for blocks
+            block_size: Size of each block (default: 16)
+            token_sample_ratio: Ratio of tokens to sample (default: 0.2)
+            top_k_per_iter: Number of blocks to select per iteration (default: 32)
+        """
+        params_per_block = block_size * block_size
+        total_block_budget = block_budget // params_per_block
+
+        print(f"Phase 3b OMP: Greedy Block Selection (budget={block_budget:,} params, {total_block_budget} blocks)...")
+        print(f"  Using activation-space metric: ||X @ R^T||²")
+        print(f"  Greedy selection with top_k_per_iter={top_k_per_iter}")
+
+        if total_block_budget == 0:
+            print("  No blocks to select (budget too small)")
+            return
+
+        self.residual_blocks = {}
+        self.block_size = block_size
+
+        # Move embedding layers to device
+        if "opt" in self.model_name:
+            self.model.model.decoder.embed_tokens = self.model.model.decoder.embed_tokens.to(self.device)
+            self.model.model.decoder.embed_positions = self.model.model.decoder.embed_positions.to(self.device)
+        else:
+            self.model.model.embed_tokens = self.model.model.embed_tokens.to(self.device)
+
+        # Capture inputs to first layer
+        dtype = next(iter(self.model.parameters())).dtype
+        inps = torch.zeros(
+            (len(calib_loader), self.model.seqlen, self.model.config.hidden_size),
+            dtype=dtype, device='cpu'
+        )
+        cache = {'i': 0, 'attention_mask': None, 'position_ids': None}
+
+        class Catcher(nn.Module):
+            def __init__(self, module):
+                super().__init__()
+                self.module = module
+
+            def forward(self, inp, **kwargs):
+                inps[cache['i']] = inp[0].detach().cpu().to(inps.dtype)
+                cache['i'] += 1
+                if cache['attention_mask'] is None:
+                    cache['attention_mask'] = kwargs['attention_mask'].cpu()
+                    if 'position_ids' in kwargs:
+                        cache['position_ids'] = kwargs['position_ids'].cpu()
+                else:
+                    cache['attention_mask'] = torch.cat(
+                        (cache['attention_mask'], kwargs['attention_mask'].cpu()), dim=0
+                    )
+                    if 'position_ids' in kwargs:
+                        cache['position_ids'] = torch.cat(
+                            (cache['position_ids'], kwargs['position_ids'].cpu()), dim=0
+                        )
+                raise ValueError
+
+        self.layers[0] = self.layers[0].to(self.device)
+        original_layer0 = self.layers[0]
+        self.layers[0] = Catcher(self.layers[0])
+
+        for batch in calib_loader:
+            try:
+                batch = {k: v.to(self.device) for k, v in batch.items()}
+                self.model(**batch)
+            except ValueError:
+                pass
+
+        self.layers[0] = original_layer0
+        self.layers[0] = self.layers[0].cpu()
+
+        if "opt" in self.model_name:
+            self.model.model.decoder.embed_tokens = self.model.model.decoder.embed_tokens.cpu()
+            self.model.model.decoder.embed_positions = self.model.model.decoder.embed_positions.cpu()
+        else:
+            self.model.model.embed_tokens = self.model.model.embed_tokens.cpu()
+
+        torch.cuda.empty_cache()
+
+        attention_masks = cache['attention_mask']
+        position_ids = cache.get('position_ids', None)
+        tokens_per_seq = max(1, int(self.model.seqlen * token_sample_ratio))
+
+        # Process each layer
+        outs = torch.zeros_like(inps)
+        total_blocks_selected = 0
+        b = block_size
+
+        for layer_idx in tqdm(range(len(self.layers)), desc="OMP Block Selection"):
+            layer = self.layers[layer_idx].float().to(self.device)
+
+            if layer_idx not in self.svd_components or layer_idx not in self.original_weights:
+                # Forward through layer
+                with torch.no_grad():
+                    for j in range(inps.shape[0]):
+                        inp_j = inps[j].unsqueeze(0).float().to(self.device)
+                        mask_j = attention_masks[j].unsqueeze(0).to(self.device)
+                        if position_ids is not None and "opt" not in self.model_name:
+                            pos_j = position_ids[j].unsqueeze(0).to(self.device)
+                            outs[j] = layer(inp_j, attention_mask=mask_j, position_ids=pos_j, use_cache=False)[0].cpu().to(dtype)
+                        else:
+                            outs[j] = layer(inp_j, attention_mask=mask_j, use_cache=False)[0].cpu().to(dtype)
+                self.layers[layer_idx] = layer.to(dtype).cpu()
+                inps = outs.clone()
+                torch.cuda.empty_cache()
+                continue
+
+            subset = find_layers(layer)
+
+            # Capture inputs to linear layers
+            layer_inputs = {name: [] for name in subset}
+            handles = []
+
+            def make_hook(name):
+                def hook(module, inp, out):
+                    x = inp[0].detach().float()
+                    if x.dim() == 2:
+                        T = x.shape[0]
+                        if T > tokens_per_seq:
+                            idx = torch.randperm(T, device=x.device)[:tokens_per_seq]
+                            x = x.index_select(0, idx)
+                        layer_inputs[name].append(x.cpu())
+                        return
+                    if x.shape[1] > tokens_per_seq:
+                        indices = torch.randperm(x.shape[1], device=x.device)[:tokens_per_seq]
+                        x = x[:, indices, :]
+                    layer_inputs[name].append(x.cpu())
+                return hook
+
+            for name in subset:
+                handle = subset[name].register_forward_hook(make_hook(name))
+                handles.append(handle)
+
+            with torch.no_grad():
+                for j in range(inps.shape[0]):
+                    inp_j = inps[j].unsqueeze(0).float().to(self.device)
+                    mask_j = attention_masks[j].unsqueeze(0).to(self.device)
+                    if position_ids is not None and "opt" not in self.model_name:
+                        pos_j = position_ids[j].unsqueeze(0).to(self.device)
+                        _ = layer(inp_j, attention_mask=mask_j, position_ids=pos_j, use_cache=False)
+                    else:
+                        _ = layer(inp_j, attention_mask=mask_j, use_cache=False)
+
+            for handle in handles:
+                handle.remove()
+
+            # OMP block selection for each projection in this layer
+            layer_block_budget = total_block_budget // len(self.layers)  # Fair share per layer
+
+            for name in subset:
+                if name not in self.svd_components[layer_idx] or len(layer_inputs.get(name, [])) == 0:
+                    continue
+                if name not in self.original_weights[layer_idx]:
+                    continue
+
+                # Get data
+                U, S, VT, bias = self.svd_components[layer_idx][name]
+                W_orig = self.original_weights[layer_idx][name].float().to(self.device)
+                W_svd = ((U.to(self.device) * S.to(self.device)) @ VT.to(self.device)).float()
+
+                X = torch.cat([x.reshape(-1, x.shape[-1]) for x in layer_inputs[name]], dim=0).to(self.device)
+                del layer_inputs[name]
+
+                m, n = W_orig.shape
+                n_row_tiles = (m + b - 1) // b
+                n_col_tiles = (n + b - 1) // b
+
+                # Initial activation-space residual
+                Y_orig = X @ W_orig.T
+                Y_svd = X @ W_svd.T
+                R_activation = Y_orig - Y_svd  # [N, m]
+
+                # Budget for this projection
+                proj_budget = layer_block_budget // len(subset)
+                proj_budget = max(1, min(proj_budget, n_row_tiles * n_col_tiles))
+
+                selected_blocks = []
+                selected_positions = set()
+
+                # OMP iterations
+                remaining_budget = proj_budget
+                while remaining_budget > 0:
+                    # Number of blocks to select this iteration
+                    k_this_iter = min(top_k_per_iter, remaining_budget)
+
+                    # Compute scores for all candidate positions
+                    candidates = []
+                    for ri in range(n_row_tiles):
+                        row_start = ri * b
+                        row_end = min(row_start + b, m)
+
+                        for ci in range(n_col_tiles):
+                            if (ri, ci) in selected_positions:
+                                continue
+
+                            col_start = ci * b
+                            col_end = min(col_start + b, n)
+
+                            # Input slice and residual slice
+                            X_c = X[:, col_start:col_end]  # [N, b]
+                            R_c = R_activation[:, row_start:row_end]  # [N, b]
+
+                            # Compute optimal block value: B^T = lstsq(X_c, R_c)
+                            try:
+                                B_T = torch.linalg.lstsq(X_c, R_c).solution
+                                B_opt = B_T.T  # [row_size, col_size]
+
+                                # Activation-space score: ||X_c @ B_opt^T||² = reduction in residual
+                                contribution = X_c @ B_opt.T
+                                score = (contribution ** 2).sum().item()
+
+                                if score > 0:
+                                    candidates.append({
+                                        'ri': ri, 'ci': ci,
+                                        'row': row_start, 'col': col_start,
+                                        'row_end': row_end, 'col_end': col_end,
+                                        'val': B_opt.cpu(),
+                                        'score': score
+                                    })
+                            except:
+                                continue
+
+                    if not candidates:
+                        break
+
+                    # Select top-k candidates
+                    candidates.sort(key=lambda x: -x['score'])
+                    top_k = candidates[:k_this_iter]
+
+                    # Add selected blocks and update residual
+                    for blk in top_k:
+                        selected_blocks.append({
+                            'row': blk['row'],
+                            'col': blk['col'],
+                            'row_end': blk['row_end'],
+                            'col_end': blk['col_end'],
+                            'val': blk['val']
+                        })
+                        selected_positions.add((blk['ri'], blk['ci']))
+
+                        # Update residual
+                        X_c = X[:, blk['col']:blk['col_end']]
+                        B_val = blk['val'].to(self.device)
+                        R_activation[:, blk['row']:blk['row_end']] -= X_c @ B_val.T
+
+                    remaining_budget -= len(top_k)
+
+                # Store selected blocks
+                if selected_blocks:
+                    key = (layer_idx, name)
+                    self.residual_blocks[key] = selected_blocks
+                    total_blocks_selected += len(selected_blocks)
+
+                del X, W_orig, W_svd, Y_orig, Y_svd, R_activation
+                torch.cuda.empty_cache()
+
+            # Forward through layer
+            with torch.no_grad():
+                for j in range(inps.shape[0]):
+                    inp_j = inps[j].unsqueeze(0).float().to(self.device)
+                    mask_j = attention_masks[j].unsqueeze(0).to(self.device)
+                    if position_ids is not None and "opt" not in self.model_name:
+                        pos_j = position_ids[j].unsqueeze(0).to(self.device)
+                        outs[j] = layer(inp_j, attention_mask=mask_j, position_ids=pos_j, use_cache=False)[0].cpu().to(dtype)
+                    else:
+                        outs[j] = layer(inp_j, attention_mask=mask_j, use_cache=False)[0].cpu().to(dtype)
+
+            self.layers[layer_idx] = layer.to(dtype).cpu()
+            inps = outs.clone()
+            torch.cuda.empty_cache()
+
+        # Print statistics
+        total_block_params = total_blocks_selected * params_per_block
+        print(f"  Total blocks selected: {total_blocks_selected}, params: {total_block_params:,}")
+        print(f"  Projections with blocks: {len(self.residual_blocks)}")
+
+        # Distribution statistics
+        if self.residual_blocks:
+            layer_counts = {}
+            for (layer_idx, name), blocks in self.residual_blocks.items():
+                layer_counts[layer_idx] = layer_counts.get(layer_idx, 0) + len(blocks)
+            if layer_counts:
+                min_l = min(layer_counts.items(), key=lambda x: x[1])
+                max_l = max(layer_counts.items(), key=lambda x: x[1])
+                print(f"  Block distribution: min={min_l[1]} (L{min_l[0]}), max={max_l[1]} (L{max_l[0]})")
+
     def phase3b_refine_blocks(self, calib_loader: List[Dict], token_sample_ratio: float = 0.2) -> None:
         """
         Refine residual block values using least squares on calibration data.
@@ -2324,6 +2631,8 @@ class FisherAwareSVD:
                  use_block_fisher_weight: bool = True,
                  block_layer_balance: str = "none",
                  refine_blocks: bool = True,
+                 use_omp_selection: bool = False,
+                 omp_top_k_per_iter: int = 32,
                  use_distillation: bool = False,
                  distill_steps: int = 2000,
                  distill_lr: float = 1e-4,
@@ -2361,6 +2670,10 @@ class FisherAwareSVD:
             refine_blocks: Refine block values using lstsq on calibration data (default: True)
                           Similar to ALS for SVD, this optimizes block values to minimize
                           reconstruction error instead of using static residual values.
+            use_omp_selection: Use OMP-style greedy block selection (default: False)
+                              When True, uses activation-space metrics ||X @ R^T||² and
+                              greedy selection with residual updating. More accurate but slower.
+            omp_top_k_per_iter: Number of blocks to select per OMP iteration (default: 32)
             use_distillation: Enable Phase 5 distillation fine-tuning (default: False)
             distill_steps: Number of distillation training steps (default: 2000)
             distill_lr: Learning rate for distillation (default: 1e-4)
@@ -2410,17 +2723,30 @@ class FisherAwareSVD:
         # NOTE: Run AFTER Phase 4 so blocks capture post-calibration residual
         if use_residual_blocks and block_budget > 0:
             self.block_size = block_size  # Store for refinement
-            self.phase3b_residual_block_selection(
-                block_budget=block_budget,
-                block_size=block_size,
-                top_per_row=8,
-                use_fisher_weight=use_block_fisher_weight,
-                layer_balance=block_layer_balance
-            )
 
-            # Phase 3b Refinement: Optimize block values using least squares
-            if refine_blocks and len(self.residual_blocks) > 0:
-                self.phase3b_refine_blocks(calib_loader, token_sample_ratio=token_sample_ratio)
+            if use_omp_selection:
+                # OMP-style greedy selection with activation-space metrics
+                # This already computes optimal block values, no separate refinement needed
+                self.phase3b_omp_block_selection(
+                    calib_loader=calib_loader,
+                    block_budget=block_budget,
+                    block_size=block_size,
+                    token_sample_ratio=token_sample_ratio,
+                    top_k_per_iter=omp_top_k_per_iter
+                )
+            else:
+                # Standard selection based on weight-space residual
+                self.phase3b_residual_block_selection(
+                    block_budget=block_budget,
+                    block_size=block_size,
+                    top_per_row=8,
+                    use_fisher_weight=use_block_fisher_weight,
+                    layer_balance=block_layer_balance
+                )
+
+                # Phase 3b Refinement: Optimize block values using least squares
+                if refine_blocks and len(self.residual_blocks) > 0:
+                    self.phase3b_refine_blocks(calib_loader, token_sample_ratio=token_sample_ratio)
 
             # Clean up original weights to save memory
             if hasattr(self, 'original_weights'):
