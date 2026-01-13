@@ -2062,29 +2062,40 @@ class FisherAwareSVD:
                 if len(blocks) == 0:
                     continue
 
-                # Get SVD components and original weight
+                # Get SVD components and TRUE original weight (before any SVD/calibration)
                 U, S, VT, bias = self.svd_components[layer_idx][name]
-                original_linear = subset[name]
 
                 # Stack calibration inputs
                 X = torch.cat([x.reshape(-1, x.shape[-1]) for x in layer_inputs[name]], dim=0).to(self.device)
                 del layer_inputs[name]
 
-                # Target output from original weight
-                W_orig = original_linear.weight.data.float().to(self.device)
+                # IMPORTANT: Use stored original weights, NOT the linear layer's current weight
+                # (which has been updated by ALS to be U @ S @ VT)
+                if hasattr(self, 'original_weights') and layer_idx in self.original_weights and name in self.original_weights[layer_idx]:
+                    W_orig = self.original_weights[layer_idx][name].float().to(self.device)
+                else:
+                    # Fallback: skip refinement for this projection (can't compute proper residual)
+                    print(f"    Warning: original_weights not available for L{layer_idx} {name}, skipping refinement")
+                    continue
+
+                # Target output from TRUE original weight
                 Y = X @ W_orig.T
 
-                # SVD approximation output
+                # SVD approximation output (from calibrated SVD)
                 W_svd = ((U.to(self.device) * S.to(self.device)) @ VT.to(self.device)).float()
                 Y_svd = X @ W_svd.T
 
-                # Residual target
+                # Residual target - will be updated as we refine blocks
                 R_target = Y - Y_svd  # [N, out_features]
 
                 block_size = self.block_size
 
-                # Refine each block
-                for blk in blocks:
+                # Sort blocks by row to process same-row blocks together
+                # and update residual properly
+                blocks_sorted = sorted(blocks, key=lambda b: (b["row"], b["col"]))
+
+                # Refine each block with residual updating
+                for blk in blocks_sorted:
                     row, col = blk["row"], blk["col"]
                     row_end = blk.get("row_end", row + block_size)
                     col_end = blk.get("col_end", col + block_size)
@@ -2093,10 +2104,10 @@ class FisherAwareSVD:
                     X_c = X[:, col:col_end]  # [N, b]
 
                     # Target residual for this block's output positions
+                    # NOTE: R_target is updated after each block refinement
                     R_c = R_target[:, row:row_end]  # [N, b]
 
                     # Least squares: find B such that X_c @ B^T ≈ R_c
-                    # This is: B^T = lstsq(X_c, R_c)
                     try:
                         B_T = torch.linalg.lstsq(X_c, R_c).solution  # [col_size, row_size]
                         B_refined = B_T.T  # [row_size, col_size]
@@ -2117,6 +2128,10 @@ class FisherAwareSVD:
                                 improvement = (1 - loss_after / loss_before) * 100
                                 total_improvement += improvement
                             blocks_refined += 1
+
+                            # KEY FIX: Update residual to account for this block's contribution
+                            # This ensures subsequent blocks at same row see the remaining residual
+                            R_target[:, row:row_end] = R_target[:, row:row_end] - X_c @ B_refined.T
                     except Exception:
                         continue
 
