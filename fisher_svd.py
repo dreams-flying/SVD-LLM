@@ -2095,10 +2095,11 @@ class FisherAwareSVD:
                 selected_blocks = []
                 selected_positions = set()
 
-                # OMP iterations
+                # OMP iterations - select ONE block at a time for true greedy
                 remaining_budget = proj_budget
                 while remaining_budget > 0:
                     # Number of blocks to select this iteration
+                    # Use top_k_per_iter=1 for true OMP, >1 for faster but approximate
                     k_this_iter = min(top_k_per_iter, remaining_budget)
 
                     # Compute scores for all candidate positions
@@ -2145,23 +2146,43 @@ class FisherAwareSVD:
                     candidates.sort(key=lambda x: -x['score'])
                     top_k = candidates[:k_this_iter]
 
-                    # Add selected blocks and update residual
+                    # Add selected blocks and update residual ONE BY ONE
+                    # This ensures subsequent blocks in top_k see updated residual
                     for blk in top_k:
-                        selected_blocks.append({
-                            'row': blk['row'],
-                            'col': blk['col'],
-                            'row_end': blk['row_end'],
-                            'col_end': blk['col_end'],
-                            'val': blk['val']
-                        })
-                        selected_positions.add((blk['ri'], blk['ci']))
-
-                        # Update residual
+                        # Re-compute optimal value against CURRENT residual
+                        # (important when multiple blocks target same row)
                         X_c = X[:, blk['col']:blk['col_end']]
-                        B_val = blk['val'].to(self.device)
-                        R_activation[:, blk['row']:blk['row_end']] -= X_c @ B_val.T
+                        R_c = R_activation[:, blk['row']:blk['row_end']]
 
-                    remaining_budget -= len(top_k)
+                        try:
+                            B_T = torch.linalg.lstsq(X_c, R_c).solution
+                            B_recomputed = B_T.T
+
+                            # Verify this block still provides improvement
+                            contribution = X_c @ B_recomputed.T
+                            new_score = (contribution ** 2).sum().item()
+
+                            if new_score < 1e-10:  # Negligible improvement, skip
+                                continue
+
+                            selected_blocks.append({
+                                'row': blk['row'],
+                                'col': blk['col'],
+                                'row_end': blk['row_end'],
+                                'col_end': blk['col_end'],
+                                'val': B_recomputed.cpu()
+                            })
+                            selected_positions.add((blk['ri'], blk['ci']))
+
+                            # Update residual immediately
+                            R_activation[:, blk['row']:blk['row_end']] -= contribution
+                            remaining_budget -= 1
+
+                        except:
+                            continue
+
+                        if remaining_budget <= 0:
+                            break
 
                 # Store selected blocks
                 if selected_blocks:
