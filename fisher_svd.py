@@ -1895,6 +1895,252 @@ class FisherAwareSVD:
             max_avg_score = max((layer_score_sums[l] / layer_block_counts[l], l) for l in layer_block_counts)
             print(f"  Avg score by layer: min={min_avg_score[0]:.2e} (L{min_avg_score[1]}), max={max_avg_score[0]:.2e} (L{max_avg_score[1]})")
 
+    def phase3b_refine_blocks(self, calib_loader: List[Dict], token_sample_ratio: float = 0.2) -> None:
+        """
+        Refine residual block values using least squares on calibration data.
+
+        Similar to ALS calibration for SVD, this optimizes block values to minimize
+        reconstruction error on actual data rather than using static residual values.
+
+        For each block at position (row, col):
+            Original: B = R[row:row+b, col:col+b]  (static residual)
+            Refined:  B = lstsq(X[:, col:col+b], R_target[:, row:row+b])
+                      where R_target = Y - X @ W_svd^T
+
+        Args:
+            calib_loader: Calibration data loader
+            token_sample_ratio: Ratio of tokens to sample per sequence (default: 0.2)
+        """
+        if not hasattr(self, 'residual_blocks') or len(self.residual_blocks) == 0:
+            print("Phase 3b Refinement: No blocks to refine")
+            return
+
+        print(f"Phase 3b Refinement: Optimizing block values on calibration data...")
+
+        # Move embedding layers to device
+        if "opt" in self.model_name:
+            self.model.model.decoder.embed_tokens = self.model.model.decoder.embed_tokens.to(self.device)
+            self.model.model.decoder.embed_positions = self.model.model.decoder.embed_positions.to(self.device)
+        else:
+            self.model.model.embed_tokens = self.model.model.embed_tokens.to(self.device)
+
+        # Capture inputs to first layer
+        dtype = next(iter(self.model.parameters())).dtype
+        inps = torch.zeros(
+            (len(calib_loader), self.model.seqlen, self.model.config.hidden_size),
+            dtype=dtype, device='cpu'
+        )
+        cache = {'i': 0, 'attention_mask': None, 'position_ids': None}
+
+        class Catcher(nn.Module):
+            def __init__(self, module):
+                super().__init__()
+                self.module = module
+
+            def forward(self, inp, **kwargs):
+                inps[cache['i']] = inp[0].detach().cpu().to(inps.dtype)
+                cache['i'] += 1
+                if cache['attention_mask'] is None:
+                    cache['attention_mask'] = kwargs['attention_mask'].cpu()
+                    if 'position_ids' in kwargs:
+                        cache['position_ids'] = kwargs['position_ids'].cpu()
+                else:
+                    cache['attention_mask'] = torch.cat(
+                        (cache['attention_mask'], kwargs['attention_mask'].cpu()), dim=0
+                    )
+                    if 'position_ids' in kwargs:
+                        cache['position_ids'] = torch.cat(
+                            (cache['position_ids'], kwargs['position_ids'].cpu()), dim=0
+                        )
+                raise ValueError
+
+        self.layers[0] = self.layers[0].to(self.device)
+        original_layer0 = self.layers[0]
+        self.layers[0] = Catcher(self.layers[0])
+
+        for batch in calib_loader:
+            try:
+                batch = {k: v.to(self.device) for k, v in batch.items()}
+                self.model(**batch)
+            except ValueError:
+                pass
+
+        self.layers[0] = original_layer0
+        self.layers[0] = self.layers[0].cpu()
+
+        # Move embedding layers back to CPU
+        if "opt" in self.model_name:
+            self.model.model.decoder.embed_tokens = self.model.model.decoder.embed_tokens.cpu()
+            self.model.model.decoder.embed_positions = self.model.model.decoder.embed_positions.cpu()
+        else:
+            self.model.model.embed_tokens = self.model.model.embed_tokens.cpu()
+
+        torch.cuda.empty_cache()
+
+        attention_masks = cache['attention_mask']
+        position_ids = cache.get('position_ids', None)
+
+        # Token sampling
+        tokens_per_seq = max(1, int(self.model.seqlen * token_sample_ratio))
+
+        # Process each layer
+        outs = torch.zeros_like(inps)
+        total_improvement = 0.0
+        blocks_refined = 0
+
+        for layer_idx in tqdm(range(len(self.layers))):
+            layer = self.layers[layer_idx].float().to(self.device)
+
+            # Check if this layer has blocks to refine
+            layer_has_blocks = any(
+                key[0] == layer_idx for key in self.residual_blocks.keys()
+            )
+
+            if not layer_has_blocks:
+                # Just forward through this layer
+                with torch.no_grad():
+                    for j in range(inps.shape[0]):
+                        inp_j = inps[j].unsqueeze(0).float().to(self.device)
+                        mask_j = attention_masks[j].unsqueeze(0).to(self.device)
+                        if position_ids is not None and "opt" not in self.model_name:
+                            pos_j = position_ids[j].unsqueeze(0).to(self.device)
+                            outs[j] = layer(inp_j, attention_mask=mask_j, position_ids=pos_j, use_cache=False)[0].cpu().to(dtype)
+                        else:
+                            outs[j] = layer(inp_j, attention_mask=mask_j, use_cache=False)[0].cpu().to(dtype)
+                self.layers[layer_idx] = layer.to(dtype).cpu()
+                inps = outs.clone()
+                torch.cuda.empty_cache()
+                continue
+
+            subset = find_layers(layer)
+
+            # Capture inputs to each linear layer
+            layer_inputs = {name: [] for name in subset}
+            handles = []
+
+            def make_hook(name):
+                def hook(module, inp, out):
+                    x = inp[0].detach().float()
+                    if x.dim() == 2:
+                        T = x.shape[0]
+                        if T > tokens_per_seq:
+                            idx = torch.randperm(T, device=x.device)[:tokens_per_seq]
+                            x = x.index_select(0, idx)
+                        layer_inputs[name].append(x.cpu())
+                        return
+                    if x.shape[1] > tokens_per_seq:
+                        indices = torch.randperm(x.shape[1], device=x.device)[:tokens_per_seq]
+                        x = x[:, indices, :]
+                    layer_inputs[name].append(x.cpu())
+                return hook
+
+            for name in subset:
+                handle = subset[name].register_forward_hook(make_hook(name))
+                handles.append(handle)
+
+            # Forward pass to capture inputs
+            with torch.no_grad():
+                for j in range(inps.shape[0]):
+                    inp_j = inps[j].unsqueeze(0).float().to(self.device)
+                    mask_j = attention_masks[j].unsqueeze(0).to(self.device)
+                    if position_ids is not None and "opt" not in self.model_name:
+                        pos_j = position_ids[j].unsqueeze(0).to(self.device)
+                        _ = layer(inp_j, attention_mask=mask_j, position_ids=pos_j, use_cache=False)
+                    else:
+                        _ = layer(inp_j, attention_mask=mask_j, use_cache=False)
+
+            for handle in handles:
+                handle.remove()
+
+            # Refine blocks for each projection
+            for name in subset:
+                key = (layer_idx, name)
+                if key not in self.residual_blocks or len(layer_inputs.get(name, [])) == 0:
+                    continue
+
+                blocks = self.residual_blocks[key]
+                if len(blocks) == 0:
+                    continue
+
+                # Get SVD components and original weight
+                U, S, VT, bias = self.svd_components[layer_idx][name]
+                original_linear = subset[name]
+
+                # Stack calibration inputs
+                X = torch.cat([x.reshape(-1, x.shape[-1]) for x in layer_inputs[name]], dim=0).to(self.device)
+                del layer_inputs[name]
+
+                # Target output from original weight
+                W_orig = original_linear.weight.data.float().to(self.device)
+                Y = X @ W_orig.T
+
+                # SVD approximation output
+                W_svd = ((U.to(self.device) * S.to(self.device)) @ VT.to(self.device)).float()
+                Y_svd = X @ W_svd.T
+
+                # Residual target
+                R_target = Y - Y_svd  # [N, out_features]
+
+                block_size = self.block_size
+
+                # Refine each block
+                for blk in blocks:
+                    row, col = blk["row"], blk["col"]
+                    row_end = blk.get("row_end", row + block_size)
+                    col_end = blk.get("col_end", col + block_size)
+
+                    # Input slice for this block
+                    X_c = X[:, col:col_end]  # [N, b]
+
+                    # Target residual for this block's output positions
+                    R_c = R_target[:, row:row_end]  # [N, b]
+
+                    # Least squares: find B such that X_c @ B^T ≈ R_c
+                    # This is: B^T = lstsq(X_c, R_c)
+                    try:
+                        B_T = torch.linalg.lstsq(X_c, R_c).solution  # [col_size, row_size]
+                        B_refined = B_T.T  # [row_size, col_size]
+
+                        # Check for numerical issues
+                        if torch.isnan(B_refined).any() or torch.isinf(B_refined).any():
+                            continue
+
+                        # Compute improvement
+                        old_val = blk["val"].to(self.device)
+                        loss_before = ((X_c @ old_val.T - R_c) ** 2).mean().item()
+                        loss_after = ((X_c @ B_refined.T - R_c) ** 2).mean().item()
+
+                        # Only use refined value if it's better
+                        if loss_after < loss_before:
+                            blk["val"] = B_refined.cpu()
+                            if loss_before > 1e-10:
+                                improvement = (1 - loss_after / loss_before) * 100
+                                total_improvement += improvement
+                            blocks_refined += 1
+                    except Exception:
+                        continue
+
+                del X, Y, Y_svd, R_target, W_orig, W_svd
+                torch.cuda.empty_cache()
+
+            # Forward through layer for next layer's input
+            with torch.no_grad():
+                for j in range(inps.shape[0]):
+                    inp_j = inps[j].unsqueeze(0).float().to(self.device)
+                    mask_j = attention_masks[j].unsqueeze(0).to(self.device)
+                    if position_ids is not None and "opt" not in self.model_name:
+                        pos_j = position_ids[j].unsqueeze(0).to(self.device)
+                        outs[j] = layer(inp_j, attention_mask=mask_j, position_ids=pos_j, use_cache=False)[0].cpu().to(dtype)
+                    else:
+                        outs[j] = layer(inp_j, attention_mask=mask_j, use_cache=False)[0].cpu().to(dtype)
+
+            self.layers[layer_idx] = layer.to(dtype).cpu()
+            inps = outs.clone()
+            torch.cuda.empty_cache()
+
+        avg_improvement = total_improvement / blocks_refined if blocks_refined > 0 else 0
+        print(f"  Refined {blocks_refined} blocks, avg improvement: {avg_improvement:.1f}%")
+
     def apply_compression(self, ratio: float, use_residual_blocks: bool = True) -> None:
         """
         Apply compression to the model by replacing layers with SVD-factorized versions.
@@ -2062,6 +2308,7 @@ class FisherAwareSVD:
                  block_size: int = 16,
                  use_block_fisher_weight: bool = True,
                  block_layer_balance: str = "none",
+                 refine_blocks: bool = True,
                  use_distillation: bool = False,
                  distill_steps: int = 2000,
                  distill_lr: float = 1e-4,
@@ -2096,6 +2343,9 @@ class FisherAwareSVD:
                                 - "none": No layer bias, pure error*Fisher score (recommended)
                                 - "later": Favor later layers
                                 - "earlier": Favor earlier layers
+            refine_blocks: Refine block values using lstsq on calibration data (default: True)
+                          Similar to ALS for SVD, this optimizes block values to minimize
+                          reconstruction error instead of using static residual values.
             use_distillation: Enable Phase 5 distillation fine-tuning (default: False)
             distill_steps: Number of distillation training steps (default: 2000)
             distill_lr: Learning rate for distillation (default: 1e-4)
@@ -2144,6 +2394,7 @@ class FisherAwareSVD:
         # Phase 3b: Residual Block Selection (if enabled)
         # NOTE: Run AFTER Phase 4 so blocks capture post-calibration residual
         if use_residual_blocks and block_budget > 0:
+            self.block_size = block_size  # Store for refinement
             self.phase3b_residual_block_selection(
                 block_budget=block_budget,
                 block_size=block_size,
@@ -2151,6 +2402,11 @@ class FisherAwareSVD:
                 use_fisher_weight=use_block_fisher_weight,
                 layer_balance=block_layer_balance
             )
+
+            # Phase 3b Refinement: Optimize block values using least squares
+            if refine_blocks and len(self.residual_blocks) > 0:
+                self.phase3b_refine_blocks(calib_loader, token_sample_ratio=token_sample_ratio)
+
             # Clean up original weights to save memory
             if hasattr(self, 'original_weights'):
                 del self.original_weights
