@@ -2104,16 +2104,24 @@ class FisherAwareSVD:
                 X_blocks = X_padded.view(N, n_col_tiles, b)
                 R_blocks = R_padded.view(n_row_tiles, b, n_col_tiles, b).permute(0, 2, 1, 3)
 
-                # Compute activation-space scores using einsum
-                contributions = torch.einsum('nck,rcjk->nrcj', X_blocks, R_blocks)
-                scores = (contributions ** 2).sum(dim=(0, 3))  # [n_row_tiles, n_col_tiles]
+                # Compute activation-space scores column-by-column to save memory
+                # Full einsum 'nck,rcjk->nrcj' would create [N, n_row, n_col, b] tensor (too large!)
+                # Instead, iterate over column tiles: intermediate is only [n_row, N, b]
+                scores = torch.zeros(n_row_tiles, n_col_tiles, device=self.device)
+                for ci in range(n_col_tiles):
+                    X_ci = X_blocks[:, ci, :]  # [N, b]
+                    R_ci = R_blocks[:, ci, :, :]  # [n_row_tiles, b, b]
+                    # contribution[r, n, j] = sum_k X_ci[n, k] * R_ci[r, j, k]
+                    contribution = torch.einsum('nk,rjk->rnj', X_ci, R_ci)  # [n_row, N, b]
+                    scores[:, ci] = (contribution ** 2).sum(dim=(1, 2))  # [n_row]
+                    del contribution
 
                 # Store total error and block data
                 total_error = scores.sum().item()
                 proj_total_errors[key] = total_error
                 proj_block_data[key] = (scores.cpu(), R_blocks.cpu(), m, n, n_row_tiles, n_col_tiles)
 
-                del X, W_orig, W_svd, R_weight, X_padded, R_padded, X_blocks, contributions
+                del X, W_orig, W_svd, R_weight, X_padded, R_padded, X_blocks, scores
                 torch.cuda.empty_cache()
 
             # Forward through layer
