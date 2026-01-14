@@ -2092,97 +2092,136 @@ class FisherAwareSVD:
                 proj_budget = layer_block_budget // len(subset)
                 proj_budget = max(1, min(proj_budget, n_row_tiles * n_col_tiles))
 
+                # === EFFICIENT OMP: Batch computation + incremental updates ===
+                # Key insight: Score = ||X_c @ B_opt^T||² where B_opt = lstsq(X_c, R_c)
+                # This equals ||P_c @ R_c||² where P_c = X_c @ (X_c^T @ X_c)^{-1} @ X_c^T
+                # We can precompute (X_c^T @ X_c)^{-1} for each column tile (only n_col_tiles)
+
                 selected_blocks = []
                 selected_positions = set()
 
-                # OMP iterations - select ONE block at a time for true greedy
-                remaining_budget = proj_budget
-                while remaining_budget > 0:
-                    # Number of blocks to select this iteration
-                    # Use top_k_per_iter=1 for true OMP, >1 for faster but approximate
-                    k_this_iter = min(top_k_per_iter, remaining_budget)
+                # Precompute X_c^T @ X_c inverse for each column tile
+                col_XtX_inv = {}
+                for ci in range(n_col_tiles):
+                    col_start = ci * b
+                    col_end = min(col_start + b, n)
+                    X_c = X[:, col_start:col_end]
+                    try:
+                        XtX = X_c.T @ X_c
+                        XtX_inv = torch.linalg.inv(XtX + 1e-6 * torch.eye(XtX.shape[0], device=self.device))
+                        col_XtX_inv[ci] = (X_c, XtX_inv, col_start, col_end)
+                    except:
+                        continue
 
-                    # Compute scores for all candidate positions
-                    candidates = []
+                # Compute initial scores for ALL candidates at once
+                # Score[ri, ci] = ||X_c @ (X_c^T X_c)^{-1} @ X_c^T @ R_c||² = ||X_c @ B_opt^T||²
+                all_scores = torch.zeros(n_row_tiles, n_col_tiles, device=self.device)
+                all_B_vals = {}  # Cache computed B values
+
+                for ci, (X_c, XtX_inv, col_start, col_end) in col_XtX_inv.items():
+                    # B^T = (X_c^T X_c)^{-1} @ X_c^T @ R  for all rows at once
+                    # Shape: [col_size, m]
+                    B_T_all = XtX_inv @ (X_c.T @ R_activation)  # [col_size, m]
+
                     for ri in range(n_row_tiles):
                         row_start = ri * b
                         row_end = min(row_start + b, m)
 
-                        for ci in range(n_col_tiles):
-                            if (ri, ci) in selected_positions:
-                                continue
+                        B_T = B_T_all[:, row_start:row_end]  # [col_size, row_size]
+                        B_opt = B_T.T  # [row_size, col_size]
 
-                            col_start = ci * b
-                            col_end = min(col_start + b, n)
+                        # Score = ||X_c @ B_opt^T||²
+                        contribution = X_c @ B_opt.T  # [N, row_size]
+                        score = (contribution ** 2).sum()
+                        all_scores[ri, ci] = score
+                        all_B_vals[(ri, ci)] = B_opt.cpu()
 
-                            # Input slice and residual slice
-                            X_c = X[:, col_start:col_end]  # [N, b]
-                            R_c = R_activation[:, row_start:row_end]  # [N, b]
+                # Greedy selection loop
+                remaining_budget = proj_budget
+                while remaining_budget > 0:
+                    k_this_iter = min(top_k_per_iter, remaining_budget)
 
-                            # Compute optimal block value: B^T = lstsq(X_c, R_c)
-                            try:
-                                B_T = torch.linalg.lstsq(X_c, R_c).solution
-                                B_opt = B_T.T  # [row_size, col_size]
+                    # Find top-k from current scores (excluding already selected)
+                    scores_masked = all_scores.clone()
+                    for (ri, ci) in selected_positions:
+                        scores_masked[ri, ci] = -1
 
-                                # Activation-space score: ||X_c @ B_opt^T||² = reduction in residual
-                                contribution = X_c @ B_opt.T
-                                score = (contribution ** 2).sum().item()
+                    # Get top-k positions
+                    flat_scores = scores_masked.view(-1)
+                    top_k_scores, top_k_indices = torch.topk(flat_scores, min(k_this_iter, (flat_scores > 0).sum().item()))
 
-                                if score > 0:
-                                    candidates.append({
-                                        'ri': ri, 'ci': ci,
-                                        'row': row_start, 'col': col_start,
-                                        'row_end': row_end, 'col_end': col_end,
-                                        'val': B_opt.cpu(),
-                                        'score': score
-                                    })
-                            except:
-                                continue
-
-                    if not candidates:
+                    if len(top_k_indices) == 0 or top_k_scores[0] <= 0:
                         break
 
-                    # Select top-k candidates
-                    candidates.sort(key=lambda x: -x['score'])
-                    top_k = candidates[:k_this_iter]
-
-                    # Add selected blocks and update residual ONE BY ONE
-                    # This ensures subsequent blocks in top_k see updated residual
-                    for blk in top_k:
-                        # Re-compute optimal value against CURRENT residual
-                        # (important when multiple blocks target same row)
-                        X_c = X[:, blk['col']:blk['col_end']]
-                        R_c = R_activation[:, blk['row']:blk['row_end']]
-
-                        try:
-                            B_T = torch.linalg.lstsq(X_c, R_c).solution
-                            B_recomputed = B_T.T
-
-                            # Verify this block still provides improvement
-                            contribution = X_c @ B_recomputed.T
-                            new_score = (contribution ** 2).sum().item()
-
-                            if new_score < 1e-10:  # Negligible improvement, skip
-                                continue
-
-                            selected_blocks.append({
-                                'row': blk['row'],
-                                'col': blk['col'],
-                                'row_end': blk['row_end'],
-                                'col_end': blk['col_end'],
-                                'val': B_recomputed.cpu()
-                            })
-                            selected_positions.add((blk['ri'], blk['ci']))
-
-                            # Update residual immediately
-                            R_activation[:, blk['row']:blk['row_end']] -= contribution
-                            remaining_budget -= 1
-
-                        except:
+                    # Process selected blocks
+                    rows_to_update = set()
+                    for idx, score in zip(top_k_indices.tolist(), top_k_scores.tolist()):
+                        if score <= 0:
                             continue
+
+                        ri = idx // n_col_tiles
+                        ci = idx % n_col_tiles
+
+                        if (ri, ci) in selected_positions:
+                            continue
+
+                        row_start = ri * b
+                        row_end = min(row_start + b, m)
+                        col_start = ci * b
+                        col_end = min(col_start + b, n)
+
+                        # Get precomputed B value (or recompute if needed)
+                        if (ri, ci) in all_B_vals:
+                            B_val = all_B_vals[(ri, ci)].to(self.device)
+                        else:
+                            continue
+
+                        # For true OMP: recompute against current residual
+                        if ci in col_XtX_inv:
+                            X_c, XtX_inv, _, _ = col_XtX_inv[ci]
+                            R_c = R_activation[:, row_start:row_end]
+                            B_T = XtX_inv @ (X_c.T @ R_c)
+                            B_val = B_T.T
+
+                        contribution = col_XtX_inv[ci][0] @ B_val.T if ci in col_XtX_inv else X[:, col_start:col_end] @ B_val.T
+                        actual_score = (contribution ** 2).sum().item()
+
+                        if actual_score < 1e-10:
+                            all_scores[ri, ci] = 0
+                            continue
+
+                        selected_blocks.append({
+                            'row': row_start,
+                            'col': col_start,
+                            'row_end': row_end,
+                            'col_end': col_end,
+                            'val': B_val.cpu()
+                        })
+                        selected_positions.add((ri, ci))
+                        rows_to_update.add(ri)
+
+                        # Update residual
+                        R_activation[:, row_start:row_end] -= contribution
+                        remaining_budget -= 1
 
                         if remaining_budget <= 0:
                             break
+
+                    # Update scores only for affected rows (where residual changed)
+                    if rows_to_update and remaining_budget > 0:
+                        for ci, (X_c, XtX_inv, col_start, col_end) in col_XtX_inv.items():
+                            for ri in rows_to_update:
+                                if (ri, ci) in selected_positions:
+                                    continue
+                                row_start = ri * b
+                                row_end = min(row_start + b, m)
+
+                                R_c = R_activation[:, row_start:row_end]
+                                B_T = XtX_inv @ (X_c.T @ R_c)
+                                B_opt = B_T.T
+                                contribution = X_c @ B_opt.T
+                                all_scores[ri, ci] = (contribution ** 2).sum()
+                                all_B_vals[(ri, ci)] = B_opt.cpu()
 
                 # Store selected blocks
                 if selected_blocks:
