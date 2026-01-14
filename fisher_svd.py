@@ -1999,12 +1999,17 @@ class FisherAwareSVD:
         position_ids = cache.get('position_ids', None)
         tokens_per_seq = max(1, int(self.model.seqlen * token_sample_ratio))
 
-        # Process each layer
-        outs = torch.zeros_like(inps)
-        total_blocks_selected = 0
         b = block_size
+        outs = torch.zeros_like(inps)
 
-        for layer_idx in tqdm(range(len(self.layers)), desc="OMP Block Selection"):
+        # ==========================================
+        # PASS 1: Compute total error per projection
+        # ==========================================
+        print("  Pass 1: Computing activation-space error per projection...")
+        proj_total_errors = {}  # (layer_idx, name) -> total error
+        proj_block_data = {}    # (layer_idx, name) -> (scores, R_blocks, m, n, n_row_tiles, n_col_tiles)
+
+        for layer_idx in tqdm(range(len(self.layers)), desc="Pass 1 - Error Computation"):
             layer = self.layers[layer_idx].float().to(self.device)
 
             if layer_idx not in self.svd_components or layer_idx not in self.original_weights:
@@ -2062,14 +2067,14 @@ class FisherAwareSVD:
             for handle in handles:
                 handle.remove()
 
-            # OMP block selection for each projection in this layer
-            layer_block_budget = total_block_budget // len(self.layers)  # Fair share per layer
-
+            # Compute scores for each projection
             for name in subset:
                 if name not in self.svd_components[layer_idx] or len(layer_inputs.get(name, [])) == 0:
                     continue
                 if name not in self.original_weights[layer_idx]:
                     continue
+
+                key = (layer_idx, name)
 
                 # Get data
                 U, S, VT, bias = self.svd_components[layer_idx][name]
@@ -2080,156 +2085,35 @@ class FisherAwareSVD:
                 del layer_inputs[name]
 
                 m, n = W_orig.shape
+                N = X.shape[0]
                 n_row_tiles = (m + b - 1) // b
                 n_col_tiles = (n + b - 1) // b
 
-                # Initial activation-space residual
-                Y_orig = X @ W_orig.T
-                Y_svd = X @ W_svd.T
-                R_activation = Y_orig - Y_svd  # [N, m]
+                R_weight = W_orig - W_svd
 
-                # Budget for this projection
-                proj_budget = layer_block_budget // len(subset)
-                proj_budget = max(1, min(proj_budget, n_row_tiles * n_col_tiles))
+                # Pad and reshape for batch computation
+                n_padded = n_col_tiles * b
+                m_padded = n_row_tiles * b
 
-                # === EFFICIENT OMP: Batch computation + incremental updates ===
-                # Key insight: Score = ||X_c @ B_opt^T||² where B_opt = lstsq(X_c, R_c)
-                # This equals ||P_c @ R_c||² where P_c = X_c @ (X_c^T @ X_c)^{-1} @ X_c^T
-                # We can precompute (X_c^T @ X_c)^{-1} for each column tile (only n_col_tiles)
+                X_padded = torch.zeros(N, n_padded, device=self.device, dtype=X.dtype)
+                X_padded[:, :n] = X
 
-                selected_blocks = []
-                selected_positions = set()
+                R_padded = torch.zeros(m_padded, n_padded, device=self.device, dtype=R_weight.dtype)
+                R_padded[:m, :n] = R_weight
 
-                # Precompute X_c^T @ X_c inverse for each column tile
-                col_XtX_inv = {}
-                for ci in range(n_col_tiles):
-                    col_start = ci * b
-                    col_end = min(col_start + b, n)
-                    X_c = X[:, col_start:col_end]
-                    try:
-                        XtX = X_c.T @ X_c
-                        XtX_inv = torch.linalg.inv(XtX + 1e-6 * torch.eye(XtX.shape[0], device=self.device))
-                        col_XtX_inv[ci] = (X_c, XtX_inv, col_start, col_end)
-                    except:
-                        continue
+                X_blocks = X_padded.view(N, n_col_tiles, b)
+                R_blocks = R_padded.view(n_row_tiles, b, n_col_tiles, b).permute(0, 2, 1, 3)
 
-                # Compute initial scores for ALL candidates at once
-                # Score[ri, ci] = ||X_c @ (X_c^T X_c)^{-1} @ X_c^T @ R_c||² = ||X_c @ B_opt^T||²
-                all_scores = torch.zeros(n_row_tiles, n_col_tiles, device=self.device)
-                all_B_vals = {}  # Cache computed B values
+                # Compute activation-space scores using einsum
+                contributions = torch.einsum('nck,rcjk->nrcj', X_blocks, R_blocks)
+                scores = (contributions ** 2).sum(dim=(0, 3))  # [n_row_tiles, n_col_tiles]
 
-                for ci, (X_c, XtX_inv, col_start, col_end) in col_XtX_inv.items():
-                    # B^T = (X_c^T X_c)^{-1} @ X_c^T @ R  for all rows at once
-                    # Shape: [col_size, m]
-                    B_T_all = XtX_inv @ (X_c.T @ R_activation)  # [col_size, m]
+                # Store total error and block data
+                total_error = scores.sum().item()
+                proj_total_errors[key] = total_error
+                proj_block_data[key] = (scores.cpu(), R_blocks.cpu(), m, n, n_row_tiles, n_col_tiles)
 
-                    for ri in range(n_row_tiles):
-                        row_start = ri * b
-                        row_end = min(row_start + b, m)
-
-                        B_T = B_T_all[:, row_start:row_end]  # [col_size, row_size]
-                        B_opt = B_T.T  # [row_size, col_size]
-
-                        # Score = ||X_c @ B_opt^T||²
-                        contribution = X_c @ B_opt.T  # [N, row_size]
-                        score = (contribution ** 2).sum()
-                        all_scores[ri, ci] = score
-                        all_B_vals[(ri, ci)] = B_opt.cpu()
-
-                # Greedy selection loop
-                remaining_budget = proj_budget
-                while remaining_budget > 0:
-                    k_this_iter = min(top_k_per_iter, remaining_budget)
-
-                    # Find top-k from current scores (excluding already selected)
-                    scores_masked = all_scores.clone()
-                    for (ri, ci) in selected_positions:
-                        scores_masked[ri, ci] = -1
-
-                    # Get top-k positions
-                    flat_scores = scores_masked.view(-1)
-                    top_k_scores, top_k_indices = torch.topk(flat_scores, min(k_this_iter, (flat_scores > 0).sum().item()))
-
-                    if len(top_k_indices) == 0 or top_k_scores[0] <= 0:
-                        break
-
-                    # Process selected blocks
-                    rows_to_update = set()
-                    for idx, score in zip(top_k_indices.tolist(), top_k_scores.tolist()):
-                        if score <= 0:
-                            continue
-
-                        ri = idx // n_col_tiles
-                        ci = idx % n_col_tiles
-
-                        if (ri, ci) in selected_positions:
-                            continue
-
-                        row_start = ri * b
-                        row_end = min(row_start + b, m)
-                        col_start = ci * b
-                        col_end = min(col_start + b, n)
-
-                        # Get precomputed B value (or recompute if needed)
-                        if (ri, ci) in all_B_vals:
-                            B_val = all_B_vals[(ri, ci)].to(self.device)
-                        else:
-                            continue
-
-                        # For true OMP: recompute against current residual
-                        if ci in col_XtX_inv:
-                            X_c, XtX_inv, _, _ = col_XtX_inv[ci]
-                            R_c = R_activation[:, row_start:row_end]
-                            B_T = XtX_inv @ (X_c.T @ R_c)
-                            B_val = B_T.T
-
-                        contribution = col_XtX_inv[ci][0] @ B_val.T if ci in col_XtX_inv else X[:, col_start:col_end] @ B_val.T
-                        actual_score = (contribution ** 2).sum().item()
-
-                        if actual_score < 1e-10:
-                            all_scores[ri, ci] = 0
-                            continue
-
-                        selected_blocks.append({
-                            'row': row_start,
-                            'col': col_start,
-                            'row_end': row_end,
-                            'col_end': col_end,
-                            'val': B_val.cpu()
-                        })
-                        selected_positions.add((ri, ci))
-                        rows_to_update.add(ri)
-
-                        # Update residual
-                        R_activation[:, row_start:row_end] -= contribution
-                        remaining_budget -= 1
-
-                        if remaining_budget <= 0:
-                            break
-
-                    # Update scores only for affected rows (where residual changed)
-                    if rows_to_update and remaining_budget > 0:
-                        for ci, (X_c, XtX_inv, col_start, col_end) in col_XtX_inv.items():
-                            for ri in rows_to_update:
-                                if (ri, ci) in selected_positions:
-                                    continue
-                                row_start = ri * b
-                                row_end = min(row_start + b, m)
-
-                                R_c = R_activation[:, row_start:row_end]
-                                B_T = XtX_inv @ (X_c.T @ R_c)
-                                B_opt = B_T.T
-                                contribution = X_c @ B_opt.T
-                                all_scores[ri, ci] = (contribution ** 2).sum()
-                                all_B_vals[(ri, ci)] = B_opt.cpu()
-
-                # Store selected blocks
-                if selected_blocks:
-                    key = (layer_idx, name)
-                    self.residual_blocks[key] = selected_blocks
-                    total_blocks_selected += len(selected_blocks)
-
-                del X, W_orig, W_svd, Y_orig, Y_svd, R_activation
+                del X, W_orig, W_svd, R_weight, X_padded, R_padded, X_blocks, contributions
                 torch.cuda.empty_cache()
 
             # Forward through layer
@@ -2246,6 +2130,83 @@ class FisherAwareSVD:
             self.layers[layer_idx] = layer.to(dtype).cpu()
             inps = outs.clone()
             torch.cuda.empty_cache()
+
+        # ==========================================
+        # PASS 2: Allocate budget and select blocks
+        # ==========================================
+        print("  Pass 2: Proportional budget allocation and block selection...")
+
+        # Compute proportional budget allocation
+        total_error = sum(proj_total_errors.values())
+        if total_error == 0:
+            print("  No error to reduce, skipping block selection")
+            return
+
+        proj_budgets = {}
+        for key, error in proj_total_errors.items():
+            # Proportional allocation based on error
+            ratio = error / total_error
+            proj_budgets[key] = max(1, int(total_block_budget * ratio))
+
+        # Adjust to match total budget
+        allocated = sum(proj_budgets.values())
+        if allocated > total_block_budget:
+            # Scale down proportionally
+            scale = total_block_budget / allocated
+            for key in proj_budgets:
+                proj_budgets[key] = max(1, int(proj_budgets[key] * scale))
+
+        # Select blocks for each projection
+        total_blocks_selected = 0
+        for key, (scores, R_blocks, m, n, n_row_tiles, n_col_tiles) in proj_block_data.items():
+            layer_idx, name = key
+            budget = proj_budgets.get(key, 0)
+            if budget == 0:
+                continue
+
+            # Cap at half of available blocks
+            budget = min(budget, n_row_tiles * n_col_tiles // 2)
+
+            # Flatten and get top-k
+            flat_scores = scores.view(-1)
+            k = min(budget, (flat_scores > 0).sum().item())
+            if k == 0:
+                continue
+
+            top_scores, top_indices = torch.topk(flat_scores, k)
+
+            # Extract selected blocks
+            selected_blocks = []
+            for idx, score in zip(top_indices.tolist(), top_scores.tolist()):
+                if score <= 0:
+                    continue
+                ri = idx // n_col_tiles
+                ci = idx % n_col_tiles
+
+                row_start = ri * b
+                row_end = min(row_start + b, m)
+                col_start = ci * b
+                col_end = min(col_start + b, n)
+
+                # Get block value from weight-space residual
+                B_val = R_blocks[ri, ci, :row_end-row_start, :col_end-col_start]
+
+                selected_blocks.append({
+                    'row': row_start,
+                    'col': col_start,
+                    'row_end': row_end,
+                    'col_end': col_end,
+                    'val': B_val,
+                    'score': score
+                })
+
+            if selected_blocks:
+                self.residual_blocks[key] = selected_blocks
+                total_blocks_selected += len(selected_blocks)
+
+        # Clean up
+        del proj_block_data
+        torch.cuda.empty_cache()
 
         # Print statistics
         total_block_params = total_blocks_selected * params_per_block
