@@ -2734,6 +2734,7 @@ class FisherAwareSVD:
                  refine_blocks: bool = True,
                  use_omp_selection: bool = False,
                  omp_top_k_per_iter: int = 32,
+                 joint_optimize_iters: int = 0,
                  use_distillation: bool = False,
                  distill_steps: int = 2000,
                  distill_lr: float = 1e-4,
@@ -2775,6 +2776,9 @@ class FisherAwareSVD:
                               When True, uses activation-space metrics ||X @ R^T||² and
                               greedy selection with residual updating. More accurate but slower.
             omp_top_k_per_iter: Number of blocks to select per OMP iteration (default: 32)
+            joint_optimize_iters: Number of joint optimization iterations after adding blocks (default: 0)
+                                 Each iteration: ALS(SVD) -> Refine(Blocks) -> repeat
+                                 This helps SVD and blocks jointly minimize reconstruction error.
             use_distillation: Enable Phase 5 distillation fine-tuning (default: False)
             distill_steps: Number of distillation training steps (default: 2000)
             distill_lr: Learning rate for distillation (default: 1e-4)
@@ -2853,6 +2857,25 @@ class FisherAwareSVD:
                 # Phase 3b Refinement: Optimize block values using least squares
                 if refine_blocks and len(self.residual_blocks) > 0:
                     self.phase3b_refine_blocks(calib_loader, token_sample_ratio=token_sample_ratio)
+
+            # Joint optimization: alternate between ALS and block refinement
+            # This helps SVD and blocks jointly minimize reconstruction error
+            if joint_optimize_iters > 0 and len(self.residual_blocks) > 0:
+                print(f"Phase 4b: Joint optimization ({joint_optimize_iters} iterations)...")
+                for joint_iter in range(joint_optimize_iters):
+                    print(f"  Joint iteration {joint_iter + 1}/{joint_optimize_iters}")
+
+                    # Re-run ALS to adjust SVD components (now accounting for blocks)
+                    # The blocks capture some error, so SVD should shift to capture different patterns
+                    self.phase4_als_calibration_with_blocks(
+                        calib_loader,
+                        num_iters=1,
+                        token_sample_ratio=token_sample_ratio
+                    )
+
+                    # Re-run block refinement with updated SVD
+                    if refine_blocks:
+                        self.phase3b_refine_blocks(calib_loader, token_sample_ratio=token_sample_ratio)
 
             # Clean up original weights to save memory
             if hasattr(self, 'original_weights'):
@@ -3307,6 +3330,264 @@ class FisherAwareSVD:
             print(f"  Average ALS improvement: {avg_improvement:.1f}% across {calibrated_layers} linear layers")
         else:
             print("  No layers calibrated")
+
+
+    def phase4_als_calibration_with_blocks(self, calib_loader: List[Dict], num_iters: int = 1,
+                                           token_sample_ratio: float = 0.2) -> None:
+        """
+        ALS calibration that accounts for residual blocks.
+
+        When blocks are present, the total approximation is: W_approx = W_svd + W_blocks
+        We want to minimize: ||X @ W_approx^T - X @ W_orig^T||²
+
+        This is equivalent to minimizing: ||X @ W_svd^T - (X @ W_orig^T - X @ W_blocks^T)||²
+        So the target for SVD becomes: Y_target = Y_orig - Y_blocks
+
+        This allows SVD and blocks to jointly minimize reconstruction error.
+        """
+        if not hasattr(self, 'residual_blocks') or len(self.residual_blocks) == 0:
+            print("  No blocks to account for, running standard ALS...")
+            self.phase4_als_calibration(calib_loader, num_iters=num_iters,
+                                        update_sigma=True, token_sample_ratio=token_sample_ratio)
+            return
+
+        print(f"Phase 4b: Joint ALS with blocks ({num_iters} iters)...")
+
+        # Move embedding layers to device
+        if "opt" in self.model_name:
+            self.model.model.decoder.embed_tokens = self.model.model.decoder.embed_tokens.to(self.device)
+            self.model.model.decoder.embed_positions = self.model.model.decoder.embed_positions.to(self.device)
+        else:
+            self.model.model.embed_tokens = self.model.model.embed_tokens.to(self.device)
+
+        dtype = next(iter(self.model.parameters())).dtype
+        inps = torch.zeros(
+            (len(calib_loader), self.model.seqlen, self.model.config.hidden_size),
+            dtype=dtype, device='cpu'
+        )
+        cache = {'i': 0, 'attention_mask': None, 'position_ids': None}
+
+        class Catcher(nn.Module):
+            def __init__(self, module):
+                super().__init__()
+                self.module = module
+
+            def forward(self, inp, **kwargs):
+                inps[cache['i']] = inp[0].detach().cpu().to(inps.dtype)
+                cache['i'] += 1
+                if cache['attention_mask'] is None:
+                    cache['attention_mask'] = kwargs['attention_mask'].cpu()
+                    cache['position_ids'] = kwargs.get('position_ids', torch.zeros(1)).cpu()
+                else:
+                    cache['attention_mask'] = torch.cat(
+                        (cache['attention_mask'], kwargs['attention_mask'].cpu()), dim=0
+                    )
+                    if 'position_ids' in kwargs:
+                        cache['position_ids'] = torch.cat(
+                            (cache['position_ids'], kwargs['position_ids'].cpu()), dim=0
+                        )
+                raise ValueError
+
+        self.layers[0] = self.layers[0].to(self.device)
+        original_layer0 = self.layers[0]
+        self.layers[0] = Catcher(self.layers[0])
+
+        for batch in calib_loader:
+            try:
+                batch = {k: v.to(self.device) for k, v in batch.items()}
+                self.model(**batch)
+            except ValueError:
+                pass
+
+        self.layers[0] = original_layer0
+        self.layers[0] = self.layers[0].cpu()
+
+        if "opt" in self.model_name:
+            self.model.model.decoder.embed_tokens = self.model.model.decoder.embed_tokens.cpu()
+            self.model.model.decoder.embed_positions = self.model.model.decoder.embed_positions.cpu()
+        else:
+            self.model.model.embed_tokens = self.model.model.embed_tokens.cpu()
+
+        torch.cuda.empty_cache()
+
+        attention_masks = cache['attention_mask']
+        position_ids = cache.get('position_ids', None)
+        tokens_per_seq = max(1, int(self.model.seqlen * token_sample_ratio))
+
+        total_improvement = 0.0
+        calibrated_count = 0
+        outs = torch.zeros_like(inps)
+
+        for layer_idx in tqdm(range(len(self.layers)), desc="Joint ALS"):
+            layer = self.layers[layer_idx].float().to(self.device)
+
+            if layer_idx not in self.svd_components:
+                with torch.no_grad():
+                    for j in range(inps.shape[0]):
+                        inp_j = inps[j].unsqueeze(0).float().to(self.device)
+                        mask_j = attention_masks[j].unsqueeze(0).to(self.device)
+                        if position_ids is not None and "opt" not in self.model_name:
+                            pos_j = position_ids[j].unsqueeze(0).to(self.device)
+                            outs[j] = layer(inp_j, attention_mask=mask_j, position_ids=pos_j, use_cache=False)[0].cpu().to(dtype)
+                        else:
+                            outs[j] = layer(inp_j, attention_mask=mask_j, use_cache=False)[0].cpu().to(dtype)
+                self.layers[layer_idx] = layer.to(dtype).cpu()
+                inps = outs.clone()
+                torch.cuda.empty_cache()
+                continue
+
+            subset = find_layers(layer)
+            layer_inputs = {name: [] for name in subset}
+            handles = []
+
+            def make_hook(name):
+                def hook(module, inp, out):
+                    x = inp[0].detach().float()
+                    if x.dim() == 2:
+                        T = x.shape[0]
+                        if T > tokens_per_seq:
+                            idx = torch.randperm(T, device=x.device)[:tokens_per_seq]
+                            x = x.index_select(0, idx)
+                        layer_inputs[name].append(x.cpu())
+                        return
+                    if x.shape[1] > tokens_per_seq:
+                        indices = torch.randperm(x.shape[1], device=x.device)[:tokens_per_seq]
+                        x = x[:, indices, :]
+                    layer_inputs[name].append(x.cpu())
+                return hook
+
+            for name in subset:
+                handle = subset[name].register_forward_hook(make_hook(name))
+                handles.append(handle)
+
+            with torch.no_grad():
+                for j in range(inps.shape[0]):
+                    inp_j = inps[j].unsqueeze(0).float().to(self.device)
+                    mask_j = attention_masks[j].unsqueeze(0).to(self.device)
+                    if position_ids is not None and "opt" not in self.model_name:
+                        pos_j = position_ids[j].unsqueeze(0).to(self.device)
+                        _ = layer(inp_j, attention_mask=mask_j, position_ids=pos_j, use_cache=False)
+                    else:
+                        _ = layer(inp_j, attention_mask=mask_j, use_cache=False)
+
+            for handle in handles:
+                handle.remove()
+
+            # Calibrate each projection with block adjustment
+            for name in subset:
+                key = (layer_idx, name)
+                if name not in self.svd_components[layer_idx] or len(layer_inputs.get(name, [])) == 0:
+                    continue
+
+                U_r, S_r, VT_r, bias = self.svd_components[layer_idx][name]
+                rank = len(S_r)
+                original_linear = self._get_module_by_name(layer, name)
+
+                X = torch.cat([x.reshape(-1, x.shape[-1]) for x in layer_inputs[name]], dim=0).to(self.device)
+                del layer_inputs[name]
+
+                # Original target
+                W_orig = original_linear.weight.data.float().to(self.device)
+                Y_orig = X @ W_orig.T
+
+                # Compute block contribution and subtract from target
+                Y_blocks = torch.zeros_like(Y_orig)
+                if key in self.residual_blocks:
+                    for block in self.residual_blocks[key]:
+                        row, col = block['row'], block['col']
+                        row_end, col_end = block['row_end'], block['col_end']
+                        B_val = block['val'].float().to(self.device)
+                        # Block contribution: X[:, col:col_end] @ B_val.T -> Y[:, row:row_end]
+                        Y_blocks[:, row:row_end] += X[:, col:col_end] @ B_val.T
+
+                # Adjusted target: what SVD needs to approximate
+                Y = Y_orig - Y_blocks
+
+                # SVD components
+                U = U_r.float().to(self.device)
+                S = S_r.float().to(self.device)
+                V = VT_r.T.float().to(self.device)
+
+                # Loss before
+                W_before = (U * S) @ VT_r.float().to(self.device)
+                loss_before = ((X @ W_before.T - Y) ** 2).mean().item()
+
+                if loss_before < 1e-6:
+                    del X, W_orig, Y_orig, Y_blocks, Y, U, S, V, W_before
+                    torch.cuda.empty_cache()
+                    continue
+
+                reg = 1e-6
+
+                # ALS iterations
+                for _ in range(num_iters):
+                    # Step A: Fix V, S, solve U
+                    Z = (X @ V) * S
+                    U_T_new = torch.linalg.lstsq(Z, Y).solution
+                    U = U_T_new.T
+                    del Z, U_T_new
+
+                    # Step B: Fix U, S, solve V
+                    U_s = U * S
+                    G = U_s.T @ U_s + reg * torch.eye(rank, device=self.device)
+                    Z_target = (Y @ U_s) @ torch.linalg.inv(G)
+                    V = torch.linalg.lstsq(X, Z_target).solution
+                    del U_s, G, Z_target
+
+                # Step C: Solve D
+                A = X @ V
+                YB = Y @ U
+                h = (A * YB).sum(dim=0)
+                AtA = A.T @ A
+                BtB = U.T @ U
+                G = AtA * BtB
+                d = torch.linalg.solve(G + reg * torch.eye(rank, device=self.device), h)
+                S = torch.abs(d)
+                del A, YB, h, AtA, BtB, G, d
+
+                # Loss after
+                VT = V.T
+                W_after = (U * S) @ VT
+                loss_after = ((X @ W_after.T - Y) ** 2).mean().item()
+
+                # Check for issues
+                if torch.isnan(W_after).any() or loss_after > loss_before:
+                    U = U_r.float().to(self.device)
+                    S = S_r.float().to(self.device)
+                    VT = VT_r.float().to(self.device)
+                else:
+                    improvement = (1 - loss_after / loss_before) * 100
+                    total_improvement += improvement
+                    calibrated_count += 1
+
+                    # Update components
+                    self.svd_components[layer_idx][name] = (U.cpu(), S.cpu(), VT.cpu(),
+                                                            bias.cpu() if bias is not None else None)
+                    # Note: linear weight will be updated during apply_compression
+                    # For now, update with SVD approximation for subsequent layer forward passes
+                    with torch.no_grad():
+                        original_linear.weight.copy_(W_after.to(original_linear.weight.dtype))
+
+                del U, S, V, VT, W_after, X, W_orig, Y_orig, Y_blocks, Y
+                torch.cuda.empty_cache()
+
+            # Forward through layer
+            with torch.no_grad():
+                for j in range(inps.shape[0]):
+                    inp_j = inps[j].unsqueeze(0).float().to(self.device)
+                    mask_j = attention_masks[j].unsqueeze(0).to(self.device)
+                    if position_ids is not None and "opt" not in self.model_name:
+                        pos_j = position_ids[j].unsqueeze(0).to(self.device)
+                        outs[j] = layer(inp_j, attention_mask=mask_j, position_ids=pos_j, use_cache=False)[0].cpu().to(dtype)
+                    else:
+                        outs[j] = layer(inp_j, attention_mask=mask_j, use_cache=False)[0].cpu().to(dtype)
+
+            self.layers[layer_idx] = layer.to(dtype).cpu()
+            inps = outs.clone()
+            torch.cuda.empty_cache()
+
+        if calibrated_count > 0:
+            print(f"  Joint ALS improvement: {total_improvement/calibrated_count:.1f}% avg across {calibrated_count} layers")
 
 
 def fisher_aware_svd_compression(model_name: str, model: nn.Module,
