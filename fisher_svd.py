@@ -2144,25 +2144,51 @@ class FisherAwareSVD:
         # ==========================================
         print("  Pass 2: Proportional budget allocation and block selection...")
 
-        # Compute proportional budget allocation
+        # Compute proportional budget allocation with log-smoothing
+        # Problem: Linear allocation creates extreme skew (min=15, max=15274)
+        # Solution: Use sqrt or log to smooth the distribution while preserving relative order
         total_error = sum(proj_total_errors.values())
         if total_error == 0:
             print("  No error to reduce, skipping block selection")
             return
 
-        proj_budgets = {}
+        # Compute smoothed errors using sqrt (balances between uniform and pure proportional)
+        import math
+        smoothed_errors = {}
         for key, error in proj_total_errors.items():
-            # Proportional allocation based on error
-            ratio = error / total_error
-            proj_budgets[key] = max(1, int(total_block_budget * ratio))
+            # sqrt smoothing: reduces extreme ratios while preserving relative order
+            # error_ratio 1000:1 becomes sqrt_ratio ~31:1
+            smoothed_errors[key] = math.sqrt(max(error, 1e-10))
+
+        total_smoothed = sum(smoothed_errors.values())
+
+        # Minimum budget per projection (ensure every projection gets some blocks)
+        n_projections = len(proj_total_errors)
+        min_budget_per_proj = max(1, total_block_budget // (n_projections * 10))  # At least 10% uniform
+        reserved_budget = min_budget_per_proj * n_projections
+        remaining_budget = total_block_budget - reserved_budget
+
+        proj_budgets = {}
+        for key, smoothed_err in smoothed_errors.items():
+            # Base allocation (minimum) + proportional allocation (based on smoothed error)
+            prop_budget = int(remaining_budget * smoothed_err / total_smoothed)
+            proj_budgets[key] = min_budget_per_proj + prop_budget
 
         # Adjust to match total budget
         allocated = sum(proj_budgets.values())
         if allocated > total_block_budget:
-            # Scale down proportionally
             scale = total_block_budget / allocated
             for key in proj_budgets:
                 proj_budgets[key] = max(1, int(proj_budgets[key] * scale))
+
+        # Print allocation statistics
+        layer_budgets = {}
+        for (layer_idx, name), budget in proj_budgets.items():
+            layer_budgets[layer_idx] = layer_budgets.get(layer_idx, 0) + budget
+        if layer_budgets:
+            min_lb = min(layer_budgets.items(), key=lambda x: x[1])
+            max_lb = max(layer_budgets.items(), key=lambda x: x[1])
+            print(f"  Budget allocation: min={min_lb[1]} (L{min_lb[0]}), max={max_lb[1]} (L{max_lb[0]}), ratio={max_lb[1]/max(min_lb[1],1):.1f}x")
 
         # Select blocks for each projection
         total_blocks_selected = 0
