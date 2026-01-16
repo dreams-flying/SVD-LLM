@@ -2086,6 +2086,14 @@ class FisherAwareSVD:
 
                 m, n = W_orig.shape
                 N = X.shape[0]
+
+                # Token subsampling for speed (borrowed from reference)
+                max_tokens = 8192
+                if N > max_tokens:
+                    indices = torch.randperm(N, device=X.device)[:max_tokens]
+                    X = X[indices]
+                    N = max_tokens
+
                 n_row_tiles = (m + b - 1) // b
                 n_col_tiles = (n + b - 1) // b
 
@@ -2101,27 +2109,41 @@ class FisherAwareSVD:
                 R_padded = torch.zeros(m_padded, n_padded, device=self.device, dtype=R_weight.dtype)
                 R_padded[:m, :n] = R_weight
 
-                X_blocks = X_padded.view(N, n_col_tiles, b)
+                # X_blocks: [n_col_tiles, N, b] for chunked access
+                X_blocks = X_padded.view(N, n_col_tiles, b).permute(1, 0, 2)
                 R_blocks = R_padded.view(n_row_tiles, b, n_col_tiles, b).permute(0, 2, 1, 3)
 
-                # Compute activation-space scores column-by-column to save memory
-                # Full einsum 'nck,rcjk->nrcj' would create [N, n_row, n_col, b] tensor (too large!)
-                # Instead, iterate over column tiles: intermediate is only [n_row, N, b]
+                del X_padded, R_padded, X, W_orig, W_svd, R_weight
+                torch.cuda.empty_cache()
+
+                # Double-layer chunking for memory efficiency (borrowed from reference)
                 scores = torch.zeros(n_row_tiles, n_col_tiles, device=self.device)
-                for ci in range(n_col_tiles):
-                    X_ci = X_blocks[:, ci, :]  # [N, b]
-                    R_ci = R_blocks[:, ci, :, :]  # [n_row_tiles, b, b]
-                    # contribution[r, n, j] = sum_k X_ci[n, k] * R_ci[r, j, k]
-                    contribution = torch.einsum('nk,rjk->rnj', X_ci, R_ci)  # [n_row, N, b]
-                    scores[:, ci] = (contribution ** 2).sum(dim=(1, 2))  # [n_row]
-                    del contribution
+                col_chunk_size = min(32, n_col_tiles)
+                row_chunk_size = min(64, n_row_tiles)
+
+                for ci_start in range(0, n_col_tiles, col_chunk_size):
+                    ci_end = min(ci_start + col_chunk_size, n_col_tiles)
+                    X_chunk = X_blocks[ci_start:ci_end]  # [col_chunk, N, b]
+                    R_col_chunk = R_blocks[:, ci_start:ci_end, :, :]  # [n_row, col_chunk, b, b]
+
+                    for ri_start in range(0, n_row_tiles, row_chunk_size):
+                        ri_end = min(ri_start + row_chunk_size, n_row_tiles)
+                        R_sub = R_col_chunk[ri_start:ri_end]  # [row_chunk, col_chunk, b, b]
+
+                        # einsum: 'cnk,rcjk->rcnj' then sum over n,j
+                        contribution = torch.einsum('cnk,rcjk->rcnj', X_chunk, R_sub)
+                        scores[ri_start:ri_end, ci_start:ci_end] = (contribution ** 2).sum(dim=(2, 3))
+                        del contribution
+
+                    del X_chunk, R_col_chunk
+                    torch.cuda.empty_cache()
 
                 # Store total error and block data
                 total_error = scores.sum().item()
                 proj_total_errors[key] = total_error
                 proj_block_data[key] = (scores.cpu(), R_blocks.cpu(), m, n, n_row_tiles, n_col_tiles)
 
-                del X, W_orig, W_svd, R_weight, X_padded, R_padded, X_blocks, scores
+                del X_blocks, scores
                 torch.cuda.empty_cache()
 
             # Forward through layer
@@ -2190,7 +2212,7 @@ class FisherAwareSVD:
             max_lb = max(layer_budgets.items(), key=lambda x: x[1])
             print(f"  Budget allocation: min={min_lb[1]} (L{min_lb[0]}), max={max_lb[1]} (L{max_lb[0]}), ratio={max_lb[1]/max(min_lb[1],1):.1f}x")
 
-        # Select blocks for each projection
+        # Select blocks for each projection with score damping for diversity
         total_blocks_selected = 0
         for key, (scores, R_blocks, m, n, n_row_tiles, n_col_tiles) in proj_block_data.items():
             layer_idx, name = key
@@ -2201,38 +2223,62 @@ class FisherAwareSVD:
             # Cap at half of available blocks
             budget = min(budget, n_row_tiles * n_col_tiles // 2)
 
-            # Flatten and get top-k
-            flat_scores = scores.view(-1)
-            k = min(budget, (flat_scores > 0).sum().item())
-            if k == 0:
-                continue
-
-            top_scores, top_indices = torch.topk(flat_scores, k)
-
-            # Extract selected blocks
+            # Use iterative selection with score damping (borrowed from reference)
+            # This encourages spatial diversity - blocks in same row/col get dampened
+            scores = scores.clone()  # Work on a copy
+            selected_mask = torch.zeros(n_row_tiles, n_col_tiles, dtype=torch.bool)
             selected_blocks = []
-            for idx, score in zip(top_indices.tolist(), top_scores.tolist()):
-                if score <= 0:
-                    continue
-                ri = idx // n_col_tiles
-                ci = idx % n_col_tiles
 
-                row_start = ri * b
-                row_end = min(row_start + b, m)
-                col_start = ci * b
-                col_end = min(col_start + b, n)
+            # Iterative selection with damping
+            top_k_per_iter = min(128, budget)  # Batch size per iteration
+            max_iters = (budget + top_k_per_iter - 1) // top_k_per_iter
 
-                # Get block value from weight-space residual
-                B_val = R_blocks[ri, ci, :row_end-row_start, :col_end-col_start]
+            for _ in range(max_iters):
+                if len(selected_blocks) >= budget:
+                    break
 
-                selected_blocks.append({
-                    'row': row_start,
-                    'col': col_start,
-                    'row_end': row_end,
-                    'col_end': col_end,
-                    'val': B_val,
-                    'score': score
-                })
+                k = min(top_k_per_iter, budget - len(selected_blocks))
+                flat_scores = scores.view(-1).clone()
+                flat_scores[selected_mask.view(-1)] = -float('inf')
+
+                valid_count = (flat_scores > 0).sum().item()
+                if valid_count == 0:
+                    break
+
+                k = min(k, valid_count)
+                top_scores, top_indices = torch.topk(flat_scores, k)
+
+                for idx, score in zip(top_indices.tolist(), top_scores.tolist()):
+                    if score <= 0 or len(selected_blocks) >= budget:
+                        break
+
+                    ri = idx // n_col_tiles
+                    ci = idx % n_col_tiles
+
+                    if selected_mask[ri, ci]:
+                        continue
+
+                    row_start = ri * b
+                    row_end = min(row_start + b, m)
+                    col_start = ci * b
+                    col_end = min(col_start + b, n)
+
+                    B_val = R_blocks[ri, ci, :row_end-row_start, :col_end-col_start]
+
+                    selected_mask[ri, ci] = True
+                    selected_blocks.append({
+                        'row': row_start,
+                        'col': col_start,
+                        'row_end': row_end,
+                        'col_end': col_end,
+                        'val': B_val,
+                        'score': score
+                    })
+
+                    # Score damping for diversity (borrowed from reference)
+                    # Blocks in same column/row will have reduced priority
+                    scores[:, ci] *= 0.5  # Same column: 50% damping
+                    scores[ri, :] *= 0.8  # Same row: 20% damping
 
             if selected_blocks:
                 self.residual_blocks[key] = selected_blocks
