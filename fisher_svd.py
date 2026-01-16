@@ -2827,7 +2827,6 @@ class FisherAwareSVD:
 
             if use_omp_selection:
                 # OMP-style greedy selection with activation-space metrics
-                # This already computes optimal block values, no separate refinement needed
                 self.phase3b_omp_block_selection(
                     calib_loader=calib_loader,
                     block_budget=block_budget,
@@ -2835,6 +2834,12 @@ class FisherAwareSVD:
                     token_sample_ratio=token_sample_ratio,
                     top_k_per_iter=omp_top_k_per_iter
                 )
+
+                # Refine block values using lstsq on calibration data
+                # OMP selects blocks based on activation-space error but uses static residual values
+                # Refinement optimizes these values to minimize actual reconstruction error
+                if refine_blocks and len(self.residual_blocks) > 0:
+                    self.phase3b_refine_blocks(calib_loader, token_sample_ratio=token_sample_ratio)
             else:
                 # Standard selection based on weight-space residual
                 self.phase3b_residual_block_selection(
