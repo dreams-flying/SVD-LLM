@@ -2726,6 +2726,7 @@ class FisherAwareSVD:
                  use_als: bool = True,
                  als_iters: int = 2,
                  token_sample_ratio: float = 0.2,
+                 use_fisher_weight_als: bool = False,
                  use_residual_blocks: bool = False,
                  block_share: float = 0.1,
                  block_size: int = 16,
@@ -2759,6 +2760,9 @@ class FisherAwareSVD:
             use_als: Use ALS calibration instead of M-optimization (default: True)
             als_iters: Number of ALS iterations per layer (default: 2)
             token_sample_ratio: Ratio of tokens to sample per sequence for ALS (default: 0.1)
+            use_fisher_weight_als: Use Fisher-weighted ALS calibration (default: False)
+                                  Weights output dimensions by their sensitivity to task loss.
+                                  F_y ≈ (U² @ F_σ) approximates output Fisher from singular value Fisher.
             use_residual_blocks: Use dense residual blocks to improve accuracy (default: False)
             block_share: Fraction of total budget for residual blocks (default: 0.1 = 10%)
                         Budget is unified: SVD gets (1-block_share), blocks get block_share
@@ -2811,9 +2815,11 @@ class FisherAwareSVD:
         if calibration_steps > 0:
             try:
                 if use_als:
-                    print(f"Starting Phase 4 ALS calibration ({als_iters} iterations)...")
+                    fisher_str = " (Fisher-weighted)" if use_fisher_weight_als else ""
+                    print(f"Starting Phase 4 ALS calibration ({als_iters} iterations){fisher_str}...")
                     self.phase4_als_calibration(calib_loader, num_iters=als_iters,
-                                                 update_sigma=True, token_sample_ratio=token_sample_ratio)
+                                                 update_sigma=True, token_sample_ratio=token_sample_ratio,
+                                                 use_fisher_weight=use_fisher_weight_als)
                 else:
                     print(f"Starting Phase 4 M-optimization calibration...")
             except Exception as e:
@@ -2897,7 +2903,8 @@ class FisherAwareSVD:
         return module
 
     def phase4_als_calibration(self, calib_loader: List[Dict], num_iters: int = 2,
-                                update_sigma: bool = True, token_sample_ratio: float = 0.2) -> None:
+                                update_sigma: bool = True, token_sample_ratio: float = 0.2,
+                                use_fisher_weight: bool = False) -> None:
         """
         Phase 4: ALS (Alternating Least Squares) Calibration.
 
@@ -2909,31 +2916,41 @@ class FisherAwareSVD:
         After each projection is calibrated, we write the updated SVD components back to
         the layer so that subsequent layers see the calibrated outputs.
 
+        Fisher-Weighted ALS (use_fisher_weight=True):
+        Standard ALS minimizes: ||X @ W^T - Y||²_F (all outputs equally weighted)
+        Fisher-weighted minimizes: ||F^{1/2} @ (X @ W^T - Y)^T||²_F
+        where F_y = diag(F_11, ..., F_mm) weights outputs by their sensitivity to loss.
+
+        Output Fisher F_y is approximated from singular value Fisher F_σ:
+            F_y ≈ diag(U @ diag(F_σ) @ U^T) = (U² @ F_σ)
+
         Mathematical formulation:
         Given W' = U @ Σ @ V^T, we want to minimize ||X @ W'^T - X @ W^T||_F^2
 
         Step A: Fix V, Σ, solve U
             Z = X @ V @ Σ (N × r)
             U^T = (Z^T Z)^{-1} Z^T Y → U = (solution)^T
+            (Fisher does not affect Step A - it cancels out)
 
         Step B: Fix U, Σ, solve V (CORRECTED - no U orthogonality assumption)
-            Let U_s = U * S (out_dim × r)
-            Z = Y @ U_s @ (U_s^T U_s)^{-1}  (target for X @ V)
+            Without Fisher: Z = Y @ U_s @ (U_s^T U_s)^{-1}
+            With Fisher:    Z = Y @ F @ U_s @ (U_s^T F U_s)^{-1}
             V = lstsq(X, Z)
 
         Step C: Fix U, V, solve D (r×r linear system)
-            A = X @ V, B = U
-            h = (A * (Y @ B)).sum(dim=0)
-            G = (A^T A) ⊙ (B^T B)  (Hadamard product)
-            d = solve(G, h)
+            Without Fisher: h = diag(A^T Y B), G = (A^T A) ⊙ (B^T B)
+            With Fisher:    h = diag(A^T Y F B), G = (A^T A) ⊙ (B^T F B)
 
         Args:
             calib_loader: Calibration data loader
             num_iters: Number of ALS iterations (default: 2)
             update_sigma: Whether to update diagonal scaling in Step C (default: True)
             token_sample_ratio: Ratio of tokens to sample per sequence to avoid OOM (default: 0.1)
+            use_fisher_weight: Use Fisher information to weight output dimensions (default: False)
+                              Prioritizes reconstruction accuracy for loss-sensitive outputs.
         """
-        print(f"Phase 4: ALS Calibration ({num_iters} iterations, update_sigma={update_sigma}, token_sample={token_sample_ratio:.0%})...")
+        fisher_str = ", Fisher-weighted" if use_fisher_weight else ""
+        print(f"Phase 4: ALS Calibration ({num_iters} iterations, update_sigma={update_sigma}, token_sample={token_sample_ratio:.0%}{fisher_str})...")
 
         # Move embedding layers to device
         if "opt" in self.model_name:
@@ -3189,37 +3206,70 @@ class FisherAwareSVD:
                     reg = 1e-6  # Increased regularization for numerical stability
                     max_val = 1e6  # Clamp threshold to prevent value explosion
 
+                    # Compute output-space Fisher weights (Scheme B approximation)
+                    # F_y ≈ (U² @ F_σ) where F_σ is the singular value Fisher from Phase 2
+                    F_y = None
+                    if use_fisher_weight and hasattr(self, 'fisher_info') and layer_idx in self.fisher_info:
+                        if name in self.fisher_info[layer_idx]:
+                            F_sigma = self.fisher_info[layer_idx][name].float().to(self.device)
+                            # Truncate F_sigma to match current rank (after Phase 3 truncation)
+                            F_sigma = F_sigma[:rank]
+                            # F_y = diag(U @ diag(F_σ) @ U^T) = (U² @ F_σ)
+                            F_y = (U ** 2) @ F_sigma  # (out_dim,)
+                            # Normalize to avoid numerical issues
+                            F_y = F_y / (F_y.mean() + 1e-10)
+                            # Clamp extreme values
+                            F_y = F_y.clamp(min=0.01, max=100.0)
+
                     # ALS iterations
                     for als_iter in range(num_iters):
-                        # Step A: Fix V, S, solve U (with regularization)
+                        # Step A: Fix V, S, solve U
+                        # Fisher does NOT affect Step A (cancels in the derivation)
                         Z = (X @ V) * S  # (N, r)
-                        # Use lstsq for better numerical stability
                         U_T_new = torch.linalg.lstsq(Z, Y).solution  # (r, out_dim)
                         U = U_T_new.T  # (out_dim, r)
                         del Z, U_T_new
 
-                        # Step B: Fix U, S, solve V (with regularization)
+                        # Step B: Fix U, S, solve V
+                        # Without Fisher: Z_target = Y @ U_s @ (U_s^T @ U_s)^{-1}
+                        # With Fisher:    Z_target = Y @ F @ U_s @ (U_s^T @ F @ U_s)^{-1}
                         U_s = U * S  # (out_dim, r)
-                        G = U_s.T @ U_s + reg * torch.eye(rank, device=self.device)
-                        Z_target = (Y @ U_s) @ torch.linalg.inv(G)  # (N, r)
-                        # Z_target = torch.linalg.solve(G, (Y @ U_s).T).T
-                        # Solve X @ V = Z_target -> V = lstsq(X, Z_target)
+                        if F_y is not None:
+                            # F_y is (out_dim,), apply as diagonal: F @ U_s = U_s * F_y[:, None]
+                            F_U_s = U_s * F_y.unsqueeze(1)  # (out_dim, r)
+                            G = U_s.T @ F_U_s + reg * torch.eye(rank, device=self.device)  # (r, r)
+                            Z_target = (Y @ F_U_s) @ torch.linalg.inv(G)  # (N, r)
+                            del F_U_s
+                        else:
+                            G = U_s.T @ U_s + reg * torch.eye(rank, device=self.device)
+                            Z_target = (Y @ U_s) @ torch.linalg.inv(G)  # (N, r)
                         V = torch.linalg.lstsq(X, Z_target).solution  # (in_dim, r)
                         del U_s, G, Z_target
 
-                    # Step C: Fix U, V, solve D                    
+                    # Step C: Fix U, V, solve D
+                    # Without Fisher: h = diag(A^T @ Y @ B), G = (A^T A) ⊙ (B^T B)
+                    # With Fisher:    h = diag(A^T @ Y @ F @ B), G = (A^T A) ⊙ (B^T @ F @ B)
                     if update_sigma:
                         A = X @ V  # (N, r)
-                        YB = Y @ U  # (N, r)
+                        if F_y is not None:
+                            # Y @ F = Y * F_y (broadcast along columns)
+                            Y_F = Y * F_y.unsqueeze(0)  # (N, out_dim)
+                            YB = Y_F @ U  # (N, r)
+                            # B^T @ F @ B = U^T @ diag(F_y) @ U
+                            F_U = U * F_y.unsqueeze(1)  # (out_dim, r)
+                            BtFB = U.T @ F_U  # (r, r)
+                            del Y_F, F_U
+                        else:
+                            YB = Y @ U  # (N, r)
+                            BtFB = U.T @ U  # (r, r)
 
                         h = (A * YB).sum(dim=0)  # (r,)
                         AtA = A.T @ A  # (r, r)
-                        BtB = U.T @ U  # (r, r)
-                        G = AtA * BtB  # Hadamard product (r, r)
+                        G = AtA * BtFB  # Hadamard product (r, r)
 
                         d = torch.linalg.solve(G + reg * torch.eye(rank, device=self.device), h)
                         S = torch.abs(d)  # Keep positive
-                        del A, YB, h, AtA, BtB, G, d
+                        del A, YB, h, AtA, BtFB, G, d
 
                     # Loss after
                     VT = V.T
