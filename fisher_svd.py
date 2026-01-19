@@ -3211,15 +3211,32 @@ class FisherAwareSVD:
                     F_y = None
                     if use_fisher_weight and hasattr(self, 'fisher_info') and layer_idx in self.fisher_info:
                         if name in self.fisher_info[layer_idx]:
-                            F_sigma = self.fisher_info[layer_idx][name].float().to(self.device)
-                            # Truncate F_sigma to match current rank (after Phase 3 truncation)
-                            F_sigma = F_sigma[:rank]
-                            # F_y = diag(U @ diag(F_σ) @ U^T) = (U² @ F_σ)
-                            F_y = (U ** 2) @ F_sigma  # (out_dim,)
-                            # Normalize to avoid numerical issues
-                            F_y = F_y / (F_y.mean() + 1e-10)
-                            # Clamp extreme values
-                            F_y = F_y.clamp(min=0.01, max=100.0)
+                            fisher_raw = self.fisher_info[layer_idx][name]
+
+                            # Handle different Fisher shapes
+                            if fisher_raw.dim() == 1:
+                                # 1D: F_σ for singular values
+                                F_sigma = fisher_raw.float().to(self.device)
+                            elif fisher_raw.dim() == 2:
+                                # 2D: Full Fisher matrix, use diagonal or reduce
+                                if fisher_raw.shape[0] == fisher_raw.shape[1]:
+                                    # Square matrix, take diagonal
+                                    F_sigma = fisher_raw.diag().float().to(self.device)
+                                else:
+                                    # Non-square, sum over one dimension
+                                    F_sigma = fisher_raw.sum(dim=1).float().to(self.device)
+                            else:
+                                F_sigma = None
+
+                            if F_sigma is not None and len(F_sigma) >= rank:
+                                # Truncate F_sigma to match current rank (after Phase 3 truncation)
+                                F_sigma = F_sigma[:rank]
+                                # F_y = diag(U @ diag(F_σ) @ U^T) = (U² @ F_σ)
+                                F_y = (U ** 2) @ F_sigma  # (out_dim,)
+                                # Normalize to avoid numerical issues
+                                F_y = F_y / (F_y.mean() + 1e-10)
+                                # Clamp extreme values
+                                F_y = F_y.clamp(min=0.01, max=100.0)
 
                     # ALS iterations
                     for als_iter in range(num_iters):
