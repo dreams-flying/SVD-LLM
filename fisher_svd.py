@@ -3237,6 +3237,10 @@ class FisherAwareSVD:
                                 F_y = F_y / (F_y.mean() + 1e-10)
                                 # Clamp extreme values
                                 F_y = F_y.clamp(min=0.01, max=100.0)
+                                del F_sigma
+                            elif F_sigma is not None and layer_idx < 3:
+                                # Log warning only for first few layers to avoid spam
+                                print(f"    L{layer_idx} {name}: Fisher len({len(F_sigma)}) < rank({rank}), using standard ALS")
 
                     # ALS iterations
                     for als_iter in range(num_iters):
@@ -3254,12 +3258,13 @@ class FisherAwareSVD:
                         if F_y is not None:
                             # F_y is (out_dim,), apply as diagonal: F @ U_s = U_s * F_y[:, None]
                             F_U_s = U_s * F_y.unsqueeze(1)  # (out_dim, r)
-                            G = U_s.T @ F_U_s + reg * torch.eye(rank, device=self.device)  # (r, r)
-                            Z_target = (Y @ F_U_s) @ torch.linalg.inv(G)  # (N, r)
+                            G = U_s.T @ F_U_s + reg * torch.eye(rank, device=self.device, dtype=U.dtype)  # (r, r)
+                            # Use solve instead of inv for numerical stability: Z @ G = Y @ F_U_s => Z = solve(G.T, (Y @ F_U_s).T).T
+                            Z_target = torch.linalg.solve(G.T, (Y @ F_U_s).T).T  # (N, r)
                             del F_U_s
                         else:
-                            G = U_s.T @ U_s + reg * torch.eye(rank, device=self.device)
-                            Z_target = (Y @ U_s) @ torch.linalg.inv(G)  # (N, r)
+                            G = U_s.T @ U_s + reg * torch.eye(rank, device=self.device, dtype=U.dtype)
+                            Z_target = torch.linalg.solve(G.T, (Y @ U_s).T).T  # (N, r)
                         V = torch.linalg.lstsq(X, Z_target).solution  # (in_dim, r)
                         del U_s, G, Z_target
 
@@ -3284,7 +3289,7 @@ class FisherAwareSVD:
                         AtA = A.T @ A  # (r, r)
                         G = AtA * BtFB  # Hadamard product (r, r)
 
-                        d = torch.linalg.solve(G + reg * torch.eye(rank, device=self.device), h)
+                        d = torch.linalg.solve(G + reg * torch.eye(rank, device=self.device, dtype=G.dtype), h)
                         S = torch.abs(d)  # Keep positive
                         del A, YB, h, AtA, BtFB, G, d
 
@@ -3346,6 +3351,8 @@ class FisherAwareSVD:
                         original_linear.weight.copy_(W_after.to(original_linear.weight.dtype))
 
                     del U, S, V, VT, W_after, X, W, Y
+                    if F_y is not None:
+                        del F_y
                     torch.cuda.empty_cache()
 
                 return proj_improvement, proj_count
