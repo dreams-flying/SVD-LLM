@@ -3752,8 +3752,17 @@ class FisherAwareSVD:
         """
         print(f"Phase 5: End-to-End Gradient Calibration ({num_steps} steps, lr={lr})...")
 
+        # Get model dtype and move to device (keep original dtype for memory efficiency)
+        model_dtype = next(iter(self.model.parameters())).dtype
+        print(f"  Model dtype: {model_dtype}")
+
         # Move model to device
-        self.model = self.model.float().to(self.device)
+        self.model = self.model.to(self.device)
+
+        # Enable gradient checkpointing for memory efficiency
+        if hasattr(self.model, 'gradient_checkpointing_enable'):
+            self.model.gradient_checkpointing_enable()
+            print("  Gradient checkpointing enabled")
 
         # Collect trainable parameters (SVD layers and blocks)
         trainable_params = []
@@ -3783,6 +3792,12 @@ class FisherAwareSVD:
 
         scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
+        # Mixed precision training for speed and memory (only if model is float16/bfloat16)
+        use_amp = model_dtype in [torch.float16, torch.bfloat16]
+        scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
+        if use_amp:
+            print(f"  Mixed precision training enabled (AMP with {model_dtype})")
+
         # Training loop
         self.model.train()
         total_loss = 0.0
@@ -3804,14 +3819,17 @@ class FisherAwareSVD:
                 data_iter = iter(calib_loader)
                 batch = next(data_iter)
 
+            # Move batch to device (keep original dtype)
             batch = {k: v.to(self.device) for k, v in batch.items()}
 
-            # Forward pass
+            # Forward pass with mixed precision
             try:
-                outputs = self.model(**batch)
-                loss = outputs.loss / gradient_accumulation
+                with torch.cuda.amp.autocast(enabled=use_amp, dtype=model_dtype if use_amp else None):
+                    outputs = self.model(**batch)
+                    loss = outputs.loss / gradient_accumulation
             except Exception as e:
                 print(f"  Warning: Forward pass failed ({e}), skipping batch")
+                optimizer.zero_grad()
                 continue
 
             # Record initial loss
@@ -3819,17 +3837,22 @@ class FisherAwareSVD:
                 initial_loss = loss.item() * gradient_accumulation
                 print(f"  Initial loss: {initial_loss:.4f}")
 
-            # Backward pass
-            loss.backward()
+            # Backward pass with gradient scaling
+            scaler.scale(loss).backward()
             accumulated_loss += loss.item()
             acc_steps += 1
 
             # Update weights after accumulation
             if acc_steps >= gradient_accumulation:
+                # Unscale gradients for clipping
+                scaler.unscale_(optimizer)
+
                 # Gradient clipping for stability
                 torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=1.0)
 
-                optimizer.step()
+                # Optimizer step with scaler
+                scaler.step(optimizer)
+                scaler.update()
                 scheduler.step()
                 optimizer.zero_grad()
 
@@ -3847,6 +3870,10 @@ class FisherAwareSVD:
                 accumulated_loss = 0.0
                 acc_steps = 0
 
+                # Periodic memory clearing
+                if step % 10 == 0:
+                    torch.cuda.empty_cache()
+
         pbar.close()
 
         # Final loss
@@ -3856,6 +3883,10 @@ class FisherAwareSVD:
             print(f"  Final loss: {final_loss:.4f} (improvement: {improvement:.1f}%)")
         else:
             print(f"  Final loss: {final_loss:.4f}")
+
+        # Disable gradient checkpointing after training
+        if hasattr(self.model, 'gradient_checkpointing_disable'):
+            self.model.gradient_checkpointing_disable()
 
         # Move model back to CPU to save memory
         self.model = self.model.cpu()
