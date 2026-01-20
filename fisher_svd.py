@@ -2867,7 +2867,8 @@ class FisherAwareSVD:
             # Joint optimization: alternate between ALS and block refinement
             # This helps SVD and blocks jointly minimize reconstruction error
             if joint_optimize_iters > 0 and len(self.residual_blocks) > 0:
-                print(f"Phase 4b: Joint optimization ({joint_optimize_iters} iterations)...")
+                fisher_str = " (Fisher-weighted)" if use_fisher_weight_als else ""
+                print(f"Phase 4b: Joint optimization ({joint_optimize_iters} iterations){fisher_str}...")
                 for joint_iter in range(joint_optimize_iters):
                     print(f"  Joint iteration {joint_iter + 1}/{joint_optimize_iters}")
 
@@ -2876,7 +2877,8 @@ class FisherAwareSVD:
                     self.phase4_als_calibration_with_blocks(
                         calib_loader,
                         num_iters=1,
-                        token_sample_ratio=token_sample_ratio
+                        token_sample_ratio=token_sample_ratio,
+                        use_fisher_weight=use_fisher_weight_als
                     )
 
                     # Re-run block refinement with updated SVD
@@ -3407,7 +3409,8 @@ class FisherAwareSVD:
 
 
     def phase4_als_calibration_with_blocks(self, calib_loader: List[Dict], num_iters: int = 1,
-                                           token_sample_ratio: float = 0.2) -> None:
+                                           token_sample_ratio: float = 0.2,
+                                           use_fisher_weight: bool = False) -> None:
         """
         ALS calibration that accounts for residual blocks.
 
@@ -3418,14 +3421,19 @@ class FisherAwareSVD:
         So the target for SVD becomes: Y_target = Y_orig - Y_blocks
 
         This allows SVD and blocks to jointly minimize reconstruction error.
+
+        With Fisher weighting (use_fisher_weight=True):
+        Uses output Fisher F_y ≈ (U² @ F_σ) to prioritize loss-sensitive outputs.
         """
         if not hasattr(self, 'residual_blocks') or len(self.residual_blocks) == 0:
             print("  No blocks to account for, running standard ALS...")
             self.phase4_als_calibration(calib_loader, num_iters=num_iters,
-                                        update_sigma=True, token_sample_ratio=token_sample_ratio)
+                                        update_sigma=True, token_sample_ratio=token_sample_ratio,
+                                        use_fisher_weight=use_fisher_weight)
             return
 
-        print(f"Phase 4b: Joint ALS with blocks ({num_iters} iters)...")
+        fisher_str = ", Fisher-weighted" if use_fisher_weight else ""
+        print(f"Phase 4b: Joint ALS with blocks ({num_iters} iters{fisher_str})...")
 
         # Move embedding layers to device
         if "opt" in self.model_name:
@@ -3593,31 +3601,68 @@ class FisherAwareSVD:
 
                 reg = 1e-6
 
+                # Compute Fisher weights if enabled
+                F_y = None
+                if use_fisher_weight and hasattr(self, 'fisher_info') and layer_idx in self.fisher_info:
+                    if name in self.fisher_info[layer_idx]:
+                        fisher_raw = self.fisher_info[layer_idx][name]
+                        if fisher_raw.dim() == 1:
+                            F_sigma = fisher_raw.float().to(self.device)
+                        elif fisher_raw.dim() == 2:
+                            if fisher_raw.shape[0] == fisher_raw.shape[1]:
+                                F_sigma = fisher_raw.diag().float().to(self.device)
+                            else:
+                                F_sigma = fisher_raw.sum(dim=1).float().to(self.device)
+                        else:
+                            F_sigma = None
+
+                        if F_sigma is not None and len(F_sigma) >= rank:
+                            F_sigma = F_sigma[:rank]
+                            F_y = (U ** 2) @ F_sigma
+                            F_y = F_y / (F_y.mean() + 1e-10)
+                            F_y = F_y.clamp(min=0.01, max=100.0)
+                            del F_sigma
+
                 # ALS iterations
                 for _ in range(num_iters):
-                    # Step A: Fix V, S, solve U
+                    # Step A: Fix V, S, solve U (Fisher does not affect)
                     Z = (X @ V) * S
                     U_T_new = torch.linalg.lstsq(Z, Y).solution
                     U = U_T_new.T
                     del Z, U_T_new
 
-                    # Step B: Fix U, S, solve V
+                    # Step B: Fix U, S, solve V (with Fisher weighting)
                     U_s = U * S
-                    G = U_s.T @ U_s + reg * torch.eye(rank, device=self.device)
-                    Z_target = (Y @ U_s) @ torch.linalg.inv(G)
+                    if F_y is not None:
+                        F_U_s = U_s * F_y.unsqueeze(1)
+                        G = U_s.T @ F_U_s + reg * torch.eye(rank, device=self.device, dtype=U.dtype)
+                        Z_target = torch.linalg.solve(G.T, (Y @ F_U_s).T).T
+                        del F_U_s
+                    else:
+                        G = U_s.T @ U_s + reg * torch.eye(rank, device=self.device, dtype=U.dtype)
+                        Z_target = torch.linalg.solve(G.T, (Y @ U_s).T).T
                     V = torch.linalg.lstsq(X, Z_target).solution
                     del U_s, G, Z_target
 
-                # Step C: Solve D
+                # Step C: Solve D (with Fisher weighting)
                 A = X @ V
-                YB = Y @ U
+                if F_y is not None:
+                    Y_F = Y * F_y.unsqueeze(0)
+                    YB = Y_F @ U
+                    F_U = U * F_y.unsqueeze(1)
+                    BtFB = U.T @ F_U
+                    del Y_F, F_U
+                else:
+                    YB = Y @ U
+                    BtFB = U.T @ U
                 h = (A * YB).sum(dim=0)
                 AtA = A.T @ A
-                BtB = U.T @ U
-                G = AtA * BtB
-                d = torch.linalg.solve(G + reg * torch.eye(rank, device=self.device), h)
+                G = AtA * BtFB
+                d = torch.linalg.solve(G + reg * torch.eye(rank, device=self.device, dtype=G.dtype), h)
                 S = torch.abs(d)
-                del A, YB, h, AtA, BtB, G, d
+                del A, YB, h, AtA, BtFB, G, d
+                if F_y is not None:
+                    del F_y
 
                 # Loss after
                 VT = V.T
@@ -3675,7 +3720,15 @@ def fisher_aware_svd_compression(model_name: str, model: nn.Module,
                                   fisher_lambda: float = 2.0,
                                   use_als: bool = True,
                                   als_iters: int = 2,
-                                  token_sample_ratio: float = 0.2) -> nn.Module:
+                                  token_sample_ratio: float = 0.2,
+                                  use_fisher_weight_als: bool = False,
+                                  use_residual_blocks: bool = True,
+                                  block_share: float = 0.02,
+                                  block_size: int = 16,
+                                  use_omp_selection: bool = True,
+                                  omp_top_k_per_iter: int = 128,
+                                  joint_optimize_iters: int = 2,
+                                  refine_blocks: bool = True) -> nn.Module:
     """
     Main entry point for Fisher-Aware SVD compression.
 
@@ -3700,7 +3753,15 @@ def fisher_aware_svd_compression(model_name: str, model: nn.Module,
                       Higher values give Fisher more influence on ranking.
         use_als: Use ALS calibration instead of M-optimization (default: True)
         als_iters: Number of ALS iterations per layer (default: 2)
-        token_sample_ratio: Ratio of tokens to sample per sequence for ALS (default: 0.1)
+        token_sample_ratio: Ratio of tokens to sample per sequence for ALS (default: 0.2)
+        use_fisher_weight_als: Use Fisher-weighted ALS in Phase 4 and 4b (default: False)
+        use_residual_blocks: Use dense residual blocks (default: True)
+        block_share: Fraction of budget for residual blocks (default: 0.02 = 2%)
+        block_size: Size of residual blocks (default: 16)
+        use_omp_selection: Use OMP for block selection (default: True)
+        omp_top_k_per_iter: Top K blocks per OMP iteration (default: 128)
+        joint_optimize_iters: Joint SVD+block optimization iterations (default: 2)
+        refine_blocks: Refine block values via lstsq (default: True)
 
     Returns:
         Compressed model
@@ -3710,13 +3771,29 @@ def fisher_aware_svd_compression(model_name: str, model: nn.Module,
     print(f"  GPUs: {num_gpus}")
     print(f"  Fisher λ: {fisher_lambda} (log-space formula)")
     print(f"  Min rank: {min_rank} (adaptive f_min and max_factor)")
-    print(f"  Phase 4: {'ALS' if use_als else 'M-optimization'} ({als_iters} iterations, {token_sample_ratio:.0%} tokens)" if use_als else "  Phase 4: M-optimization")
+    als_str = f"ALS ({als_iters} iterations, {token_sample_ratio:.0%} tokens)"
+    if use_fisher_weight_als:
+        als_str += " Fisher-weighted"
+    print(f"  Phase 4: {als_str if use_als else 'M-optimization'}")
+    if use_residual_blocks:
+        print(f"  Residual blocks: {block_share:.0%} budget, size={block_size}, OMP={use_omp_selection}")
+        print(f"  Joint optimization: {joint_optimize_iters} iterations")
 
     compressor = FisherAwareSVD(model, model_name, device, num_gpus=num_gpus)
-    return compressor.compress(calib_loader, ratio, whitening_mat, use_low_resource,
-                               calibration_steps, min_rank=min_rank, fisher_lambda=fisher_lambda,
-                               use_als=use_als, als_iters=als_iters,
-                               token_sample_ratio=token_sample_ratio)
+    return compressor.compress(
+        calib_loader, ratio, whitening_mat, use_low_resource,
+        calibration_steps, min_rank=min_rank, fisher_lambda=fisher_lambda,
+        use_als=use_als, als_iters=als_iters,
+        token_sample_ratio=token_sample_ratio,
+        use_fisher_weight_als=use_fisher_weight_als,
+        use_residual_blocks=use_residual_blocks,
+        block_share=block_share,
+        block_size=block_size,
+        use_omp_selection=use_omp_selection,
+        omp_top_k_per_iter=omp_top_k_per_iter,
+        joint_optimize_iters=joint_optimize_iters,
+        refine_blocks=refine_blocks
+    )
 
 
 if __name__ == '__main__':

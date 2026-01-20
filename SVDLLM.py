@@ -530,12 +530,27 @@ if __name__ == '__main__':
     parser.add_argument('--use_als', action='store_true', default=True, help='Use ALS calibration in Phase 4 (default: True)')
     parser.add_argument('--no_als', action='store_true', help='Disable ALS calibration, use M-optimization instead')
     parser.add_argument('--als_iters', type=int, default=2, help='Number of ALS iterations per layer (default: 2)')
-    parser.add_argument('--token_sample_ratio', type=float, default=0.1, help='Ratio of tokens to sample per sequence for ALS calibration (default: 0.1)')
+    parser.add_argument('--token_sample_ratio', type=float, default=0.6, help='Ratio of tokens to sample per sequence for ALS calibration (default: 0.6)')
+
+    # Fisher-weighted ALS
+    parser.add_argument('--use_fisher_weight_als', action='store_true', help='Use Fisher-weighted ALS in Phase 4 and 4b')
+
+    # Residual block options
+    parser.add_argument('--use_residual_blocks', action='store_true', default=True, help='Use dense residual blocks (default: True)')
+    parser.add_argument('--no_residual_blocks', action='store_true', help='Disable residual blocks')
+    parser.add_argument('--block_share', type=float, default=0.02, help='Fraction of budget for residual blocks (default: 0.02 = 2%%)')
+    parser.add_argument('--block_size', type=int, default=16, help='Size of residual blocks (default: 16)')
+    parser.add_argument('--use_omp_selection', action='store_true', default=True, help='Use OMP for block selection (default: True)')
+    parser.add_argument('--omp_top_k', type=int, default=128, help='Top K blocks per OMP iteration (default: 128)')
+    parser.add_argument('--joint_iters', type=int, default=2, help='Joint SVD+block optimization iterations (default: 2)')
 
     args = parser.parse_args()
     # Handle --no_als flag
     if args.no_als:
         args.use_als = False
+    # Handle --no_residual_blocks flag
+    if args.no_residual_blocks:
+        args.use_residual_blocks = False
     args.ratio = 1- args.ratio
     if args.step == 1:
         model, tokenizer = get_model_from_huggingface(model_id=args.model)
@@ -634,7 +649,14 @@ if __name__ == '__main__':
             fisher_lambda=args.fisher_lambda,
             use_als=args.use_als,
             als_iters=args.als_iters,
-            token_sample_ratio=args.token_sample_ratio
+            token_sample_ratio=args.token_sample_ratio,
+            use_fisher_weight_als=args.use_fisher_weight_als,
+            use_residual_blocks=args.use_residual_blocks,
+            block_share=args.block_share,
+            block_size=args.block_size,
+            use_omp_selection=args.use_omp_selection,
+            omp_top_k_per_iter=args.omp_top_k,
+            joint_optimize_iters=args.joint_iters
         )
 
         if args.save_path is not None:
