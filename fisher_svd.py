@@ -2744,7 +2744,10 @@ class FisherAwareSVD:
                  use_8bit_teacher: bool = True,
                  offline_logits_path: Optional[str] = None,
                  distill_checkpoint_dir: Optional[str] = None,
-                 distill_gradient_accumulation: int = 4) -> nn.Module:
+                 distill_gradient_accumulation: int = 4,
+                 use_e2e_calibration: bool = False,
+                 e2e_steps: int = 50,
+                 e2e_lr: float = 1e-5) -> nn.Module:
         """
         Full compression pipeline.
 
@@ -2892,6 +2895,17 @@ class FisherAwareSVD:
 
         # Apply compression to model
         self.apply_compression(ratio)
+
+        # Phase 5: End-to-End Gradient Calibration (optional)
+        # This directly optimizes CE loss instead of reconstruction error
+        if use_e2e_calibration and e2e_steps > 0:
+            self.phase5_end_to_end_calibration(
+                calib_loader,
+                num_steps=e2e_steps,
+                lr=e2e_lr,
+                batch_size=4,
+                gradient_accumulation=4
+            )
 
         return self.model
 
@@ -3709,6 +3723,149 @@ class FisherAwareSVD:
             print(f"  Joint ALS improvement: {total_improvement/calibrated_count:.1f}% avg across {calibrated_count} layers")
 
 
+    def phase5_end_to_end_calibration(self, calib_loader: List[Dict],
+                                       num_steps: int = 50,
+                                       lr: float = 1e-5,
+                                       batch_size: int = 4,
+                                       gradient_accumulation: int = 4,
+                                       warmup_steps: int = 5) -> None:
+        """
+        Phase 5: End-to-End Gradient Calibration.
+
+        Unlike ALS which minimizes reconstruction error, this phase directly
+        minimizes the actual cross-entropy loss by gradient descent.
+
+        This bridges the gap between reconstruction quality and PPL because:
+        1. CE loss is the actual evaluation metric
+        2. Gradients flow through the entire model (captures inter-layer effects)
+        3. Non-linear interactions (attention, LayerNorm) are properly accounted for
+
+        The SVD layers (u_proj, v_proj) and block values are updated via gradients.
+
+        Args:
+            calib_loader: Calibration data loader
+            num_steps: Number of gradient update steps (default: 50)
+            lr: Learning rate (default: 1e-5)
+            batch_size: Effective batch size (default: 4)
+            gradient_accumulation: Accumulation steps to simulate larger batch (default: 4)
+            warmup_steps: Linear warmup steps (default: 5)
+        """
+        print(f"Phase 5: End-to-End Gradient Calibration ({num_steps} steps, lr={lr})...")
+
+        # Move model to device
+        self.model = self.model.float().to(self.device)
+
+        # Collect trainable parameters (SVD layers and blocks)
+        trainable_params = []
+        for name, param in self.model.named_parameters():
+            # Only train SVD projection layers (u_proj, v_proj) and block values
+            if any(x in name for x in ['u_proj', 'v_proj', 'block_vals']):
+                param.requires_grad = True
+                trainable_params.append(param)
+            else:
+                param.requires_grad = False
+
+        if len(trainable_params) == 0:
+            print("  No trainable parameters found, skipping Phase 5")
+            return
+
+        total_params = sum(p.numel() for p in trainable_params)
+        print(f"  Trainable parameters: {total_params:,}")
+
+        # Optimizer with weight decay
+        optimizer = torch.optim.AdamW(trainable_params, lr=lr, weight_decay=0.01)
+
+        # Learning rate scheduler with warmup
+        def lr_lambda(step):
+            if step < warmup_steps:
+                return (step + 1) / warmup_steps
+            return max(0.1, 1.0 - (step - warmup_steps) / (num_steps - warmup_steps))
+
+        scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+
+        # Training loop
+        self.model.train()
+        total_loss = 0.0
+        step = 0
+        data_iter = iter(calib_loader)
+
+        # Get initial loss for comparison
+        initial_loss = None
+
+        pbar = tqdm(total=num_steps, desc="Phase 5 E2E Calibration")
+        accumulated_loss = 0.0
+        acc_steps = 0
+
+        while step < num_steps:
+            # Get batch (cycle through data if needed)
+            try:
+                batch = next(data_iter)
+            except StopIteration:
+                data_iter = iter(calib_loader)
+                batch = next(data_iter)
+
+            batch = {k: v.to(self.device) for k, v in batch.items()}
+
+            # Forward pass
+            try:
+                outputs = self.model(**batch)
+                loss = outputs.loss / gradient_accumulation
+            except Exception as e:
+                print(f"  Warning: Forward pass failed ({e}), skipping batch")
+                continue
+
+            # Record initial loss
+            if initial_loss is None:
+                initial_loss = loss.item() * gradient_accumulation
+                print(f"  Initial loss: {initial_loss:.4f}")
+
+            # Backward pass
+            loss.backward()
+            accumulated_loss += loss.item()
+            acc_steps += 1
+
+            # Update weights after accumulation
+            if acc_steps >= gradient_accumulation:
+                # Gradient clipping for stability
+                torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=1.0)
+
+                optimizer.step()
+                scheduler.step()
+                optimizer.zero_grad()
+
+                step += 1
+                total_loss += accumulated_loss * gradient_accumulation
+
+                # Update progress bar
+                avg_loss = accumulated_loss * gradient_accumulation
+                pbar.set_postfix({
+                    'loss': f'{avg_loss:.4f}',
+                    'lr': f'{scheduler.get_last_lr()[0]:.2e}'
+                })
+                pbar.update(1)
+
+                accumulated_loss = 0.0
+                acc_steps = 0
+
+        pbar.close()
+
+        # Final loss
+        final_loss = total_loss / num_steps if num_steps > 0 else 0
+        if initial_loss is not None and initial_loss > 0:
+            improvement = (1 - final_loss / initial_loss) * 100
+            print(f"  Final loss: {final_loss:.4f} (improvement: {improvement:.1f}%)")
+        else:
+            print(f"  Final loss: {final_loss:.4f}")
+
+        # Move model back to CPU to save memory
+        self.model = self.model.cpu()
+        torch.cuda.empty_cache()
+
+        # Re-enable all gradients
+        for param in self.model.parameters():
+            param.requires_grad = True
+
+
 def fisher_aware_svd_compression(model_name: str, model: nn.Module,
                                   calib_loader: List[Dict], ratio: float,
                                   whitening_mat: Optional[Dict] = None,
@@ -3728,7 +3885,10 @@ def fisher_aware_svd_compression(model_name: str, model: nn.Module,
                                   use_omp_selection: bool = True,
                                   omp_top_k_per_iter: int = 128,
                                   joint_optimize_iters: int = 2,
-                                  refine_blocks: bool = True) -> nn.Module:
+                                  refine_blocks: bool = True,
+                                  use_e2e_calibration: bool = False,
+                                  e2e_steps: int = 50,
+                                  e2e_lr: float = 1e-5) -> nn.Module:
     """
     Main entry point for Fisher-Aware SVD compression.
 
@@ -3762,6 +3922,10 @@ def fisher_aware_svd_compression(model_name: str, model: nn.Module,
         omp_top_k_per_iter: Top K blocks per OMP iteration (default: 128)
         joint_optimize_iters: Joint SVD+block optimization iterations (default: 2)
         refine_blocks: Refine block values via lstsq (default: True)
+        use_e2e_calibration: Use end-to-end gradient calibration after compression (default: False)
+                            This directly optimizes CE loss instead of reconstruction error.
+        e2e_steps: Number of gradient steps for E2E calibration (default: 50)
+        e2e_lr: Learning rate for E2E calibration (default: 1e-5)
 
     Returns:
         Compressed model
@@ -3778,6 +3942,8 @@ def fisher_aware_svd_compression(model_name: str, model: nn.Module,
     if use_residual_blocks:
         print(f"  Residual blocks: {block_share:.0%} budget, size={block_size}, OMP={use_omp_selection}")
         print(f"  Joint optimization: {joint_optimize_iters} iterations")
+    if use_e2e_calibration:
+        print(f"  Phase 5: E2E calibration ({e2e_steps} steps, lr={e2e_lr})")
 
     compressor = FisherAwareSVD(model, model_name, device, num_gpus=num_gpus)
     return compressor.compress(
@@ -3792,7 +3958,10 @@ def fisher_aware_svd_compression(model_name: str, model: nn.Module,
         use_omp_selection=use_omp_selection,
         omp_top_k_per_iter=omp_top_k_per_iter,
         joint_optimize_iters=joint_optimize_iters,
-        refine_blocks=refine_blocks
+        refine_blocks=refine_blocks,
+        use_e2e_calibration=use_e2e_calibration,
+        e2e_steps=e2e_steps,
+        e2e_lr=e2e_lr
     )
 
 

@@ -544,6 +544,11 @@ if __name__ == '__main__':
     parser.add_argument('--omp_top_k', type=int, default=128, help='Top K blocks per OMP iteration (default: 128)')
     parser.add_argument('--joint_iters', type=int, default=2, help='Joint SVD+block optimization iterations (default: 2)')
 
+    # Phase 5: End-to-End Gradient Calibration
+    parser.add_argument('--use_e2e_calibration', action='store_true', help='Use end-to-end gradient calibration (Phase 5) after compression')
+    parser.add_argument('--e2e_steps', type=int, default=50, help='Number of gradient steps for E2E calibration (default: 50)')
+    parser.add_argument('--e2e_lr', type=float, default=1e-5, help='Learning rate for E2E calibration (default: 1e-5)')
+
     args = parser.parse_args()
     # Handle --no_als flag
     if args.no_als:
@@ -656,7 +661,10 @@ if __name__ == '__main__':
             block_size=args.block_size,
             use_omp_selection=args.use_omp_selection,
             omp_top_k_per_iter=args.omp_top_k,
-            joint_optimize_iters=args.joint_iters
+            joint_optimize_iters=args.joint_iters,
+            use_e2e_calibration=args.use_e2e_calibration,
+            e2e_steps=args.e2e_steps,
+            e2e_lr=args.e2e_lr
         )
 
         if args.save_path is not None:
