@@ -36,8 +36,8 @@ def ptb():
     return traindata, valdata
 
 def apply_lora(model, tokenizer, batch_size=64, micro_batch_size=4, cutoff_len=256, add_eos_token=False,
-            lora_r=2, lora_alpha=16, lora_target_modules="q_proj,k_proj,v_proj,o_proj,gate_proj,down_proj,up_proj", 
-            lora_dropout=0.05, val_set_size=2000, data_path="yahma/alpaca-cleaned",num_epochs=2, learning_rate=1e-4, 
+            lora_r=2, lora_alpha=16, lora_target_modules="v_proj,u_proj",  # For Fisher SVD compressed models
+            lora_dropout=0.05, val_set_size=2000, data_path="yahma/alpaca-cleaned",num_epochs=2, learning_rate=1e-4,
             output_dir="Checkpoints/tune", group_by_length=False, extra_val_dataset=None):
 
     gradient_accumulation_steps = batch_size // micro_batch_size
@@ -375,7 +375,9 @@ if __name__ == "__main__":
     parser.add_argument('--lora_r', type=int, default=8, help='lora r')
     parser.add_argument('--lora_alpha', type=int, default=16, help='lora alpha')
     parser.add_argument('--lora_dropout', type=float, default=0.05, help='lora dropout')
-    parser.add_argument('--lora_target_modules', type=str, default="q_v_proj,q_u_proj,k_v_proj,k_u_proj,v_u_proj,v_v_proj,o_u_proj,o_v_proj,gate_u_proj,gate_v_proj,down_u_proj,down_v_proj,up_u_proj,up_v_proj", help='lora target modules')
+    # For Fisher SVD compressed models, use "v_proj,u_proj" (layers inside SVDLinear)
+    # For original SVD-LLM models, use "q_v_proj,q_u_proj,k_v_proj,k_u_proj,..."
+    parser.add_argument('--lora_target_modules', type=str, default="v_proj,u_proj", help='lora target modules (default: v_proj,u_proj for Fisher SVD models)')
 
     # llm hyperparameters
     parser.add_argument('--train_on_inputs', default=False, action="store_true", help='Train on inputs. If False, masks out inputs in loss')
