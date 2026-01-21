@@ -3825,10 +3825,36 @@ class FisherAwareSVD:
             # Forward pass with mixed precision
             try:
                 with torch.cuda.amp.autocast(enabled=use_amp, dtype=model_dtype if use_amp else None):
+                    # Ensure labels are provided for loss computation
+                    if 'labels' not in batch and 'input_ids' in batch:
+                        batch['labels'] = batch['input_ids'].clone()
+
                     outputs = self.model(**batch)
-                    loss = outputs.loss / gradient_accumulation
+
+                    # Compute loss manually if model doesn't return it
+                    if outputs.loss is not None:
+                        loss = outputs.loss
+                    else:
+                        # Manual cross-entropy loss for causal LM
+                        logits = outputs.logits
+                        labels = batch.get('labels', batch['input_ids'])
+
+                        # Shift for causal LM: predict next token
+                        shift_logits = logits[..., :-1, :].contiguous()
+                        shift_labels = labels[..., 1:].contiguous()
+
+                        # Compute cross-entropy loss
+                        loss_fct = nn.CrossEntropyLoss()
+                        loss = loss_fct(
+                            shift_logits.view(-1, shift_logits.size(-1)),
+                            shift_labels.view(-1)
+                        )
+
+                    loss = loss / gradient_accumulation
             except Exception as e:
                 print(f"  Warning: Forward pass failed ({e}), skipping batch")
+                import traceback
+                traceback.print_exc()
                 optimizer.zero_grad()
                 continue
 
