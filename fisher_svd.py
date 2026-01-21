@@ -2744,10 +2744,7 @@ class FisherAwareSVD:
                  use_8bit_teacher: bool = True,
                  offline_logits_path: Optional[str] = None,
                  distill_checkpoint_dir: Optional[str] = None,
-                 distill_gradient_accumulation: int = 4,
-                 use_e2e_calibration: bool = False,
-                 e2e_steps: int = 50,
-                 e2e_lr: float = 1e-5) -> nn.Module:
+                 distill_gradient_accumulation: int = 4) -> nn.Module:
         """
         Full compression pipeline.
 
@@ -2895,17 +2892,6 @@ class FisherAwareSVD:
 
         # Apply compression to model
         self.apply_compression(ratio)
-
-        # Phase 5: End-to-End Gradient Calibration (optional)
-        # This directly optimizes CE loss instead of reconstruction error
-        if use_e2e_calibration and e2e_steps > 0:
-            self.phase5_end_to_end_calibration(
-                calib_loader,
-                num_steps=e2e_steps,
-                lr=e2e_lr,
-                batch_size=4,
-                gradient_accumulation=4
-            )
 
         return self.model
 
@@ -3723,370 +3709,6 @@ class FisherAwareSVD:
             print(f"  Joint ALS improvement: {total_improvement/calibrated_count:.1f}% avg across {calibrated_count} layers")
 
 
-    def phase5_end_to_end_calibration(self, calib_loader: List[Dict],
-                                       num_steps: int = 50,
-                                       lr: float = 1e-5,
-                                       batch_size: int = 4,
-                                       gradient_accumulation: int = 4,
-                                       warmup_steps: int = 5) -> None:
-        """
-        Phase 5: End-to-End Gradient Calibration.
-
-        Unlike ALS which minimizes reconstruction error, this phase directly
-        minimizes the actual cross-entropy loss by gradient descent.
-
-        This bridges the gap between reconstruction quality and PPL because:
-        1. CE loss is the actual evaluation metric
-        2. Gradients flow through the entire model (captures inter-layer effects)
-        3. Non-linear interactions (attention, LayerNorm) are properly accounted for
-
-        The SVD layers (u_proj, v_proj) and block values are updated via gradients.
-
-        Args:
-            calib_loader: Calibration data loader
-            num_steps: Number of gradient update steps (default: 50)
-            lr: Learning rate (default: 1e-5)
-            batch_size: Effective batch size (default: 4)
-            gradient_accumulation: Accumulation steps to simulate larger batch (default: 4)
-            warmup_steps: Linear warmup steps (default: 5)
-        """
-        print(f"Phase 5: End-to-End Gradient Calibration ({num_steps} steps, lr={lr})...")
-
-        # CRITICAL: Clear GPU memory before starting Phase 5
-        # Previous phases may have left tensors on GPU
-        self.model = self.model.cpu()
-        torch.cuda.empty_cache()
-        import gc
-        gc.collect()
-        torch.cuda.empty_cache()
-
-        # Get model dtype
-        model_dtype = next(iter(self.model.parameters())).dtype
-        print(f"  Model dtype: {model_dtype}")
-
-        # Get available GPU memory
-        if torch.cuda.is_available():
-            free_mem = torch.cuda.get_device_properties(0).total_memory - torch.cuda.memory_allocated(0)
-            print(f"  Available GPU memory: {free_mem / 1024**3:.1f} GB")
-
-        # Move model to device
-        self.model = self.model.to(self.device)
-
-        # NOTE: Do NOT enable gradient checkpointing here!
-        # Gradient checkpointing is incompatible with partial parameter training
-        # because it requires inputs to have requires_grad=True.
-        # Since we only train SVD layers (u_proj, v_proj), the embedding outputs
-        # don't have requires_grad=True, causing the checkpoint to fail.
-        # Instead, we rely on memory savings from:
-        # 1. Frozen parameters don't store gradients
-        # 2. Model stays in float16
-
-        # Collect trainable parameters (SVD layers and blocks)
-        trainable_params = []
-        trainable_names = []
-        for name, param in self.model.named_parameters():
-            # Only train SVD projection layers (u_proj, v_proj) and block values
-            if any(x in name for x in ['u_proj', 'v_proj', 'block_vals']):
-                param.requires_grad = True
-                trainable_params.append(param)
-                trainable_names.append(name)
-            else:
-                param.requires_grad = False
-
-        if len(trainable_params) == 0:
-            print("  No trainable parameters found, skipping Phase 5")
-            return
-
-        total_params = sum(p.numel() for p in trainable_params)
-        print(f"  Trainable parameters: {total_params:,} ({len(trainable_params)} tensors)")
-
-        # Check initial parameter statistics (DO NOT clamp - large values are normal for SVD)
-        param_stats = []
-        params_fixed = 0
-        max_param_val = 0.0
-        for name, param in zip(trainable_names, trainable_params):
-            pmin, pmax = param.min().item(), param.max().item()
-            pmean, pstd = param.float().mean().item(), param.float().std().item()
-            param_stats.append((name.split('.')[-2], pmin, pmax, pmean, pstd))
-            max_param_val = max(max_param_val, abs(pmin), abs(pmax))
-
-            # ONLY fix NaN/Inf - do NOT clamp large values (they are normal for SVD)
-            if torch.isnan(param).any() or torch.isinf(param).any():
-                print(f"  Warning: {name} has NaN/Inf, reinitializing...")
-                nn.init.xavier_uniform_(param.data)
-                params_fixed += 1
-
-        # Print sample parameter stats
-        if param_stats:
-            sample_stats = param_stats[:3]
-            print(f"  Sample param stats: {[(s[0], f'min={s[1]:.2f}', f'max={s[2]:.2f}') for s in sample_stats]}")
-            print(f"  Max parameter magnitude: {max_param_val:.2f}")
-        if params_fixed > 0:
-            print(f"  Fixed {params_fixed} parameters with NaN/Inf")
-
-        # Use adaptive learning rate based on parameter magnitude
-        # Larger parameters need smaller learning rates to prevent instability
-        effective_lr = lr
-        if max_param_val > 10:
-            # Scale down lr for large parameter values
-            lr_scale = 10.0 / max_param_val
-            effective_lr = lr * lr_scale
-            print(f"  Scaling lr by {lr_scale:.3f} due to large parameter values")
-        print(f"  Using learning rate: {effective_lr:.2e}")
-        optimizer = torch.optim.AdamW(trainable_params, lr=effective_lr, weight_decay=0.01)
-
-        # Learning rate scheduler with warmup
-        def lr_lambda(step):
-            if step < warmup_steps:
-                return (step + 1) / warmup_steps
-            return max(0.1, 1.0 - (step - warmup_steps) / (num_steps - warmup_steps))
-
-        scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
-
-        # NOTE: We don't use AMP (mixed precision) here because:
-        # 1. AMP with partial parameter training can cause gradient issues
-        # 2. The model is already in float16, so memory is manageable
-        print(f"  Training without AMP for gradient stability")
-
-        # Training loop
-        self.model.train()
-        total_loss = 0.0
-        step = 0
-        data_iter = iter(calib_loader)
-
-        # Get initial loss for comparison
-        initial_loss = None
-
-        # Truncate sequence length for memory efficiency
-        max_seq_len = 512  # Reduced from 2048 to save memory
-        print(f"  Truncating sequences to {max_seq_len} tokens for memory efficiency")
-
-        pbar = tqdm(total=num_steps, desc="Phase 5 E2E Calibration")
-        accumulated_loss = 0.0
-        acc_steps = 0
-        nan_count = 0  # Track NaN occurrences
-        max_nan_allowed = 20  # Early stop if too many NaN
-        consecutive_nan = 0  # Track consecutive NaN for early stopping
-
-        while step < num_steps:
-            # Get batch (cycle through data if needed)
-            try:
-                batch = next(data_iter)
-            except StopIteration:
-                data_iter = iter(calib_loader)
-                batch = next(data_iter)
-
-            # Truncate sequences to save memory
-            for k in batch:
-                if batch[k].dim() >= 2 and batch[k].shape[1] > max_seq_len:
-                    batch[k] = batch[k][:, :max_seq_len]
-
-            # Move batch to device
-            batch = {k: v.to(self.device) for k, v in batch.items()}
-
-            # Forward pass
-            try:
-                # Ensure labels are provided for loss computation
-                if 'labels' not in batch and 'input_ids' in batch:
-                    batch['labels'] = batch['input_ids'].clone()
-
-                # Forward pass
-                outputs = self.model(**batch)
-
-                # Get logits and check for NaN/Inf BEFORE computing loss
-                logits = outputs.logits
-                if torch.isnan(logits).any() or torch.isinf(logits).any():
-                    nan_count += 1
-                    consecutive_nan += 1
-                    if nan_count <= 3:
-                        # Debug: check which parameters have NaN
-                        nan_params = [n for n, p in zip(trainable_names, trainable_params)
-                                      if torch.isnan(p).any() or torch.isinf(p).any()]
-                        print(f"  Warning: NaN/Inf in logits (count={nan_count}), NaN params: {nan_params[:3]}")
-                    # Early stopping if too many NaN
-                    if nan_count >= max_nan_allowed or consecutive_nan >= 5:
-                        print(f"  ERROR: Too many NaN ({nan_count}), stopping Phase 5")
-                        break
-                    optimizer.zero_grad()
-                    del outputs
-                    torch.cuda.empty_cache()
-                    continue
-                else:
-                    consecutive_nan = 0  # Reset on successful forward
-
-                # Compute loss manually (more stable than relying on model.loss)
-                labels = batch.get('labels', batch['input_ids'])
-
-                # Shift for causal LM: predict next token
-                shift_logits = logits[..., :-1, :].contiguous()
-                shift_labels = labels[..., 1:].contiguous()
-
-                # Compute cross-entropy loss in float32 with log_softmax for numerical stability
-                # Clamp logits to prevent overflow in softmax
-                shift_logits_f32 = shift_logits.float()
-                shift_logits_f32 = torch.clamp(shift_logits_f32, min=-100, max=100)
-
-                loss_fct = nn.CrossEntropyLoss()
-                loss = loss_fct(
-                    shift_logits_f32.view(-1, shift_logits_f32.size(-1)),
-                    shift_labels.view(-1)
-                )
-
-                # Check for NaN loss
-                if torch.isnan(loss) or torch.isinf(loss):
-                    nan_count += 1
-                    if nan_count <= 3:
-                        print(f"  Warning: NaN/Inf loss detected (count={nan_count}), skipping batch")
-                    optimizer.zero_grad()
-                    del outputs, loss
-                    torch.cuda.empty_cache()
-                    continue
-
-                # Check if loss requires grad
-                if not loss.requires_grad:
-                    print(f"  Warning: Loss does not require grad, checking parameters...")
-                    grad_params = sum(1 for p in self.model.parameters() if p.requires_grad)
-                    print(f"    Parameters requiring grad: {grad_params}")
-                    optimizer.zero_grad()
-                    continue
-
-                loss = loss / gradient_accumulation
-            except RuntimeError as e:
-                if "out of memory" in str(e).lower():
-                    print(f"  OOM error, clearing cache and reducing sequence length...")
-                    optimizer.zero_grad()
-                    torch.cuda.empty_cache()
-                    max_seq_len = max(128, max_seq_len // 2)
-                    print(f"  New max_seq_len: {max_seq_len}")
-                    continue
-                else:
-                    print(f"  Warning: Forward pass failed ({e}), skipping batch")
-                    optimizer.zero_grad()
-                    continue
-            except Exception as e:
-                print(f"  Warning: Forward pass failed ({e}), skipping batch")
-                optimizer.zero_grad()
-                continue
-
-            # Record initial loss
-            if initial_loss is None:
-                initial_loss = loss.item() * gradient_accumulation
-                print(f"  Initial loss: {initial_loss:.4f}")
-
-            # Backward pass
-            loss.backward()
-
-            # Check for NaN gradients
-            has_nan_grad = False
-            for param in trainable_params:
-                if param.grad is not None and (torch.isnan(param.grad).any() or torch.isinf(param.grad).any()):
-                    has_nan_grad = True
-                    break
-
-            if has_nan_grad:
-                nan_count += 1
-                consecutive_nan += 1
-                if nan_count <= 3:
-                    print(f"  Warning: NaN gradient detected, skipping update")
-                # Early stopping if too many NaN
-                if nan_count >= max_nan_allowed or consecutive_nan >= 5:
-                    print(f"  ERROR: Too many NaN gradients ({nan_count}), stopping Phase 5")
-                    break
-                optimizer.zero_grad()
-                continue
-            else:
-                consecutive_nan = 0  # Reset on successful backward
-
-            accumulated_loss += loss.item()
-            acc_steps += 1
-
-            # Update weights after accumulation
-            if acc_steps >= gradient_accumulation:
-                # Compute gradient norm before clipping for diagnostics
-                grad_norm = 0.0
-                for param in trainable_params:
-                    if param.grad is not None:
-                        grad_norm += param.grad.data.norm(2).item() ** 2
-                grad_norm = grad_norm ** 0.5
-
-                # Skip update if gradient norm is too large (indicates instability)
-                # This is safer than aggressive clipping which can destroy gradients
-                if grad_norm > 1000:
-                    nan_count += 1
-                    if nan_count <= 5:
-                        print(f"  Warning: Gradient norm too large ({grad_norm:.1f}), skipping update")
-                    optimizer.zero_grad()
-                    accumulated_loss = 0.0
-                    acc_steps = 0
-                    continue
-
-                # Gradient clipping with adaptive max_norm based on parameter scale
-                # Use larger clip value since parameters can be large in SVD
-                torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=10.0)
-
-                # Optimizer step
-                optimizer.step()
-                scheduler.step()
-                optimizer.zero_grad()
-
-                # Check for NaN parameters after update (but do NOT clamp values)
-                # Large parameter values are normal for SVD layers
-                param_nan_found = False
-                for param in trainable_params:
-                    if torch.isnan(param).any() or torch.isinf(param).any():
-                        param_nan_found = True
-                        # Replace only NaN/Inf with the mean of valid values
-                        valid_mask = ~(torch.isnan(param.data) | torch.isinf(param.data))
-                        if valid_mask.any():
-                            valid_mean = param.data[valid_mask].mean()
-                            param.data = torch.where(valid_mask, param.data, valid_mean)
-                        else:
-                            param.data.zero_()
-                        break  # Only need to detect once
-
-                if param_nan_found:
-                    nan_count += 1
-                    if nan_count <= 3:
-                        print(f"  Warning: NaN in parameters after update (grad_norm={grad_norm:.2f})")
-
-                step += 1
-                total_loss += accumulated_loss * gradient_accumulation
-
-                # Update progress bar with gradient norm for diagnostics
-                avg_loss = accumulated_loss * gradient_accumulation
-                pbar.set_postfix({
-                    'loss': f'{avg_loss:.4f}',
-                    'lr': f'{scheduler.get_last_lr()[0]:.2e}',
-                    'gnorm': f'{grad_norm:.1f}'
-                })
-                pbar.update(1)
-
-                accumulated_loss = 0.0
-                acc_steps = 0
-
-                # Periodic memory clearing
-                if step % 10 == 0:
-                    torch.cuda.empty_cache()
-
-        pbar.close()
-
-        # Final loss
-        final_loss = total_loss / max(step, 1) if step > 0 else 0
-        print(f"  Phase 5 completed: {step}/{num_steps} steps, NaN events: {nan_count}")
-        if initial_loss is not None and initial_loss > 0 and final_loss > 0:
-            improvement = (1 - final_loss / initial_loss) * 100
-            print(f"  Final loss: {final_loss:.4f} (improvement: {improvement:.1f}%)")
-        else:
-            print(f"  Final loss: {final_loss:.4f}")
-
-        # Move model back to CPU to save memory
-        self.model = self.model.cpu()
-        torch.cuda.empty_cache()
-
-        # Re-enable all gradients
-        for param in self.model.parameters():
-            param.requires_grad = True
-
 
 def fisher_aware_svd_compression(model_name: str, model: nn.Module,
                                   calib_loader: List[Dict], ratio: float,
@@ -4107,10 +3729,7 @@ def fisher_aware_svd_compression(model_name: str, model: nn.Module,
                                   use_omp_selection: bool = True,
                                   omp_top_k_per_iter: int = 128,
                                   joint_optimize_iters: int = 2,
-                                  refine_blocks: bool = True,
-                                  use_e2e_calibration: bool = False,
-                                  e2e_steps: int = 50,
-                                  e2e_lr: float = 1e-5) -> nn.Module:
+                                  refine_blocks: bool = True) -> nn.Module:
     """
     Main entry point for Fisher-Aware SVD compression.
 
@@ -4144,10 +3763,6 @@ def fisher_aware_svd_compression(model_name: str, model: nn.Module,
         omp_top_k_per_iter: Top K blocks per OMP iteration (default: 128)
         joint_optimize_iters: Joint SVD+block optimization iterations (default: 2)
         refine_blocks: Refine block values via lstsq (default: True)
-        use_e2e_calibration: Use end-to-end gradient calibration after compression (default: False)
-                            This directly optimizes CE loss instead of reconstruction error.
-        e2e_steps: Number of gradient steps for E2E calibration (default: 50)
-        e2e_lr: Learning rate for E2E calibration (default: 1e-5)
 
     Returns:
         Compressed model
@@ -4164,8 +3779,6 @@ def fisher_aware_svd_compression(model_name: str, model: nn.Module,
     if use_residual_blocks:
         print(f"  Residual blocks: {block_share:.0%} budget, size={block_size}, OMP={use_omp_selection}")
         print(f"  Joint optimization: {joint_optimize_iters} iterations")
-    if use_e2e_calibration:
-        print(f"  Phase 5: E2E calibration ({e2e_steps} steps, lr={e2e_lr})")
 
     compressor = FisherAwareSVD(model, model_name, device, num_gpus=num_gpus)
     return compressor.compress(
@@ -4180,10 +3793,7 @@ def fisher_aware_svd_compression(model_name: str, model: nn.Module,
         use_omp_selection=use_omp_selection,
         omp_top_k_per_iter=omp_top_k_per_iter,
         joint_optimize_iters=joint_optimize_iters,
-        refine_blocks=refine_blocks,
-        use_e2e_calibration=use_e2e_calibration,
-        e2e_steps=e2e_steps,
-        e2e_lr=e2e_lr
+        refine_blocks=refine_blocks
     )
 
 
