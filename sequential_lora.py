@@ -1,146 +1,45 @@
-#!/usr/bin/env python
-# coding:utf8
-"""
-Sequential Low-rank Approximation (LoRA) Fine-tuning for SVD-LLM
-
-Based on SVD-LLM paper Section 3.2:
-- Sequential training: First train W'_u, then train W'_v
-- This avoids interference between the two low-rank matrices
-- Finally merge: W'_u ← W'_u + B_u × A_u, W'_v ← W'_v + B_v × A_v
-
-Usage:
-    python sequential_lora.py --prune_model path/to/compressed_model.pt \
-        --output_dir ./lora_output \
-        --num_epochs 2 \
-        --learning_rate 3e-4
-
-Reference: https://github.com/tloen/alpaca-lora/blob/main/finetune.py
-"""
+'''
+Refer to
+https://github.com/tloen/alpaca-lora/blob/main/finetune.py
+'''
 
 import os
 import sys
 import argparse
-from typing import List, Optional
-import copy
+from typing import List
 
 import torch
-import torch.nn as nn
 import transformers
 from datasets import load_dataset
-from tqdm import tqdm
 
 parent_path = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.append(parent_path)
-
 from peft import (
     LoraConfig,
     get_peft_model,
     get_peft_model_state_dict,
-    prepare_model_for_kbit_training,
+    prepare_model_for_int8_training,
+    set_peft_model_state_dict,
 )
+
 from Prompter import Prompter, ZeroPrompter
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
-
 def wikitext2():
-    """Load wikitext2 dataset."""
     traindata = load_dataset('wikitext', 'wikitext-2-raw-v1', split='train')
     testdata = load_dataset('wikitext', 'wikitext-2-raw-v1', split='test')
     return traindata, testdata
 
-
 def ptb():
-    """Load PTB dataset."""
     traindata = load_dataset('ptb_text_only', 'penn_treebank', split='train')
     valdata = load_dataset('ptb_text_only', 'penn_treebank', split='validation')
     return traindata, valdata
 
-
-def get_target_modules_for_phase(phase: int) -> List[str]:
-    """
-    Get target modules for each phase of sequential LoRA training.
-
-    Phase 1: Train U projections (output side of SVD decomposition)
-    Phase 2: Train V projections (input side of SVD decomposition)
-
-    Args:
-        phase: 1 for U projections, 2 for V projections
-
-    Returns:
-        List of module names to target
-    """
-    # SVD-compressed model has these modules:
-    # q_v_proj, q_u_proj - Query
-    # k_v_proj, k_u_proj - Key
-    # v_v_proj, v_u_proj - Value (note: v_v_proj is V of the value projection)
-    # o_u_proj, o_v_proj - Output
-    # gate_u_proj, gate_v_proj - Gate (MLP)
-    # down_u_proj, down_v_proj - Down (MLP)
-    # up_u_proj, up_v_proj - Up (MLP)
-
-    if phase == 1:
-        # Phase 1: Train U projections (freeze V projections)
-        return [
-            "q_u_proj", "k_u_proj", "v_u_proj", "o_u_proj",
-            "gate_u_proj", "down_u_proj", "up_u_proj"
-        ]
-    else:
-        # Phase 2: Train V projections (freeze U projections)
-        return [
-            "q_v_proj", "k_v_proj", "v_v_proj", "o_v_proj",
-            "gate_v_proj", "down_v_proj", "up_v_proj"
-        ]
-
-
-def merge_lora_weights(model):
-    """
-    Merge LoRA weights into the base model.
-
-    This performs: W ← W + B × A
-    where B and A are the LoRA adaptation matrices.
-    """
-    print("Merging LoRA weights into base model...")
-
-    # Use PEFT's built-in merge function
-    model = model.merge_and_unload()
-
-    return model
-
-
-def sequential_lora_finetune(
-    model,
-    tokenizer,
-    phase: int,
-    batch_size: int = 64,
-    micro_batch_size: int = 4,
-    cutoff_len: int = 256,
-    lora_r: int = 8,
-    lora_alpha: int = 16,
-    lora_dropout: float = 0.05,
-    val_set_size: int = 2000,
-    data_path: str = "yahma/alpaca-cleaned",
-    num_epochs: int = 2,
-    learning_rate: float = 3e-4,
-    output_dir: str = "Checkpoints/tune",
-    use_wikitext: bool = False,
-):
-    """
-    Apply LoRA fine-tuning for one phase of sequential training.
-
-    Args:
-        model: The model to fine-tune
-        tokenizer: The tokenizer
-        phase: 1 for U projections, 2 for V projections
-        Other args: Standard LoRA training hyperparameters
-
-    Returns:
-        Fine-tuned model with LoRA weights merged
-    """
-    phase_name = "U projections" if phase == 1 else "V projections"
-    print(f"\n{'='*60}")
-    print(f"Phase {phase}: Fine-tuning {phase_name}")
-    print(f"{'='*60}")
+def apply_lora(model, tokenizer, batch_size=64, micro_batch_size=4, cutoff_len=256, add_eos_token=False,
+            lora_r=2, lora_alpha=16, lora_target_modules="q_proj,k_proj,v_proj,o_proj,gate_proj,down_proj,up_proj", 
+            lora_dropout=0.05, val_set_size=2000, data_path="yahma/alpaca-cleaned",num_epochs=2, learning_rate=1e-4, 
+            output_dir="Checkpoints/tune", group_by_length=False, extra_val_dataset=None):
 
     gradient_accumulation_steps = batch_size // micro_batch_size
     prompter = ZeroPrompter()
@@ -168,6 +67,7 @@ def sequential_lora_finetune(
             result["attention_mask"].append(1)
 
         result["labels"] = result["input_ids"].copy()
+
         return result
 
     def generate_and_tokenize_prompt(data_point):
@@ -180,16 +80,24 @@ def sequential_lora_finetune(
         user_prompt = prompter.generate_prompt(
             data_point["instruction"], data_point["input"]
         )
-        tokenized_user_prompt = tokenize(user_prompt, add_eos_token=False)
+        tokenized_user_prompt = tokenize(
+            user_prompt, add_eos_token=add_eos_token
+        )
         user_prompt_len = len(tokenized_user_prompt["input_ids"])
+
+        if add_eos_token:
+            user_prompt_len -= 1
 
         tokenized_full_prompt["labels"] = [
             -100
-        ] * user_prompt_len + tokenized_full_prompt["labels"][user_prompt_len:]
+        ] * user_prompt_len + tokenized_full_prompt["labels"][
+            user_prompt_len:
+        ]  # could be sped up, probably
         return tokenized_full_prompt
 
     def split_and_tokenizer(test_data, tokenizer, seq_len, field_name):
         test_ids = tokenizer("\n\n".join(test_data[field_name]), return_tensors='pt').input_ids[0]
+        test_ids_batch = []
         nsamples = test_ids.numel() // seq_len
 
         test_set = []
@@ -201,65 +109,43 @@ def sequential_lora_finetune(
             })
         return test_set
 
-    # Prepare model for LoRA
-    model = prepare_model_for_kbit_training(model)
-
-    # Get target modules for this phase
-    target_modules = get_target_modules_for_phase(phase)
-    print(f"  Target modules: {target_modules}")
-
-    # Check which target modules actually exist in the model
-    available_modules = set()
-    for name, _ in model.named_modules():
-        for target in target_modules:
-            if target in name:
-                available_modules.add(target)
-
-    if not available_modules:
-        print(f"  Warning: No target modules found for phase {phase}")
-        print(f"  Available module names (sample):")
-        for i, (name, _) in enumerate(model.named_modules()):
-            if i < 20:
-                print(f"    {name}")
-        return model
-
-    print(f"  Found modules: {list(available_modules)}")
-    target_modules = list(available_modules)
-
-    # Configure LoRA
+    # Prepare For LoRA
+    model = prepare_model_for_int8_training(model)
     config = LoraConfig(
         r=lora_r,
         lora_alpha=lora_alpha,
-        target_modules=target_modules,
+        target_modules=lora_target_modules.split(","),
         lora_dropout=lora_dropout,
         bias="none",
         task_type="CAUSAL_LM",
     )
     model = get_peft_model(model, config)
-    model.print_trainable_parameters()
+    model.print_trainable_parameters()  
 
-    # Load training data
-    if use_wikitext:
-        # Use wikitext2 for training (language modeling)
-        train_data, _ = wikitext2()
-        train_data = split_and_tokenizer(train_data, tokenizer, cutoff_len, 'text')
-        val_data = {"wikitext2": split_and_tokenizer(wikitext2()[1], tokenizer, 128, 'text')}
-    else:
-        # Use instruction dataset
-        data = load_dataset(data_path)
-        train_val = data["train"].train_test_split(
-            test_size=val_set_size, shuffle=True, seed=42
-        )
-        train_data = train_val["train"].shuffle().map(generate_and_tokenize_prompt)
-        val_data = {
-            data_path: train_val["test"].shuffle().map(generate_and_tokenize_prompt),
-        }
+    # Load Train Dataset
+    data = load_dataset(data_path)
+    train_val = data["train"].train_test_split(
+        test_size=val_set_size, shuffle=True, seed=42
+    )
+    train_data = (
+        train_val["train"].shuffle().map(generate_and_tokenize_prompt)
+    )
+    val_data = {
+        data_path: train_val["test"].shuffle().map(generate_and_tokenize_prompt),
+    }
+   
+    # Load Extra Validation Dataset
+    if extra_val_dataset:
+        seq_len = 128
+        for extra_dataset in extra_val_dataset.split(','):
+            if 'wikitext2' in extra_dataset:
+                _, test_data = wikitext2()
+                test_data = split_and_tokenizer(test_data, tokenizer, seq_len, field_name='text')
+            if 'ptb' in extra_dataset:
+                _, test_data = ptb()
+                test_data = split_and_tokenizer(test_data, tokenizer, seq_len, field_name='sentence')
+            val_data[extra_dataset] = test_data
 
-    # Create phase-specific output directory
-    phase_output_dir = os.path.join(output_dir, f"phase{phase}")
-    os.makedirs(phase_output_dir, exist_ok=True)
-
-    # Training
     trainer = transformers.Trainer(
         model=model,
         train_dataset=train_data,
@@ -278,19 +164,19 @@ def sequential_lora_finetune(
             save_strategy="steps",
             eval_steps=100,
             save_steps=200,
-            output_dir=phase_output_dir,
-            save_total_limit=3,
+            output_dir=output_dir,
+            save_total_limit=30,
             load_best_model_at_end=True,
             ddp_find_unused_parameters=None,
-            group_by_length=False,
+            group_by_length=group_by_length,
             report_to="none",
-            run_name=f"sequential_lora_phase{phase}",
+            run_name="none",
+            metric_for_best_model="{}_loss".format(data_path),
         ),
         data_collator=transformers.DataCollatorForSeq2Seq(
             tokenizer, pad_to_multiple_of=8, return_tensors="pt", padding=True
         ),
     )
-
     model.config.use_cache = False
     old_state_dict = model.state_dict
     model.state_dict = (
@@ -301,173 +187,208 @@ def sequential_lora_finetune(
 
     trainer.train()
     model.state_dict = old_state_dict
-
-    # Merge LoRA weights into base model
-    print(f"\n  Merging Phase {phase} LoRA weights...")
-    model = merge_lora_weights(model)
-
     return model
 
-
 def main(args):
-    """
-    Main function for sequential LoRA fine-tuning.
+    # Set WanDB
+    os.environ["WANDB_PROJECT"] = args.wandb_project
 
-    Implements the Sequential Low-rank Approximation strategy from SVD-LLM:
-    1. First freeze V projections and fine-tune U projections with LoRA
-    2. Then freeze U projections and fine-tune V projections with LoRA
-    3. Merge LoRA weights after each phase
-    """
-    print("="*60)
-    print("Sequential Low-rank Approximation (LoRA) Fine-tuning")
-    print("="*60)
-    print(f"  Input model: {args.prune_model}")
-    print(f"  Output dir: {args.output_dir}")
-    print(f"  LoRA rank: {args.lora_r}")
-    print(f"  Learning rate: {args.learning_rate}")
-    print(f"  Epochs per phase: {args.num_epochs}")
-
-    # Load compressed model
-    print("\nLoading compressed model...")
+    # Load Pruned Model
     pruned_dict = torch.load(args.prune_model, map_location='cpu')
-    tokenizer = pruned_dict['tokenizer']
-    model = pruned_dict['model']
+    tokenizer, model = pruned_dict['tokenizer'], pruned_dict['model']
+    gradient_accumulation_steps = args.batch_size // args.micro_batch_size
+    if not args.no_instruction:
+        prompter = Prompter(args.prompt_template_name)
+    else:
+        prompter = ZeroPrompter()
 
-    # Move to device
     if device == 'cuda':
-        model = model.cuda()
+        model.half()
 
-    # Create output directory
-    os.makedirs(args.output_dir, exist_ok=True)
+    tokenizer.pad_token_id = 0
+    tokenizer.padding_side = "left"
 
-    # Phase 1: Fine-tune U projections
-    if not args.skip_phase1:
-        model = sequential_lora_finetune(
-            model=model,
-            tokenizer=tokenizer,
-            phase=1,
-            batch_size=args.batch_size,
-            micro_batch_size=args.micro_batch_size,
-            cutoff_len=args.cutoff_len,
-            lora_r=args.lora_r,
-            lora_alpha=args.lora_alpha,
-            lora_dropout=args.lora_dropout,
-            val_set_size=args.val_set_size,
-            data_path=args.data_path,
-            num_epochs=args.num_epochs,
-            learning_rate=args.learning_rate,
-            output_dir=args.output_dir,
-            use_wikitext=args.use_wikitext,
+    def tokenize(prompt, add_eos_token=True):
+        result = tokenizer(
+            prompt,
+            truncation=True,
+            max_length=args.cutoff_len,
+            padding=False,
+            return_tensors=None,
         )
+        if (
+            result["input_ids"][-1] != tokenizer.eos_token_id
+            and len(result["input_ids"]) < args.cutoff_len
+            and add_eos_token
+        ):
+            result["input_ids"].append(tokenizer.eos_token_id)
+            result["attention_mask"].append(1)
 
-        # Save intermediate model
-        if args.save_intermediate:
-            print("\nSaving model after Phase 1...")
-            torch.save(
-                {'model': model, 'tokenizer': tokenizer},
-                os.path.join(args.output_dir, "model_after_phase1.pt")
+        result["labels"] = result["input_ids"].copy()
+
+        return result
+
+    def generate_and_tokenize_prompt(data_point):
+        full_prompt = prompter.generate_prompt(
+            data_point["instruction"],
+            data_point["input"],
+            data_point["output"],
+        )
+        tokenized_full_prompt = tokenize(full_prompt)
+        if not args.train_on_inputs:
+            user_prompt = prompter.generate_prompt(
+                data_point["instruction"], data_point["input"]
             )
+            tokenized_user_prompt = tokenize(
+                user_prompt, add_eos_token=args.add_eos_token
+            )
+            user_prompt_len = len(tokenized_user_prompt["input_ids"])
 
-    # Phase 2: Fine-tune V projections
-    if not args.skip_phase2:
-        model = sequential_lora_finetune(
-            model=model,
-            tokenizer=tokenizer,
-            phase=2,
-            batch_size=args.batch_size,
-            micro_batch_size=args.micro_batch_size,
-            cutoff_len=args.cutoff_len,
-            lora_r=args.lora_r,
-            lora_alpha=args.lora_alpha,
-            lora_dropout=args.lora_dropout,
-            val_set_size=args.val_set_size,
-            data_path=args.data_path,
-            num_epochs=args.num_epochs,
+            if args.add_eos_token:
+                user_prompt_len -= 1
+
+            tokenized_full_prompt["labels"] = [
+                -100
+            ] * user_prompt_len + tokenized_full_prompt["labels"][
+                user_prompt_len:
+            ]  # could be sped up, probably
+        return tokenized_full_prompt
+
+    def split_and_tokenizer(test_data, tokenizer, seq_len, field_name):
+        test_ids = tokenizer("\n\n".join(test_data[field_name]), return_tensors='pt').input_ids[0]
+        test_ids_batch = []
+        nsamples = test_ids.numel() // seq_len
+
+        test_set = []
+        for i in range(nsamples):
+            batch = test_ids[(i * seq_len):((i + 1) * seq_len)]
+            test_set.append({
+                'input_ids': batch,
+                'labels': batch
+            })
+        return test_set
+
+    # Prepare For LoRA
+    model = prepare_model_for_int8_training(model)
+    config = LoraConfig(
+        r=args.lora_r,
+        lora_alpha=args.lora_alpha,
+        target_modules=args.lora_target_modules.split(","),
+        lora_dropout=args.lora_dropout,
+        bias="none",
+        task_type="CAUSAL_LM",
+    )
+    model = get_peft_model(model, config)
+    model.print_trainable_parameters()  
+
+    # Load Train Dataset
+    data = load_dataset(args.data_path)
+    train_val = data["train"].train_test_split(
+        test_size=args.val_set_size, shuffle=True, seed=42
+    )
+    train_data = (
+        train_val["train"].shuffle().map(generate_and_tokenize_prompt)
+    )
+    val_data = {
+        args.data_path: train_val["test"].shuffle().map(generate_and_tokenize_prompt),
+    }
+   
+    # Load Extra Validation Dataset
+    if args.extra_val_dataset:
+        seq_len = 128
+        for extra_dataset in args.extra_val_dataset.split(','):
+            if 'wikitext2' in extra_dataset:
+                _, test_data = wikitext2()
+                test_data = split_and_tokenizer(test_data, tokenizer, seq_len, field_name='text')
+            if 'ptb' in extra_dataset:
+                _, test_data = ptb()
+                test_data = split_and_tokenizer(test_data, tokenizer, seq_len, field_name='sentence')
+            val_data[extra_dataset] = test_data
+
+    trainer = transformers.Trainer(
+        model=model,
+        train_dataset=train_data,
+        eval_dataset=val_data,
+        args=transformers.TrainingArguments(
+            per_device_train_batch_size=args.micro_batch_size,
+            gradient_accumulation_steps=gradient_accumulation_steps,
+            warmup_steps=100,
+            num_train_epochs=args.num_epochs,
             learning_rate=args.learning_rate,
+            fp16=True,
+            logging_steps=10,
+            logging_first_step=True,
+            optim="adamw_torch",
+            evaluation_strategy="steps",
+            save_strategy="steps",
+            save_safetensors=False,
+            eval_steps=100,
+            save_steps=200,
             output_dir=args.output_dir,
-            use_wikitext=args.use_wikitext,
+            save_total_limit=20,
+            load_best_model_at_end=True,
+            ddp_find_unused_parameters=None,
+            group_by_length=args.group_by_length,
+            report_to="none",
+            run_name="none",
+            metric_for_best_model="{}_loss".format(args.data_path),
+        ),
+        data_collator=transformers.DataCollatorForSeq2Seq(
+            tokenizer, pad_to_multiple_of=8, return_tensors="pt", padding=True
+        ),
+    )
+    model.config.use_cache = False
+    old_state_dict = model.state_dict
+    model.state_dict = (
+        lambda self, *_, **__: get_peft_model_state_dict(
+            self, old_state_dict()
         )
+    ).__get__(model, type(model))
 
-    # Save final model
-    print("\n" + "="*60)
-    print("Saving final model...")
-    final_path = os.path.join(args.output_dir, "model_final.pt")
-    torch.save({'model': model, 'tokenizer': tokenizer}, final_path)
-    print(f"  Saved to: {final_path}")
+    trainer.train(resume_from_checkpoint=args.resume_from_checkpoint)
 
-    # Evaluate final model
-    if args.evaluate:
-        print("\nEvaluating final model...")
-        from utils.eval_utils import ppl_eval
-
-        model = model.float().to(device)
-        ppl_eval(
-            model, tokenizer,
-            datasets=['wikitext2'],
-            model_seq_len=args.model_seq_len,
-            batch_size=args.eval_batch_size,
-            device=device
-        )
-
-    print("\n" + "="*60)
-    print("Sequential LoRA fine-tuning completed!")
-    print("="*60)
-
-    return model, tokenizer
+    model.state_dict = old_state_dict
+    model.save_pretrained(args.output_dir, safe_serialization=False)
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description='Sequential LoRA Fine-tuning for SVD-LLM')
+    parser = argparse.ArgumentParser(description='Tuning Pruned LLM')
 
-    # Model paths
-    parser.add_argument('--prune_model', type=str, required=True,
-                        help='Path to compressed model (.pt file)')
-    parser.add_argument('--output_dir', type=str, default='./lora_output',
-                        help='Output directory for checkpoints')
+    # Model Type&Path
+    parser.add_argument('--base_model', type=str, default="decapoda-research/llama-7b-hf", help='base model name')
+    parser.add_argument('--prune_model', type=str, help='prune model name')
+    parser.add_argument('--data_path', type=str, default="yahma/alpaca-cleaned", help='data path')
+    # parser.add_argument('--extra_val_dataset', type=str, default='wikitext2,ptb', help='validation datasets. Split with ","')
+    parser.add_argument('--extra_val_dataset', type=str, default=None, help='validation datasets. Split with ","')
+    parser.add_argument('--output_dir', type=str, default="./lora-alpaca", help='output directory')
 
-    # Training hyperparameters
-    parser.add_argument('--batch_size', type=int, default=64,
-                        help='Total batch size')
-    parser.add_argument('--micro_batch_size', type=int, default=4,
-                        help='Micro batch size per GPU')
-    parser.add_argument('--num_epochs', type=int, default=2,
-                        help='Number of epochs per phase')
-    parser.add_argument('--learning_rate', type=float, default=3e-4,
-                        help='Learning rate')
-    parser.add_argument('--cutoff_len', type=int, default=256,
-                        help='Maximum sequence length')
-    parser.add_argument('--val_set_size', type=int, default=2000,
-                        help='Validation set size')
+    # Training Hyperparameters
+    parser.add_argument('--batch_size', type=int, default=128, help='batch size')
+    parser.add_argument('--micro_batch_size', type=int, default=4, help='micro batch size')
+    parser.add_argument('--num_epochs', type=int, default=5, help='number of epochs')
+    parser.add_argument('--learning_rate', type=float, default=3e-4, help='learning rate')
+    parser.add_argument('--cutoff_len', type=int, default=256, help='cutoff length')
+    parser.add_argument('--val_set_size', type=int, default=2000, help='validation set size')
+    parser.add_argument('--prompt_template_name', type=str, default="alpaca", help="The prompt template to use, will default to alpaca.")
+    parser.add_argument('--no_instruction', action='store_true', default=False, help="Whether to use the instruction template or not.")
 
-    # LoRA configuration
-    parser.add_argument('--lora_r', type=int, default=8,
-                        help='LoRA rank')
-    parser.add_argument('--lora_alpha', type=int, default=16,
-                        help='LoRA alpha')
-    parser.add_argument('--lora_dropout', type=float, default=0.05,
-                        help='LoRA dropout')
+    # Lora Configuration
+    parser.add_argument('--lora_r', type=int, default=8, help='lora r')
+    parser.add_argument('--lora_alpha', type=int, default=16, help='lora alpha')
+    parser.add_argument('--lora_dropout', type=float, default=0.05, help='lora dropout')
+    parser.add_argument('--lora_target_modules', type=str, default="q_v_proj,q_u_proj,k_v_proj,k_u_proj,v_u_proj,v_v_proj,o_u_proj,o_v_proj,gate_u_proj,gate_v_proj,down_u_proj,down_v_proj,up_u_proj,up_v_proj", help='lora target modules')
 
-    # Data
-    parser.add_argument('--data_path', type=str, default='yahma/alpaca-cleaned',
-                        help='Training data path')
-    parser.add_argument('--use_wikitext', action='store_true',
-                        help='Use wikitext2 for training instead of instruction data')
-
-    # Phase control
-    parser.add_argument('--skip_phase1', action='store_true',
-                        help='Skip Phase 1 (U projection training)')
-    parser.add_argument('--skip_phase2', action='store_true',
-                        help='Skip Phase 2 (V projection training)')
-    parser.add_argument('--save_intermediate', action='store_true',
-                        help='Save model after each phase')
-
-    # Evaluation
-    parser.add_argument('--evaluate', action='store_true',
-                        help='Evaluate model after training')
-    parser.add_argument('--model_seq_len', type=int, default=2048,
-                        help='Model sequence length for evaluation')
-    parser.add_argument('--eval_batch_size', type=int, default=1,
-                        help='Batch size for evaluation')
-
+    # llm hyperparameters
+    parser.add_argument('--train_on_inputs', default=False, action="store_true", help='Train on inputs. If False, masks out inputs in loss')
+    parser.add_argument('--add_eos_token', default=False, action="store_true")
+    parser.add_argument('--group_by_length', default=False, action="store_true", help="faster, but produces an odd training loss curve")
+   
+    # wandb params
+    parser.add_argument('--wandb_project', type=str, default="")
+    parser.add_argument('--resume_from_checkpoint', type=str, help="either training checkpoint or final adapter")
+   
     args = parser.parse_args()
+    torch_version = int(torch.__version__.split('.')[1])
+    args.torch_version = torch_version
+
     main(args)
