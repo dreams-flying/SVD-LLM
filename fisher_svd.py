@@ -3752,9 +3752,22 @@ class FisherAwareSVD:
         """
         print(f"Phase 5: End-to-End Gradient Calibration ({num_steps} steps, lr={lr})...")
 
-        # Get model dtype and move to device (keep original dtype for memory efficiency)
+        # CRITICAL: Clear GPU memory before starting Phase 5
+        # Previous phases may have left tensors on GPU
+        self.model = self.model.cpu()
+        torch.cuda.empty_cache()
+        import gc
+        gc.collect()
+        torch.cuda.empty_cache()
+
+        # Get model dtype
         model_dtype = next(iter(self.model.parameters())).dtype
         print(f"  Model dtype: {model_dtype}")
+
+        # Get available GPU memory
+        if torch.cuda.is_available():
+            free_mem = torch.cuda.get_device_properties(0).total_memory - torch.cuda.memory_allocated(0)
+            print(f"  Available GPU memory: {free_mem / 1024**3:.1f} GB")
 
         # Move model to device
         self.model = self.model.to(self.device)
@@ -3766,7 +3779,7 @@ class FisherAwareSVD:
         # don't have requires_grad=True, causing the checkpoint to fail.
         # Instead, we rely on memory savings from:
         # 1. Frozen parameters don't store gradients
-        # 2. Mixed precision training (float16)
+        # 2. Model stays in float16
 
         # Collect trainable parameters (SVD layers and blocks)
         trainable_params = []
@@ -3816,6 +3829,10 @@ class FisherAwareSVD:
         accumulated_loss = 0.0
         acc_steps = 0
 
+        # Truncate sequence length for memory efficiency
+        max_seq_len = 512  # Reduced from 2048 to save memory
+        print(f"  Truncating sequences to {max_seq_len} tokens for memory efficiency")
+
         while step < num_steps:
             # Get batch (cycle through data if needed)
             try:
@@ -3823,6 +3840,11 @@ class FisherAwareSVD:
             except StopIteration:
                 data_iter = iter(calib_loader)
                 batch = next(data_iter)
+
+            # Truncate sequences to save memory
+            for k in batch:
+                if batch[k].dim() >= 2 and batch[k].shape[1] > max_seq_len:
+                    batch[k] = batch[k][:, :max_seq_len]
 
             # Move batch to device
             batch = {k: v.to(self.device) for k, v in batch.items()}
@@ -3833,7 +3855,7 @@ class FisherAwareSVD:
                 if 'labels' not in batch and 'input_ids' in batch:
                     batch['labels'] = batch['input_ids'].clone()
 
-                # Forward pass (no autocast for stability)
+                # Forward pass
                 outputs = self.model(**batch)
 
                 # Compute loss manually if model doesn't return it
@@ -3865,10 +3887,21 @@ class FisherAwareSVD:
                     continue
 
                 loss = loss / gradient_accumulation
+            except RuntimeError as e:
+                if "out of memory" in str(e).lower():
+                    print(f"  OOM error, clearing cache and reducing sequence length...")
+                    optimizer.zero_grad()
+                    torch.cuda.empty_cache()
+                    # Try with shorter sequence next time
+                    max_seq_len = max(128, max_seq_len // 2)
+                    print(f"  New max_seq_len: {max_seq_len}")
+                    continue
+                else:
+                    print(f"  Warning: Forward pass failed ({e}), skipping batch")
+                    optimizer.zero_grad()
+                    continue
             except Exception as e:
                 print(f"  Warning: Forward pass failed ({e}), skipping batch")
-                import traceback
-                traceback.print_exc()
                 optimizer.zero_grad()
                 continue
 
