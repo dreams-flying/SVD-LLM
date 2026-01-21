@@ -3800,34 +3800,38 @@ class FisherAwareSVD:
         total_params = sum(p.numel() for p in trainable_params)
         print(f"  Trainable parameters: {total_params:,} ({len(trainable_params)} tensors)")
 
-        # Check initial parameter statistics and sanitize if needed
+        # Check initial parameter statistics (DO NOT clamp - large values are normal for SVD)
         param_stats = []
         params_fixed = 0
+        max_param_val = 0.0
         for name, param in zip(trainable_names, trainable_params):
             pmin, pmax = param.min().item(), param.max().item()
             pmean, pstd = param.float().mean().item(), param.float().std().item()
             param_stats.append((name.split('.')[-2], pmin, pmax, pmean, pstd))
+            max_param_val = max(max_param_val, abs(pmin), abs(pmax))
 
-            # Fix any NaN/Inf in initial parameters
+            # ONLY fix NaN/Inf - do NOT clamp large values (they are normal for SVD)
             if torch.isnan(param).any() or torch.isinf(param).any():
                 print(f"  Warning: {name} has NaN/Inf, reinitializing...")
                 nn.init.xavier_uniform_(param.data)
-                params_fixed += 1
-            # Clamp extreme initial values
-            elif abs(pmin) > 10 or abs(pmax) > 10:
-                param.data.clamp_(-10.0, 10.0)
                 params_fixed += 1
 
         # Print sample parameter stats
         if param_stats:
             sample_stats = param_stats[:3]
             print(f"  Sample param stats: {[(s[0], f'min={s[1]:.2f}', f'max={s[2]:.2f}') for s in sample_stats]}")
+            print(f"  Max parameter magnitude: {max_param_val:.2f}")
         if params_fixed > 0:
-            print(f"  Fixed {params_fixed} parameters with extreme values")
+            print(f"  Fixed {params_fixed} parameters with NaN/Inf")
 
-        # Optimizer with weight decay - use smaller lr if gradients seem large
-        # Default lr=1e-5 can be too large for SVD layers
+        # Use adaptive learning rate based on parameter magnitude
+        # Larger parameters need smaller learning rates to prevent instability
         effective_lr = lr
+        if max_param_val > 10:
+            # Scale down lr for large parameter values
+            lr_scale = 10.0 / max_param_val
+            effective_lr = lr * lr_scale
+            print(f"  Scaling lr by {lr_scale:.3f} due to large parameter values")
         print(f"  Using learning rate: {effective_lr:.2e}")
         optimizer = torch.optim.AdamW(trainable_params, lr=effective_lr, weight_decay=0.01)
 
@@ -4005,33 +4009,45 @@ class FisherAwareSVD:
                         grad_norm += param.grad.data.norm(2).item() ** 2
                 grad_norm = grad_norm ** 0.5
 
-                # Aggressive gradient clipping for stability (0.5 instead of 1.0)
-                torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=0.5)
+                # Skip update if gradient norm is too large (indicates instability)
+                # This is safer than aggressive clipping which can destroy gradients
+                if grad_norm > 1000:
+                    nan_count += 1
+                    if nan_count <= 5:
+                        print(f"  Warning: Gradient norm too large ({grad_norm:.1f}), skipping update")
+                    optimizer.zero_grad()
+                    accumulated_loss = 0.0
+                    acc_steps = 0
+                    continue
+
+                # Gradient clipping with adaptive max_norm based on parameter scale
+                # Use larger clip value since parameters can be large in SVD
+                torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=10.0)
 
                 # Optimizer step
                 optimizer.step()
                 scheduler.step()
                 optimizer.zero_grad()
 
-                # CRITICAL: Check and clamp parameter values after update
-                # This prevents parameter explosion which causes NaN in subsequent forward passes
+                # Check for NaN parameters after update (but do NOT clamp values)
+                # Large parameter values are normal for SVD layers
                 param_nan_found = False
                 for param in trainable_params:
                     if torch.isnan(param).any() or torch.isinf(param).any():
                         param_nan_found = True
-                        # Replace NaN/Inf with zeros (emergency recovery)
-                        param.data = torch.where(
-                            torch.isnan(param.data) | torch.isinf(param.data),
-                            torch.zeros_like(param.data),
-                            param.data
-                        )
-                    # Clamp parameter values to prevent explosion
-                    param.data.clamp_(-10.0, 10.0)
+                        # Replace only NaN/Inf with the mean of valid values
+                        valid_mask = ~(torch.isnan(param.data) | torch.isinf(param.data))
+                        if valid_mask.any():
+                            valid_mean = param.data[valid_mask].mean()
+                            param.data = torch.where(valid_mask, param.data, valid_mean)
+                        else:
+                            param.data.zero_()
+                        break  # Only need to detect once
 
                 if param_nan_found:
                     nan_count += 1
                     if nan_count <= 3:
-                        print(f"  Warning: NaN in parameters after update (grad_norm={grad_norm:.2f}), clamped")
+                        print(f"  Warning: NaN in parameters after update (grad_norm={grad_norm:.2f})")
 
                 step += 1
                 total_loss += accumulated_loss * gradient_accumulation
