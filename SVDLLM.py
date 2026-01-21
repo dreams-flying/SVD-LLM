@@ -547,7 +547,7 @@ if __name__ == '__main__':
     # Phase 5: End-to-End Gradient Calibration
     parser.add_argument('--use_e2e_calibration', action='store_true', help='Use end-to-end gradient calibration (Phase 5) after compression')
     parser.add_argument('--e2e_steps', type=int, default=50, help='Number of gradient steps for E2E calibration (default: 50)')
-    parser.add_argument('--e2e_lr', type=float, default=1e-5, help='Learning rate for E2E calibration (default: 1e-5)')
+    parser.add_argument('--e2e_lr', type=float, default=1e-6, help='Learning rate for E2E calibration (default: 1e-6, conservative for stability)')
 
     args = parser.parse_args()
     # Handle --no_als flag

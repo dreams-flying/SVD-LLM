@@ -3800,8 +3800,36 @@ class FisherAwareSVD:
         total_params = sum(p.numel() for p in trainable_params)
         print(f"  Trainable parameters: {total_params:,} ({len(trainable_params)} tensors)")
 
-        # Optimizer with weight decay
-        optimizer = torch.optim.AdamW(trainable_params, lr=lr, weight_decay=0.01)
+        # Check initial parameter statistics and sanitize if needed
+        param_stats = []
+        params_fixed = 0
+        for name, param in zip(trainable_names, trainable_params):
+            pmin, pmax = param.min().item(), param.max().item()
+            pmean, pstd = param.float().mean().item(), param.float().std().item()
+            param_stats.append((name.split('.')[-2], pmin, pmax, pmean, pstd))
+
+            # Fix any NaN/Inf in initial parameters
+            if torch.isnan(param).any() or torch.isinf(param).any():
+                print(f"  Warning: {name} has NaN/Inf, reinitializing...")
+                nn.init.xavier_uniform_(param.data)
+                params_fixed += 1
+            # Clamp extreme initial values
+            elif abs(pmin) > 10 or abs(pmax) > 10:
+                param.data.clamp_(-10.0, 10.0)
+                params_fixed += 1
+
+        # Print sample parameter stats
+        if param_stats:
+            sample_stats = param_stats[:3]
+            print(f"  Sample param stats: {[(s[0], f'min={s[1]:.2f}', f'max={s[2]:.2f}') for s in sample_stats]}")
+        if params_fixed > 0:
+            print(f"  Fixed {params_fixed} parameters with extreme values")
+
+        # Optimizer with weight decay - use smaller lr if gradients seem large
+        # Default lr=1e-5 can be too large for SVD layers
+        effective_lr = lr
+        print(f"  Using learning rate: {effective_lr:.2e}")
+        optimizer = torch.optim.AdamW(trainable_params, lr=effective_lr, weight_decay=0.01)
 
         # Learning rate scheduler with warmup
         def lr_lambda(step):
@@ -3825,13 +3853,16 @@ class FisherAwareSVD:
         # Get initial loss for comparison
         initial_loss = None
 
-        pbar = tqdm(total=num_steps, desc="Phase 5 E2E Calibration")
-        accumulated_loss = 0.0
-        acc_steps = 0
-
         # Truncate sequence length for memory efficiency
         max_seq_len = 512  # Reduced from 2048 to save memory
         print(f"  Truncating sequences to {max_seq_len} tokens for memory efficiency")
+
+        pbar = tqdm(total=num_steps, desc="Phase 5 E2E Calibration")
+        accumulated_loss = 0.0
+        acc_steps = 0
+        nan_count = 0  # Track NaN occurrences
+        max_nan_allowed = 20  # Early stop if too many NaN
+        consecutive_nan = 0  # Track consecutive NaN for early stopping
 
         while step < num_steps:
             # Get batch (cycle through data if needed)
@@ -3858,29 +3889,58 @@ class FisherAwareSVD:
                 # Forward pass
                 outputs = self.model(**batch)
 
-                # Compute loss manually if model doesn't return it
-                if outputs.loss is not None:
-                    loss = outputs.loss
+                # Get logits and check for NaN/Inf BEFORE computing loss
+                logits = outputs.logits
+                if torch.isnan(logits).any() or torch.isinf(logits).any():
+                    nan_count += 1
+                    consecutive_nan += 1
+                    if nan_count <= 3:
+                        # Debug: check which parameters have NaN
+                        nan_params = [n for n, p in zip(trainable_names, trainable_params)
+                                      if torch.isnan(p).any() or torch.isinf(p).any()]
+                        print(f"  Warning: NaN/Inf in logits (count={nan_count}), NaN params: {nan_params[:3]}")
+                    # Early stopping if too many NaN
+                    if nan_count >= max_nan_allowed or consecutive_nan >= 5:
+                        print(f"  ERROR: Too many NaN ({nan_count}), stopping Phase 5")
+                        break
+                    optimizer.zero_grad()
+                    del outputs
+                    torch.cuda.empty_cache()
+                    continue
                 else:
-                    # Manual cross-entropy loss for causal LM
-                    logits = outputs.logits
-                    labels = batch.get('labels', batch['input_ids'])
+                    consecutive_nan = 0  # Reset on successful forward
 
-                    # Shift for causal LM: predict next token
-                    shift_logits = logits[..., :-1, :].contiguous()
-                    shift_labels = labels[..., 1:].contiguous()
+                # Compute loss manually (more stable than relying on model.loss)
+                labels = batch.get('labels', batch['input_ids'])
 
-                    # Compute cross-entropy loss
-                    loss_fct = nn.CrossEntropyLoss()
-                    loss = loss_fct(
-                        shift_logits.view(-1, shift_logits.size(-1)),
-                        shift_labels.view(-1)
-                    )
+                # Shift for causal LM: predict next token
+                shift_logits = logits[..., :-1, :].contiguous()
+                shift_labels = labels[..., 1:].contiguous()
+
+                # Compute cross-entropy loss in float32 with log_softmax for numerical stability
+                # Clamp logits to prevent overflow in softmax
+                shift_logits_f32 = shift_logits.float()
+                shift_logits_f32 = torch.clamp(shift_logits_f32, min=-100, max=100)
+
+                loss_fct = nn.CrossEntropyLoss()
+                loss = loss_fct(
+                    shift_logits_f32.view(-1, shift_logits_f32.size(-1)),
+                    shift_labels.view(-1)
+                )
+
+                # Check for NaN loss
+                if torch.isnan(loss) or torch.isinf(loss):
+                    nan_count += 1
+                    if nan_count <= 3:
+                        print(f"  Warning: NaN/Inf loss detected (count={nan_count}), skipping batch")
+                    optimizer.zero_grad()
+                    del outputs, loss
+                    torch.cuda.empty_cache()
+                    continue
 
                 # Check if loss requires grad
                 if not loss.requires_grad:
                     print(f"  Warning: Loss does not require grad, checking parameters...")
-                    # Debug: check which parameters require grad
                     grad_params = sum(1 for p in self.model.parameters() if p.requires_grad)
                     print(f"    Parameters requiring grad: {grad_params}")
                     optimizer.zero_grad()
@@ -3892,7 +3952,6 @@ class FisherAwareSVD:
                     print(f"  OOM error, clearing cache and reducing sequence length...")
                     optimizer.zero_grad()
                     torch.cuda.empty_cache()
-                    # Try with shorter sequence next time
                     max_seq_len = max(128, max_seq_len // 2)
                     print(f"  New max_seq_len: {max_seq_len}")
                     continue
@@ -3912,27 +3971,77 @@ class FisherAwareSVD:
 
             # Backward pass
             loss.backward()
+
+            # Check for NaN gradients
+            has_nan_grad = False
+            for param in trainable_params:
+                if param.grad is not None and (torch.isnan(param.grad).any() or torch.isinf(param.grad).any()):
+                    has_nan_grad = True
+                    break
+
+            if has_nan_grad:
+                nan_count += 1
+                consecutive_nan += 1
+                if nan_count <= 3:
+                    print(f"  Warning: NaN gradient detected, skipping update")
+                # Early stopping if too many NaN
+                if nan_count >= max_nan_allowed or consecutive_nan >= 5:
+                    print(f"  ERROR: Too many NaN gradients ({nan_count}), stopping Phase 5")
+                    break
+                optimizer.zero_grad()
+                continue
+            else:
+                consecutive_nan = 0  # Reset on successful backward
+
             accumulated_loss += loss.item()
             acc_steps += 1
 
             # Update weights after accumulation
             if acc_steps >= gradient_accumulation:
-                # Gradient clipping for stability
-                torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=1.0)
+                # Compute gradient norm before clipping for diagnostics
+                grad_norm = 0.0
+                for param in trainable_params:
+                    if param.grad is not None:
+                        grad_norm += param.grad.data.norm(2).item() ** 2
+                grad_norm = grad_norm ** 0.5
+
+                # Aggressive gradient clipping for stability (0.5 instead of 1.0)
+                torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=0.5)
 
                 # Optimizer step
                 optimizer.step()
                 scheduler.step()
                 optimizer.zero_grad()
 
+                # CRITICAL: Check and clamp parameter values after update
+                # This prevents parameter explosion which causes NaN in subsequent forward passes
+                param_nan_found = False
+                for param in trainable_params:
+                    if torch.isnan(param).any() or torch.isinf(param).any():
+                        param_nan_found = True
+                        # Replace NaN/Inf with zeros (emergency recovery)
+                        param.data = torch.where(
+                            torch.isnan(param.data) | torch.isinf(param.data),
+                            torch.zeros_like(param.data),
+                            param.data
+                        )
+                    # Clamp parameter values to prevent explosion
+                    param.data.clamp_(-10.0, 10.0)
+
+                if param_nan_found:
+                    nan_count += 1
+                    if nan_count <= 3:
+                        print(f"  Warning: NaN in parameters after update (grad_norm={grad_norm:.2f}), clamped")
+
                 step += 1
                 total_loss += accumulated_loss * gradient_accumulation
 
-                # Update progress bar
+                # Update progress bar with gradient norm for diagnostics
                 avg_loss = accumulated_loss * gradient_accumulation
                 pbar.set_postfix({
                     'loss': f'{avg_loss:.4f}',
-                    'lr': f'{scheduler.get_last_lr()[0]:.2e}'
+                    'lr': f'{scheduler.get_last_lr()[0]:.2e}',
+                    'gnorm': f'{grad_norm:.1f}'
                 })
                 pbar.update(1)
 
@@ -3946,8 +4055,9 @@ class FisherAwareSVD:
         pbar.close()
 
         # Final loss
-        final_loss = total_loss / num_steps if num_steps > 0 else 0
-        if initial_loss is not None and initial_loss > 0:
+        final_loss = total_loss / max(step, 1) if step > 0 else 0
+        print(f"  Phase 5 completed: {step}/{num_steps} steps, NaN events: {nan_count}")
+        if initial_loss is not None and initial_loss > 0 and final_loss > 0:
             improvement = (1 - final_loss / initial_loss) * 100
             print(f"  Final loss: {final_loss:.4f} (improvement: {improvement:.1f}%)")
         else:
