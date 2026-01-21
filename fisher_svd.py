@@ -3759,18 +3759,24 @@ class FisherAwareSVD:
         # Move model to device
         self.model = self.model.to(self.device)
 
-        # Enable gradient checkpointing for memory efficiency
-        if hasattr(self.model, 'gradient_checkpointing_enable'):
-            self.model.gradient_checkpointing_enable()
-            print("  Gradient checkpointing enabled")
+        # NOTE: Do NOT enable gradient checkpointing here!
+        # Gradient checkpointing is incompatible with partial parameter training
+        # because it requires inputs to have requires_grad=True.
+        # Since we only train SVD layers (u_proj, v_proj), the embedding outputs
+        # don't have requires_grad=True, causing the checkpoint to fail.
+        # Instead, we rely on memory savings from:
+        # 1. Frozen parameters don't store gradients
+        # 2. Mixed precision training (float16)
 
         # Collect trainable parameters (SVD layers and blocks)
         trainable_params = []
+        trainable_names = []
         for name, param in self.model.named_parameters():
             # Only train SVD projection layers (u_proj, v_proj) and block values
             if any(x in name for x in ['u_proj', 'v_proj', 'block_vals']):
                 param.requires_grad = True
                 trainable_params.append(param)
+                trainable_names.append(name)
             else:
                 param.requires_grad = False
 
@@ -3779,7 +3785,7 @@ class FisherAwareSVD:
             return
 
         total_params = sum(p.numel() for p in trainable_params)
-        print(f"  Trainable parameters: {total_params:,}")
+        print(f"  Trainable parameters: {total_params:,} ({len(trainable_params)} tensors)")
 
         # Optimizer with weight decay
         optimizer = torch.optim.AdamW(trainable_params, lr=lr, weight_decay=0.01)
@@ -3792,11 +3798,10 @@ class FisherAwareSVD:
 
         scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
-        # Mixed precision training for speed and memory (only if model is float16/bfloat16)
-        use_amp = model_dtype in [torch.float16, torch.bfloat16]
-        scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
-        if use_amp:
-            print(f"  Mixed precision training enabled (AMP with {model_dtype})")
+        # NOTE: We don't use AMP (mixed precision) here because:
+        # 1. AMP with partial parameter training can cause gradient issues
+        # 2. The model is already in float16, so memory is manageable
+        print(f"  Training without AMP for gradient stability")
 
         # Training loop
         self.model.train()
@@ -3819,38 +3824,47 @@ class FisherAwareSVD:
                 data_iter = iter(calib_loader)
                 batch = next(data_iter)
 
-            # Move batch to device (keep original dtype)
+            # Move batch to device
             batch = {k: v.to(self.device) for k, v in batch.items()}
 
-            # Forward pass with mixed precision
+            # Forward pass
             try:
-                with torch.cuda.amp.autocast(enabled=use_amp, dtype=model_dtype if use_amp else None):
-                    # Ensure labels are provided for loss computation
-                    if 'labels' not in batch and 'input_ids' in batch:
-                        batch['labels'] = batch['input_ids'].clone()
+                # Ensure labels are provided for loss computation
+                if 'labels' not in batch and 'input_ids' in batch:
+                    batch['labels'] = batch['input_ids'].clone()
 
-                    outputs = self.model(**batch)
+                # Forward pass (no autocast for stability)
+                outputs = self.model(**batch)
 
-                    # Compute loss manually if model doesn't return it
-                    if outputs.loss is not None:
-                        loss = outputs.loss
-                    else:
-                        # Manual cross-entropy loss for causal LM
-                        logits = outputs.logits
-                        labels = batch.get('labels', batch['input_ids'])
+                # Compute loss manually if model doesn't return it
+                if outputs.loss is not None:
+                    loss = outputs.loss
+                else:
+                    # Manual cross-entropy loss for causal LM
+                    logits = outputs.logits
+                    labels = batch.get('labels', batch['input_ids'])
 
-                        # Shift for causal LM: predict next token
-                        shift_logits = logits[..., :-1, :].contiguous()
-                        shift_labels = labels[..., 1:].contiguous()
+                    # Shift for causal LM: predict next token
+                    shift_logits = logits[..., :-1, :].contiguous()
+                    shift_labels = labels[..., 1:].contiguous()
 
-                        # Compute cross-entropy loss
-                        loss_fct = nn.CrossEntropyLoss()
-                        loss = loss_fct(
-                            shift_logits.view(-1, shift_logits.size(-1)),
-                            shift_labels.view(-1)
-                        )
+                    # Compute cross-entropy loss
+                    loss_fct = nn.CrossEntropyLoss()
+                    loss = loss_fct(
+                        shift_logits.view(-1, shift_logits.size(-1)),
+                        shift_labels.view(-1)
+                    )
 
-                    loss = loss / gradient_accumulation
+                # Check if loss requires grad
+                if not loss.requires_grad:
+                    print(f"  Warning: Loss does not require grad, checking parameters...")
+                    # Debug: check which parameters require grad
+                    grad_params = sum(1 for p in self.model.parameters() if p.requires_grad)
+                    print(f"    Parameters requiring grad: {grad_params}")
+                    optimizer.zero_grad()
+                    continue
+
+                loss = loss / gradient_accumulation
             except Exception as e:
                 print(f"  Warning: Forward pass failed ({e}), skipping batch")
                 import traceback
@@ -3863,22 +3877,18 @@ class FisherAwareSVD:
                 initial_loss = loss.item() * gradient_accumulation
                 print(f"  Initial loss: {initial_loss:.4f}")
 
-            # Backward pass with gradient scaling
-            scaler.scale(loss).backward()
+            # Backward pass
+            loss.backward()
             accumulated_loss += loss.item()
             acc_steps += 1
 
             # Update weights after accumulation
             if acc_steps >= gradient_accumulation:
-                # Unscale gradients for clipping
-                scaler.unscale_(optimizer)
-
                 # Gradient clipping for stability
                 torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=1.0)
 
-                # Optimizer step with scaler
-                scaler.step(optimizer)
-                scaler.update()
+                # Optimizer step
+                optimizer.step()
                 scheduler.step()
                 optimizer.zero_grad()
 
@@ -3909,10 +3919,6 @@ class FisherAwareSVD:
             print(f"  Final loss: {final_loss:.4f} (improvement: {improvement:.1f}%)")
         else:
             print(f"  Final loss: {final_loss:.4f}")
-
-        # Disable gradient checkpointing after training
-        if hasattr(self.model, 'gradient_checkpointing_disable'):
-            self.model.gradient_checkpointing_disable()
 
         # Move model back to CPU to save memory
         self.model = self.model.cpu()
