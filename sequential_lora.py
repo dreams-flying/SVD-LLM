@@ -420,6 +420,20 @@ def main(args):
     # Save final model
     print("\n" + "="*60)
     print("Saving final model...")
+
+    # Remove CastOutputToFloat wrapper before saving (it can't be pickled)
+    # CastOutputToFloat is an nn.Sequential that wraps the original lm_head
+    # We need to extract the original layer from the Sequential
+    if hasattr(model, 'lm_head'):
+        lm_head = model.lm_head
+        class_name = lm_head.__class__.__name__
+        if 'CastOutputToFloat' in class_name or isinstance(lm_head, nn.Sequential):
+            # CastOutputToFloat is Sequential with the original layer as first child
+            if len(list(lm_head.children())) > 0:
+                original_layer = list(lm_head.children())[0]
+                model.lm_head = original_layer
+                print("  Removed CastOutputToFloat wrapper from lm_head")
+
     final_path = os.path.join(args.output_dir, "model_final.pt")
     torch.save({'model': model, 'tokenizer': tokenizer}, final_path)
     print(f"  Saved to: {final_path}")
