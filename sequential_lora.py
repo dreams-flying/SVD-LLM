@@ -61,14 +61,24 @@ def ptb():
     return traindata, valdata
 
 
-def get_target_modules_for_phase(phase: int) -> List[str]:
+def get_target_modules_for_phase(phase: int) -> str:
     """
-    Get target modules for each phase of sequential LoRA training.
+    Get target modules regex pattern for each phase of sequential LoRA training.
 
     For Fisher SVD compressed models:
-    - Original linear layers (e.g., q_proj) are replaced with SVDLinear/SVDLinearWithDenseBlocks
+    - Original linear layers (e.g., q_proj, v_proj) are replaced with SVDLinear
     - Each SVDLinear contains: v_proj (input side) and u_proj (output side)
     - Module paths like: model.layers.0.self_attn.q_proj.v_proj
+
+    IMPORTANT: Original model has a "v_proj" (value projection) which becomes SVDLinear.
+    We must use regex to only match the INNER v_proj/u_proj (nn.Linear), not the outer
+    SVDLinear modules that might also be named v_proj.
+
+    Pattern ".*_proj\\.u_proj" matches:
+    - self_attn.q_proj.u_proj ✓ (Linear inside SVDLinear)
+    - self_attn.v_proj.u_proj ✓ (Linear inside the value projection's SVDLinear)
+    But NOT:
+    - self_attn.v_proj ✗ (this is SVDLinear, not Linear)
 
     Phase 1: Train U projections (output side of SVD decomposition)
     Phase 2: Train V projections (input side of SVD decomposition)
@@ -77,16 +87,16 @@ def get_target_modules_for_phase(phase: int) -> List[str]:
         phase: 1 for U projections, 2 for V projections
 
     Returns:
-        List of module names to target
+        Regex pattern string for target modules
     """
     if phase == 1:
         # Phase 1: Train U projections (freeze V projections)
-        # This targets all u_proj layers inside SVDLinear modules
-        return ["u_proj"]
+        # Regex matches: any_name_proj.u_proj (e.g., q_proj.u_proj, gate_proj.u_proj)
+        return r".*_proj\.u_proj"
     else:
         # Phase 2: Train V projections (freeze U projections)
-        # This targets all v_proj layers inside SVDLinear modules
-        return ["v_proj"]
+        # Regex matches: any_name_proj.v_proj (e.g., q_proj.v_proj, gate_proj.v_proj)
+        return r".*_proj\.v_proj"
 
 
 def merge_lora_weights(model):
@@ -210,18 +220,19 @@ def sequential_lora_finetune(
     except Exception as e:
         print(f"  Skipping prepare_model_for_int8_training: {e}")
 
-    # Get target modules for this phase
-    target_modules = get_target_modules_for_phase(phase)
-    print(f"  Target modules: {target_modules}")
+    # Get target modules regex pattern for this phase
+    target_pattern = get_target_modules_for_phase(phase)
+    print(f"  Target modules pattern: {target_pattern}")
 
-    # Check which target modules actually exist in the model
-    available_modules = set()
-    for name, _ in model.named_modules():
-        for target in target_modules:
-            if name.endswith(target):
-                available_modules.add(target)
+    # Check which modules match the pattern (for logging)
+    import re
+    pattern = re.compile(target_pattern)
+    matched_modules = []
+    for name, module in model.named_modules():
+        if pattern.search(name) and isinstance(module, nn.Linear):
+            matched_modules.append(name)
 
-    if not available_modules:
+    if not matched_modules:
         print(f"  Warning: No target modules found for phase {phase}")
         print(f"  Available module names (sample):")
         for i, (name, _) in enumerate(model.named_modules()):
@@ -229,7 +240,14 @@ def sequential_lora_finetune(
                 print(f"    {name}")
         return model
 
-    print(f"  Found modules: {list(available_modules)}")
+    print(f"  Found {len(matched_modules)} matching Linear modules")
+    if len(matched_modules) <= 10:
+        for m in matched_modules:
+            print(f"    {m}")
+    else:
+        for m in matched_modules[:5]:
+            print(f"    {m}")
+        print(f"    ... and {len(matched_modules) - 5} more")
 
     # PEFT compatibility: Add bias attribute to SVDLinear modules if missing
     # PEFT's _find_and_replace checks for bias attribute on target modules
@@ -239,11 +257,11 @@ def sequential_lora_finetune(
             if not hasattr(module, 'bias'):
                 module.bias = None
 
-    # Configure LoRA
+    # Configure LoRA with regex pattern
     config = LoraConfig(
         r=lora_r,
         lora_alpha=lora_alpha,
-        target_modules=list(available_modules),
+        target_modules=target_pattern,  # Pass regex pattern as string
         lora_dropout=lora_dropout,
         bias="none",
         task_type="CAUSAL_LM",
