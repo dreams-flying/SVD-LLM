@@ -80,6 +80,8 @@ class SVDLinear(nn.Module):
         super().__init__()
         self.v_proj = v_proj
         self.u_proj = u_proj
+        # Add bias attribute for PEFT compatibility (SVD layers don't use bias at this level)
+        self.bias = None
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.u_proj(self.v_proj(x))
@@ -115,6 +117,8 @@ class SVDLinearWithDenseBlocks(nn.Module):
         self.u_proj = u_proj
         self.block_size = block_size
         self.num_groups = 0
+        # Add bias attribute for PEFT compatibility (SVD layers don't use bias at this level)
+        self.bias = None
 
         if groups is not None:
             self.num_groups = len(groups)
