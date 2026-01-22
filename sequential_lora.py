@@ -231,6 +231,14 @@ def sequential_lora_finetune(
 
     print(f"  Found modules: {list(available_modules)}")
 
+    # PEFT compatibility: Add bias attribute to SVDLinear modules if missing
+    # PEFT's _find_and_replace checks for bias attribute on target modules
+    from fisher_svd import SVDLinear, SVDLinearWithDenseBlocks
+    for name, module in model.named_modules():
+        if isinstance(module, (SVDLinear, SVDLinearWithDenseBlocks)):
+            if not hasattr(module, 'bias'):
+                module.bias = None
+
     # Configure LoRA
     config = LoraConfig(
         r=lora_r,
