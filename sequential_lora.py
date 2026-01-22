@@ -194,8 +194,21 @@ def sequential_lora_finetune(
             })
         return test_set
 
-    # Prepare model for LoRA
-    model = prepare_model_for_int8_training(model)
+    # Prepare model for LoRA (only needed once, skip if already prepared)
+    # Check if model was already prepared by looking for CastOutputToFloat wrapper
+    try:
+        # Try to access the output embedding weight - if it fails, model is already prepared
+        if hasattr(model, 'get_output_embeddings'):
+            output_emb = model.get_output_embeddings()
+            if output_emb is not None and hasattr(output_emb, 'weight'):
+                model = prepare_model_for_int8_training(model)
+                print(f"  Model prepared for training")
+            else:
+                print(f"  Model already prepared, skipping prepare_model_for_int8_training")
+        else:
+            model = prepare_model_for_int8_training(model)
+    except Exception as e:
+        print(f"  Skipping prepare_model_for_int8_training: {e}")
 
     # Get target modules for this phase
     target_modules = get_target_modules_for_phase(phase)
