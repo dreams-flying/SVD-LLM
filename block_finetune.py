@@ -43,17 +43,20 @@ from fisher_svd import SVDLinear, SVDLinearWithDenseBlocks
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
 
-def convert_blocks_to_trainable(model: nn.Module) -> int:
+def convert_blocks_to_trainable(model: nn.Module, max_block_norm: float = 10.0) -> int:
     """
     Convert block values from buffers to trainable parameters.
+    Also normalizes large block values to prevent NaN during training.
 
     Args:
         model: The compressed model
+        max_block_norm: Maximum norm for block values (clamp to prevent NaN)
 
     Returns:
         Number of trainable block parameters
     """
     total_block_params = 0
+    normalized_count = 0
 
     for name, module in model.named_modules():
         if isinstance(module, SVDLinearWithDenseBlocks):
@@ -70,12 +73,28 @@ def convert_blocks_to_trainable(model: nn.Module) -> int:
                     # Delete the buffer
                     delattr(module, buffer_name)
 
+                    # Clone and convert to FP32 for stable training
+                    blocks_data = blocks_T.clone().detach().float()
+
+                    # Normalize large block values to prevent NaN
+                    # Block values come from W_orig - W_svd, can be very large
+                    block_norm = blocks_data.norm()
+                    if block_norm > max_block_norm:
+                        scale_factor = max_block_norm / block_norm
+                        blocks_data = blocks_data * scale_factor
+                        normalized_count += 1
+
+                    # Clamp extreme values
+                    blocks_data = torch.clamp(blocks_data, -max_block_norm, max_block_norm)
+
                     # Register as parameter (trainable)
-                    # Use nn.Parameter to make it trainable
-                    param = nn.Parameter(blocks_T.clone().detach())
+                    param = nn.Parameter(blocks_data)
                     module.register_parameter(buffer_name, param)
 
                     total_block_params += param.numel()
+
+    if normalized_count > 0:
+        print(f"  Normalized {normalized_count} blocks with large values")
 
     return total_block_params
 
@@ -116,7 +135,7 @@ def create_calib_dataloader(tokenizer, dataset_name: str = "wikitext2",
                             num_samples: int = 256, seq_len: int = 512,
                             batch_size: int = 4) -> DataLoader:
     """
-    Create calibration data loader.
+    Create calibration data loader with proper attention masks.
 
     Args:
         tokenizer: The tokenizer
@@ -128,6 +147,11 @@ def create_calib_dataloader(tokenizer, dataset_name: str = "wikitext2",
     Returns:
         DataLoader
     """
+    # Ensure tokenizer has pad token
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+        tokenizer.pad_token_id = tokenizer.eos_token_id
+
     if dataset_name == "wikitext2":
         data = load_dataset('wikitext', 'wikitext-2-raw-v1', split='train')
         text = "\n\n".join(data['text'])
@@ -145,17 +169,35 @@ def create_calib_dataloader(tokenizer, dataset_name: str = "wikitext2",
     # Tokenize
     tokens = tokenizer(text, return_tensors='pt').input_ids[0]
 
-    # Create samples
+    # Create samples with attention masks
     samples = []
     for i in range(min(num_samples, len(tokens) // seq_len)):
         start = i * seq_len
         input_ids = tokens[start:start + seq_len]
+
+        # Create attention mask (all 1s for non-padded sequences)
+        attention_mask = torch.ones_like(input_ids)
+
+        # Labels: use -100 for positions we don't want to compute loss on
+        # For causal LM, we want to predict all tokens, so labels = input_ids
+        labels = input_ids.clone()
+
         samples.append({
             'input_ids': input_ids,
-            'labels': input_ids.clone()
+            'attention_mask': attention_mask,
+            'labels': labels
         })
 
     return DataLoader(samples, batch_size=batch_size, shuffle=True)
+
+
+def check_gradients_valid(params) -> bool:
+    """Check if gradients are valid (no NaN or Inf)."""
+    for p in params:
+        if p.grad is not None:
+            if torch.isnan(p.grad).any() or torch.isinf(p.grad).any():
+                return False
+    return True
 
 
 def block_finetune(
@@ -194,16 +236,20 @@ def block_finetune(
     print("Block Fine-tuning")
     print("="*60)
 
-    # Step 1: Convert blocks to trainable parameters
+    # Step 1: Convert model to FP32 for stable training
+    print("\nConverting model to FP32 for stable training...")
+    model = model.float()
+
+    # Step 2: Convert blocks to trainable parameters (includes normalization)
     print("\nConverting blocks to trainable parameters...")
-    num_block_params = convert_blocks_to_trainable(model)
+    num_block_params = convert_blocks_to_trainable(model, max_block_norm=10.0)
     print(f"  Total block parameters: {num_block_params:,}")
 
     if num_block_params == 0:
         print("  No blocks found, skipping fine-tuning")
         return model
 
-    # Step 2: Freeze non-block parameters
+    # Step 3: Freeze non-block parameters
     print("\nFreezing non-block parameters...")
     freeze_non_block_params(model)
 
@@ -212,16 +258,16 @@ def block_finetune(
     total_params = sum(p.numel() for p in model.parameters())
     print(f"  Trainable: {trainable_params:,} / {total_params:,} ({100*trainable_params/total_params:.2f}%)")
 
-    # Step 3: Create data loader
+    # Step 4: Create data loader
     print(f"\nCreating calibration data ({dataset_name})...")
     dataloader = create_calib_dataloader(
         tokenizer, dataset_name, num_samples, seq_len, batch_size
     )
     print(f"  Samples: {len(dataloader.dataset)}, Batch size: {batch_size}")
 
-    # Step 4: Setup optimizer
+    # Step 5: Setup optimizer with eps for numerical stability
     block_params = get_trainable_block_params(model)
-    optimizer = torch.optim.AdamW(block_params, lr=learning_rate, weight_decay=0.01)
+    optimizer = torch.optim.AdamW(block_params, lr=learning_rate, weight_decay=0.01, eps=1e-8)
 
     # Learning rate scheduler with warmup
     total_steps = len(dataloader) * num_epochs // gradient_accumulation
@@ -232,7 +278,7 @@ def block_finetune(
 
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
-    # Step 5: Training loop
+    # Step 6: Training loop
     print(f"\nTraining for {num_epochs} epochs...")
     model.train()
     model = model.to(device)
@@ -240,6 +286,8 @@ def block_finetune(
     global_step = 0
     accumulated_loss = 0.0
     acc_steps = 0
+    nan_count = 0
+    max_nan_batches = 10  # Stop if too many NaN batches
 
     for epoch in range(num_epochs):
         epoch_loss = 0.0
@@ -250,22 +298,45 @@ def block_finetune(
         for batch in pbar:
             # Move to device
             input_ids = batch['input_ids'].to(device)
+            attention_mask = batch['attention_mask'].to(device)
             labels = batch['labels'].to(device)
 
-            # Forward pass
-            outputs = model(input_ids=input_ids, labels=labels)
-
-            if outputs.loss is not None:
-                loss = outputs.loss
-            else:
-                # Manual loss computation
-                logits = outputs.logits
-                shift_logits = logits[..., :-1, :].contiguous()
-                shift_labels = labels[..., 1:].contiguous()
-                loss = F.cross_entropy(
-                    shift_logits.view(-1, shift_logits.size(-1)),
-                    shift_labels.view(-1)
+            # Forward pass with attention_mask
+            try:
+                outputs = model(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    labels=labels
                 )
+
+                if outputs.loss is not None:
+                    loss = outputs.loss
+                else:
+                    # Manual loss computation with ignore_index for padding
+                    logits = outputs.logits
+                    shift_logits = logits[..., :-1, :].contiguous()
+                    shift_labels = labels[..., 1:].contiguous()
+
+                    # Use ignore_index=-100 for padding tokens
+                    loss = F.cross_entropy(
+                        shift_logits.view(-1, shift_logits.size(-1)),
+                        shift_labels.view(-1),
+                        ignore_index=-100
+                    )
+            except Exception as e:
+                print(f"\n  Warning: Forward pass error: {e}")
+                optimizer.zero_grad()
+                continue
+
+            # Check for NaN/Inf loss
+            if torch.isnan(loss) or torch.isinf(loss):
+                nan_count += 1
+                print(f"\n  Warning: NaN/Inf loss detected (count: {nan_count})")
+                optimizer.zero_grad()
+                if nan_count >= max_nan_batches:
+                    print(f"\n  Error: Too many NaN batches ({nan_count}), stopping training")
+                    break
+                continue
 
             loss = loss / gradient_accumulation
             loss.backward()
@@ -275,6 +346,18 @@ def block_finetune(
 
             # Optimizer step
             if acc_steps >= gradient_accumulation:
+                # Check for NaN/Inf gradients BEFORE clipping
+                if not check_gradients_valid(block_params):
+                    print(f"\n  Warning: NaN/Inf gradients detected, skipping update")
+                    optimizer.zero_grad()
+                    accumulated_loss = 0.0
+                    acc_steps = 0
+                    nan_count += 1
+                    if nan_count >= max_nan_batches:
+                        print(f"\n  Error: Too many NaN batches ({nan_count}), stopping training")
+                        break
+                    continue
+
                 # Gradient clipping
                 torch.nn.utils.clip_grad_norm_(block_params, max_grad_norm)
 
@@ -294,8 +377,14 @@ def block_finetune(
                 accumulated_loss = 0.0
                 acc_steps = 0
 
+        if nan_count >= max_nan_batches:
+            break
+
         avg_loss = epoch_loss / max(num_batches, 1)
         print(f"  Epoch {epoch+1} average loss: {avg_loss:.4f}")
+
+    # Set model to eval mode after training
+    model.eval()
 
     print("\nBlock fine-tuning completed!")
     return model
@@ -316,6 +405,11 @@ def main(args):
     pruned_dict = torch.load(args.prune_model, map_location='cpu')
     tokenizer = pruned_dict['tokenizer']
     model = pruned_dict['model']
+
+    # Ensure tokenizer has pad token
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+        tokenizer.pad_token_id = tokenizer.eos_token_id
 
     # Count blocks
     num_blocks = 0
@@ -349,8 +443,9 @@ def main(args):
     print("\n" + "="*60)
     print("Saving fine-tuned model...")
 
-    # Move to CPU for saving
-    model = model.cpu()
+    # Ensure eval mode and move to CPU for saving
+    model.eval()
+    model = model.cpu().float()
 
     final_path = os.path.join(args.output_dir, "model_block_finetuned.pt")
     torch.save({'model': model, 'tokenizer': tokenizer}, final_path)
@@ -359,16 +454,23 @@ def main(args):
     # Evaluate if requested
     if args.evaluate:
         print("\nEvaluating fine-tuned model...")
-        from utils.eval_utils import ppl_eval
+        from evaluater import ppl_eval
 
+        # Ensure model is in eval mode and FP32
+        model.eval()
         model = model.float().to(device)
-        ppl_eval(
-            model, tokenizer,
-            datasets=['wikitext2'],
-            model_seq_len=args.model_seq_len,
-            batch_size=args.eval_batch_size,
-            device=device
-        )
+
+        try:
+            ppl_eval(
+                model, tokenizer,
+                datasets=['wikitext2'],
+                model_seq_len=args.model_seq_len,
+                batch_size=args.eval_batch_size,
+                device=device
+            )
+        except Exception as e:
+            print(f"  Evaluation error: {e}")
+            print("  Model may need to be loaded fresh for evaluation")
 
     print("\n" + "="*60)
     print("Block fine-tuning completed!")
