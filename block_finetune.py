@@ -43,20 +43,18 @@ from fisher_svd import SVDLinear, SVDLinearWithDenseBlocks
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
 
-def convert_blocks_to_trainable(model: nn.Module, max_block_norm: float = 10.0) -> int:
+def convert_blocks_to_trainable(model: nn.Module) -> int:
     """
     Convert block values from buffers to trainable parameters.
-    Also normalizes large block values to prevent NaN during training.
+    Keep original values - don't normalize or clamp (would destroy residual compensation).
 
     Args:
         model: The compressed model
-        max_block_norm: Maximum norm for block values (clamp to prevent NaN)
 
     Returns:
         Number of trainable block parameters
     """
     total_block_params = 0
-    normalized_count = 0
 
     for name, module in model.named_modules():
         if isinstance(module, SVDLinearWithDenseBlocks):
@@ -73,50 +71,45 @@ def convert_blocks_to_trainable(model: nn.Module, max_block_norm: float = 10.0) 
                     # Delete the buffer
                     delattr(module, buffer_name)
 
-                    # Clone and convert to FP32 for stable training
-                    blocks_data = blocks_T.clone().detach().float()
-
-                    # Normalize large block values to prevent NaN
-                    # Block values come from W_orig - W_svd, can be very large
-                    block_norm = blocks_data.norm()
-                    if block_norm > max_block_norm:
-                        scale_factor = max_block_norm / block_norm
-                        blocks_data = blocks_data * scale_factor
-                        normalized_count += 1
-
-                    # Clamp extreme values
-                    blocks_data = torch.clamp(blocks_data, -max_block_norm, max_block_norm)
-
-                    # Register as parameter (trainable)
-                    param = nn.Parameter(blocks_data)
+                    # Keep original values and dtype - don't normalize or clamp!
+                    # Blocks contain residual W_orig - W_svd, normalization destroys compensation
+                    param = nn.Parameter(blocks_T.clone().detach())
                     module.register_parameter(buffer_name, param)
 
                     total_block_params += param.numel()
 
-    if normalized_count > 0:
-        print(f"  Normalized {normalized_count} blocks with large values")
-
     return total_block_params
 
 
-def freeze_non_block_params(model: nn.Module) -> None:
+def freeze_non_block_params(model: nn.Module, train_layernorm: bool = True, train_bias: bool = True) -> None:
     """
-    Freeze all parameters except block values.
+    Freeze most parameters, but keep trainable:
+    - Block values (g*_blocks_T)
+    - LayerNorm parameters (helps adapt to block changes)
+    - Bias terms (low cost, helps adaptation)
 
     Args:
         model: The model to freeze
+        train_layernorm: Whether to train LayerNorm parameters
+        train_bias: Whether to train bias parameters
     """
     for name, param in model.named_parameters():
-        # Only train block values (g*_blocks_T)
+        # Always train block values
         if 'blocks_T' in name:
+            param.requires_grad = True
+        # Train LayerNorm (input_layernorm, post_attention_layernorm, norm)
+        elif train_layernorm and ('layernorm' in name.lower() or 'norm' in name.lower()):
+            param.requires_grad = True
+        # Train bias terms
+        elif train_bias and 'bias' in name.lower():
             param.requires_grad = True
         else:
             param.requires_grad = False
 
 
-def get_trainable_block_params(model: nn.Module) -> List[nn.Parameter]:
+def get_trainable_params(model: nn.Module) -> List[nn.Parameter]:
     """
-    Get all trainable block parameters.
+    Get all trainable parameters (blocks, LayerNorm, bias).
 
     Args:
         model: The model
@@ -126,7 +119,7 @@ def get_trainable_block_params(model: nn.Module) -> List[nn.Parameter]:
     """
     params = []
     for name, param in model.named_parameters():
-        if 'blocks_T' in name and param.requires_grad:
+        if param.requires_grad:
             params.append(param)
     return params
 
@@ -208,13 +201,15 @@ def block_finetune(
     batch_size: int = 4,
     seq_len: int = 512,
     num_samples: int = 256,
-    warmup_steps: int = 50,
+    warmup_ratio: float = 0.1,
     gradient_accumulation: int = 4,
     max_grad_norm: float = 1.0,
     dataset_name: str = "wikitext2",
+    train_layernorm: bool = True,
+    train_bias: bool = True,
 ) -> nn.Module:
     """
-    Fine-tune residual blocks.
+    Fine-tune residual blocks (and optionally LayerNorm/bias).
 
     Args:
         model: Compressed model with SVDLinearWithDenseBlocks
@@ -224,10 +219,12 @@ def block_finetune(
         batch_size: Batch size
         seq_len: Sequence length
         num_samples: Number of calibration samples
-        warmup_steps: Warmup steps
+        warmup_ratio: Warmup ratio (fraction of total steps)
         gradient_accumulation: Gradient accumulation steps
         max_grad_norm: Maximum gradient norm for clipping
         dataset_name: Dataset name
+        train_layernorm: Whether to train LayerNorm parameters
+        train_bias: Whether to train bias parameters
 
     Returns:
         Fine-tuned model
@@ -236,49 +233,68 @@ def block_finetune(
     print("Block Fine-tuning")
     print("="*60)
 
-    # Step 1: Convert model to FP32 for stable training
-    print("\nConverting model to FP32 for stable training...")
-    model = model.float()
-
-    # Step 2: Convert blocks to trainable parameters (includes normalization)
+    # Step 1: Convert blocks to trainable parameters (keep original values!)
     print("\nConverting blocks to trainable parameters...")
-    num_block_params = convert_blocks_to_trainable(model, max_block_norm=10.0)
+    num_block_params = convert_blocks_to_trainable(model)
     print(f"  Total block parameters: {num_block_params:,}")
 
     if num_block_params == 0:
         print("  No blocks found, skipping fine-tuning")
         return model
 
-    # Step 3: Freeze non-block parameters
-    print("\nFreezing non-block parameters...")
-    freeze_non_block_params(model)
+    # Step 2: Freeze non-block parameters (but keep LayerNorm/bias trainable)
+    print("\nSetting up trainable parameters...")
+    print(f"  Train LayerNorm: {train_layernorm}, Train bias: {train_bias}")
+    freeze_non_block_params(model, train_layernorm=train_layernorm, train_bias=train_bias)
 
-    # Count trainable params
-    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    # Count trainable params by type
+    block_params_count = 0
+    ln_params_count = 0
+    bias_params_count = 0
+    for name, param in model.named_parameters():
+        if param.requires_grad:
+            if 'blocks_T' in name:
+                block_params_count += param.numel()
+            elif 'layernorm' in name.lower() or 'norm' in name.lower():
+                ln_params_count += param.numel()
+            elif 'bias' in name.lower():
+                bias_params_count += param.numel()
+
+    trainable_total = sum(p.numel() for p in model.parameters() if p.requires_grad)
     total_params = sum(p.numel() for p in model.parameters())
-    print(f"  Trainable: {trainable_params:,} / {total_params:,} ({100*trainable_params/total_params:.2f}%)")
+    print(f"  Blocks: {block_params_count:,}, LayerNorm: {ln_params_count:,}, Bias: {bias_params_count:,}")
+    print(f"  Trainable: {trainable_total:,} / {total_params:,} ({100*trainable_total/total_params:.2f}%)")
 
-    # Step 4: Create data loader
+    # Step 3: Create data loader
     print(f"\nCreating calibration data ({dataset_name})...")
     dataloader = create_calib_dataloader(
         tokenizer, dataset_name, num_samples, seq_len, batch_size
     )
     print(f"  Samples: {len(dataloader.dataset)}, Batch size: {batch_size}")
 
-    # Step 5: Setup optimizer with eps for numerical stability
-    block_params = get_trainable_block_params(model)
-    optimizer = torch.optim.AdamW(block_params, lr=learning_rate, weight_decay=0.01, eps=1e-8)
+    # Step 4: Setup optimizer
+    trainable_params = get_trainable_params(model)
+    optimizer = torch.optim.AdamW(trainable_params, lr=learning_rate, weight_decay=0.01, eps=1e-8)
 
-    # Learning rate scheduler with warmup
-    total_steps = len(dataloader) * num_epochs // gradient_accumulation
+    # Learning rate scheduler with warmup (use ratio to avoid warmup > total_steps)
+    total_steps = max(1, len(dataloader) * num_epochs // gradient_accumulation)
+    warmup_steps = int(total_steps * warmup_ratio)
+    print(f"  Total steps: {total_steps}, Warmup steps: {warmup_steps}")
+
     def lr_lambda(step):
         if step < warmup_steps:
-            return (step + 1) / warmup_steps
-        return max(0.1, 1.0 - (step - warmup_steps) / (total_steps - warmup_steps))
+            return (step + 1) / max(1, warmup_steps)
+        # Linear decay after warmup
+        decay_steps = total_steps - warmup_steps
+        if decay_steps <= 0:
+            return 1.0
+        progress = (step - warmup_steps) / decay_steps
+        return max(0.1, 1.0 - 0.9 * progress)
 
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
-    # Step 6: Training loop
+    # Step 5: Training loop
+    # Don't call model.float() - keep original dtype to preserve compressed module behavior
     print(f"\nTraining for {num_epochs} epochs...")
     model.train()
     model = model.to(device)
@@ -287,7 +303,7 @@ def block_finetune(
     accumulated_loss = 0.0
     acc_steps = 0
     nan_count = 0
-    max_nan_batches = 10  # Stop if too many NaN batches
+    max_nan_batches = 10
 
     for epoch in range(num_epochs):
         epoch_loss = 0.0
@@ -301,7 +317,7 @@ def block_finetune(
             attention_mask = batch['attention_mask'].to(device)
             labels = batch['labels'].to(device)
 
-            # Forward pass with attention_mask
+            # Forward pass
             try:
                 outputs = model(
                     input_ids=input_ids,
@@ -312,16 +328,13 @@ def block_finetune(
                 if outputs.loss is not None:
                     loss = outputs.loss
                 else:
-                    # Manual loss computation with ignore_index for padding
+                    # Manual loss computation (no ignore_index since no padding in our data)
                     logits = outputs.logits
                     shift_logits = logits[..., :-1, :].contiguous()
                     shift_labels = labels[..., 1:].contiguous()
-
-                    # Use ignore_index=-100 for padding tokens
                     loss = F.cross_entropy(
                         shift_logits.view(-1, shift_logits.size(-1)),
-                        shift_labels.view(-1),
-                        ignore_index=-100
+                        shift_labels.view(-1)
                     )
             except Exception as e:
                 print(f"\n  Warning: Forward pass error: {e}")
@@ -347,7 +360,7 @@ def block_finetune(
             # Optimizer step
             if acc_steps >= gradient_accumulation:
                 # Check for NaN/Inf gradients BEFORE clipping
-                if not check_gradients_valid(block_params):
+                if not check_gradients_valid(trainable_params):
                     print(f"\n  Warning: NaN/Inf gradients detected, skipping update")
                     optimizer.zero_grad()
                     accumulated_loss = 0.0
@@ -359,7 +372,7 @@ def block_finetune(
                     continue
 
                 # Gradient clipping
-                torch.nn.utils.clip_grad_norm_(block_params, max_grad_norm)
+                torch.nn.utils.clip_grad_norm_(trainable_params, max_grad_norm)
 
                 optimizer.step()
                 scheduler.step()
@@ -434,9 +447,11 @@ def main(args):
         batch_size=args.batch_size,
         seq_len=args.seq_len,
         num_samples=args.num_samples,
-        warmup_steps=args.warmup_steps,
+        warmup_ratio=args.warmup_ratio,
         gradient_accumulation=args.gradient_accumulation,
         dataset_name=args.dataset,
+        train_layernorm=args.train_layernorm,
+        train_bias=args.train_bias,
     )
 
     # Save model
@@ -445,7 +460,7 @@ def main(args):
 
     # Ensure eval mode and move to CPU for saving
     model.eval()
-    model = model.cpu().float()
+    model = model.cpu()
 
     final_path = os.path.join(args.output_dir, "model_block_finetuned.pt")
     torch.save({'model': model, 'tokenizer': tokenizer}, final_path)
@@ -456,9 +471,9 @@ def main(args):
         print("\nEvaluating fine-tuned model...")
         from evaluater import ppl_eval
 
-        # Ensure model is in eval mode and FP32
+        # Ensure model is in eval mode
         model.eval()
-        model = model.float().to(device)
+        model = model.to(device)
 
         try:
             ppl_eval(
@@ -497,10 +512,20 @@ if __name__ == "__main__":
                         help='Sequence length')
     parser.add_argument('--num_samples', type=int, default=256,
                         help='Number of calibration samples')
-    parser.add_argument('--warmup_steps', type=int, default=50,
-                        help='Warmup steps')
+    parser.add_argument('--warmup_ratio', type=float, default=0.1,
+                        help='Warmup ratio (fraction of total steps)')
     parser.add_argument('--gradient_accumulation', type=int, default=4,
                         help='Gradient accumulation steps')
+
+    # What to train
+    parser.add_argument('--train_layernorm', action='store_true', default=True,
+                        help='Train LayerNorm parameters (default: True)')
+    parser.add_argument('--no_train_layernorm', action='store_false', dest='train_layernorm',
+                        help='Do not train LayerNorm parameters')
+    parser.add_argument('--train_bias', action='store_true', default=True,
+                        help='Train bias parameters (default: True)')
+    parser.add_argument('--no_train_bias', action='store_false', dest='train_bias',
+                        help='Do not train bias parameters')
 
     # Data
     parser.add_argument('--dataset', type=str, default='wikitext2',
