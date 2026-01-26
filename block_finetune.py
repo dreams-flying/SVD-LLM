@@ -199,18 +199,19 @@ def check_gradients_valid(params) -> bool:
 def block_finetune(
     model: nn.Module,
     tokenizer,
-    num_epochs: int = 2,
-    learning_rate: float = 1e-4,
+    num_epochs: int = 5,
+    learning_rate: float = 5e-4,
     batch_size: int = 4,
     seq_len: int = 512,
     num_samples: int = 256,
-    warmup_ratio: float = 0.1,
-    gradient_accumulation: int = 4,
+    warmup_ratio: float = 0.05,
+    gradient_accumulation: int = 2,
     max_grad_norm: float = 1.0,
     dataset_name: str = "wikitext2",
     train_layernorm: bool = True,
     train_bias: bool = True,
     use_amp: bool = True,
+    use_gradient_checkpointing: bool = True,
 ) -> nn.Module:
     """
     Fine-tune residual blocks (and optionally LayerNorm/bias).
@@ -231,6 +232,7 @@ def block_finetune(
         train_layernorm: Whether to train LayerNorm parameters
         train_bias: Whether to train bias parameters
         use_amp: Whether to use automatic mixed precision
+        use_gradient_checkpointing: Whether to use gradient checkpointing
 
     Returns:
         Fine-tuned model
@@ -238,6 +240,11 @@ def block_finetune(
     print("="*60)
     print("Block Fine-tuning (AMP enabled)" if use_amp else "Block Fine-tuning")
     print("="*60)
+
+    # Enable gradient checkpointing for memory efficiency
+    if use_gradient_checkpointing and hasattr(model, 'gradient_checkpointing_enable'):
+        model.gradient_checkpointing_enable()
+        print("  Gradient checkpointing: enabled")
 
     # Step 1: Convert blocks to trainable parameters (keep original values!)
     print("\nConverting blocks to trainable parameters...")
@@ -287,15 +294,16 @@ def block_finetune(
     warmup_steps = int(total_steps * warmup_ratio)
     print(f"  Total steps: {total_steps}, Warmup steps: {warmup_steps}")
 
+    import math
     def lr_lambda(step):
         if step < warmup_steps:
             return (step + 1) / max(1, warmup_steps)
-        # Linear decay after warmup
+        # Cosine annealing after warmup (better than linear decay)
         decay_steps = total_steps - warmup_steps
         if decay_steps <= 0:
             return 1.0
         progress = (step - warmup_steps) / decay_steps
-        return max(0.1, 1.0 - 0.9 * progress)
+        return max(0.01, 0.5 * (1 + math.cos(math.pi * progress)))
 
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
@@ -530,6 +538,7 @@ def main(args):
         train_layernorm=args.train_layernorm,
         train_bias=args.train_bias,
         use_amp=args.use_amp,
+        use_gradient_checkpointing=args.gradient_checkpointing,
     )
 
     # Save model
@@ -580,20 +589,20 @@ if __name__ == "__main__":
                         help='Output directory')
 
     # Training hyperparameters
-    parser.add_argument('--num_epochs', type=int, default=2,
-                        help='Number of epochs')
-    parser.add_argument('--learning_rate', type=float, default=1e-4,
-                        help='Learning rate')
+    parser.add_argument('--num_epochs', type=int, default=5,
+                        help='Number of epochs (default: 5)')
+    parser.add_argument('--learning_rate', type=float, default=5e-4,
+                        help='Learning rate (default: 5e-4)')
     parser.add_argument('--batch_size', type=int, default=4,
                         help='Batch size')
     parser.add_argument('--seq_len', type=int, default=512,
                         help='Sequence length')
     parser.add_argument('--num_samples', type=int, default=256,
                         help='Number of calibration samples')
-    parser.add_argument('--warmup_ratio', type=float, default=0.1,
-                        help='Warmup ratio (fraction of total steps)')
-    parser.add_argument('--gradient_accumulation', type=int, default=4,
-                        help='Gradient accumulation steps')
+    parser.add_argument('--warmup_ratio', type=float, default=0.05,
+                        help='Warmup ratio (default: 0.05)')
+    parser.add_argument('--gradient_accumulation', type=int, default=2,
+                        help='Gradient accumulation steps (default: 2)')
 
     # What to train
     parser.add_argument('--train_layernorm', action='store_true', default=True,
@@ -610,6 +619,12 @@ if __name__ == "__main__":
                         help='Use automatic mixed precision (default: True)')
     parser.add_argument('--no_amp', action='store_false', dest='use_amp',
                         help='Disable automatic mixed precision')
+
+    # Memory optimization
+    parser.add_argument('--gradient_checkpointing', action='store_true', default=True,
+                        help='Use gradient checkpointing (default: True)')
+    parser.add_argument('--no_gradient_checkpointing', action='store_false', dest='gradient_checkpointing',
+                        help='Disable gradient checkpointing')
 
     # Data
     parser.add_argument('--dataset', type=str, default='wikitext2',
