@@ -46,7 +46,7 @@ device = "cuda" if torch.cuda.is_available() else "cpu"
 def convert_blocks_to_trainable(model: nn.Module) -> int:
     """
     Convert block values from buffers to trainable parameters.
-    Keep original values - don't normalize or clamp (would destroy residual compensation).
+    Convert trainable params to FP32 for stable gradients, keep model backbone in BF16/FP16.
 
     Args:
         model: The compressed model
@@ -71,9 +71,8 @@ def convert_blocks_to_trainable(model: nn.Module) -> int:
                     # Delete the buffer
                     delattr(module, buffer_name)
 
-                    # Keep original values and dtype - don't normalize or clamp!
-                    # Blocks contain residual W_orig - W_svd, normalization destroys compensation
-                    param = nn.Parameter(blocks_T.clone().detach())
+                    # Convert to FP32 for stable training gradients
+                    param = nn.Parameter(blocks_T.clone().detach().float())
                     module.register_parameter(buffer_name, param)
 
                     total_block_params += param.numel()
@@ -88,21 +87,25 @@ def freeze_non_block_params(model: nn.Module, train_layernorm: bool = True, trai
     - LayerNorm parameters (helps adapt to block changes)
     - Bias terms (low cost, helps adaptation)
 
+    Trainable parameters are converted to FP32 for stable gradients.
+
     Args:
         model: The model to freeze
         train_layernorm: Whether to train LayerNorm parameters
         train_bias: Whether to train bias parameters
     """
     for name, param in model.named_parameters():
-        # Always train block values
+        # Always train block values (already converted to FP32 in convert_blocks_to_trainable)
         if 'blocks_T' in name:
             param.requires_grad = True
         # Train LayerNorm (input_layernorm, post_attention_layernorm, norm)
         elif train_layernorm and ('layernorm' in name.lower() or 'norm' in name.lower()):
             param.requires_grad = True
+            param.data = param.data.float()  # Convert to FP32
         # Train bias terms
         elif train_bias and 'bias' in name.lower():
             param.requires_grad = True
+            param.data = param.data.float()  # Convert to FP32
         else:
             param.requires_grad = False
 
@@ -207,9 +210,11 @@ def block_finetune(
     dataset_name: str = "wikitext2",
     train_layernorm: bool = True,
     train_bias: bool = True,
+    use_amp: bool = True,
 ) -> nn.Module:
     """
     Fine-tune residual blocks (and optionally LayerNorm/bias).
+    Uses AMP (Automatic Mixed Precision) for memory efficiency.
 
     Args:
         model: Compressed model with SVDLinearWithDenseBlocks
@@ -225,12 +230,13 @@ def block_finetune(
         dataset_name: Dataset name
         train_layernorm: Whether to train LayerNorm parameters
         train_bias: Whether to train bias parameters
+        use_amp: Whether to use automatic mixed precision
 
     Returns:
         Fine-tuned model
     """
     print("="*60)
-    print("Block Fine-tuning")
+    print("Block Fine-tuning (AMP enabled)" if use_amp else "Block Fine-tuning")
     print("="*60)
 
     # Step 1: Convert blocks to trainable parameters (keep original values!)
@@ -293,8 +299,31 @@ def block_finetune(
 
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
-    # Step 5: Training loop
-    # Don't call model.float() - keep original dtype to preserve compressed module behavior
+    # Step 5: Setup AMP (Automatic Mixed Precision)
+    # Keep model backbone in BF16/FP16, trainable params in FP32
+    use_cuda = device == "cuda" and torch.cuda.is_available()
+    if use_amp and use_cuda:
+        # Detect model backbone dtype (skip FP32 trainable params)
+        model_dtype = torch.float32
+        for p in model.parameters():
+            if p.dtype in (torch.float16, torch.bfloat16):
+                model_dtype = p.dtype
+                break
+        if model_dtype == torch.bfloat16:
+            amp_dtype = torch.bfloat16
+            # BF16 doesn't need GradScaler
+            scaler = None
+        else:
+            amp_dtype = torch.float16
+            scaler = torch.cuda.amp.GradScaler()
+        print(f"  AMP enabled: autocast={amp_dtype}, GradScaler={scaler is not None}")
+    else:
+        amp_dtype = torch.float32
+        scaler = None
+        if use_amp:
+            print("  AMP disabled (no CUDA)")
+
+    # Step 6: Training loop
     print(f"\nTraining for {num_epochs} epochs...")
     model.train()
     model = model.to(device)
@@ -310,9 +339,10 @@ def block_finetune(
             input_ids = batch['input_ids'].to(device)
             attention_mask = batch['attention_mask'].to(device)
             labels = batch['labels'].to(device)
-            outputs = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
+            with torch.cuda.amp.autocast(enabled=use_amp and use_cuda, dtype=amp_dtype):
+                outputs = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
             if outputs.loss is not None:
-                init_losses.append(outputs.loss.item())
+                init_losses.append(outputs.loss.float().item())
         if init_losses:
             init_loss = sum(init_losses) / len(init_losses)
             print(f"  Initial loss (before training): {init_loss:.4f}")
@@ -337,28 +367,31 @@ def block_finetune(
             attention_mask = batch['attention_mask'].to(device)
             labels = batch['labels'].to(device)
 
-            # Forward pass
+            # Forward pass with AMP autocast
             try:
-                outputs = model(
-                    input_ids=input_ids,
-                    attention_mask=attention_mask,
-                    labels=labels
-                )
-
-                if outputs.loss is not None:
-                    loss = outputs.loss
-                else:
-                    # Manual loss computation (no ignore_index since no padding in our data)
-                    logits = outputs.logits
-                    shift_logits = logits[..., :-1, :].contiguous()
-                    shift_labels = labels[..., 1:].contiguous()
-                    loss = F.cross_entropy(
-                        shift_logits.view(-1, shift_logits.size(-1)),
-                        shift_labels.view(-1)
+                with torch.cuda.amp.autocast(enabled=use_amp and use_cuda, dtype=amp_dtype):
+                    outputs = model(
+                        input_ids=input_ids,
+                        attention_mask=attention_mask,
+                        labels=labels
                     )
+
+                    if outputs.loss is not None:
+                        loss = outputs.loss
+                    else:
+                        # Manual loss computation
+                        logits = outputs.logits
+                        shift_logits = logits[..., :-1, :].contiguous()
+                        shift_labels = labels[..., 1:].contiguous()
+                        loss = F.cross_entropy(
+                            shift_logits.view(-1, shift_logits.size(-1)),
+                            shift_labels.view(-1)
+                        )
             except Exception as e:
                 print(f"\n  Warning: Forward pass error: {e}")
                 optimizer.zero_grad()
+                if scaler:
+                    scaler.update()
                 continue
 
             # Check for NaN/Inf loss
@@ -366,23 +399,37 @@ def block_finetune(
                 nan_count += 1
                 print(f"\n  Warning: NaN/Inf loss detected (count: {nan_count})")
                 optimizer.zero_grad()
+                if scaler:
+                    scaler.update()
                 if nan_count >= max_nan_batches:
                     print(f"\n  Error: Too many NaN batches ({nan_count}), stopping training")
                     break
                 continue
 
+            # Scale loss for gradient accumulation
             loss = loss / gradient_accumulation
-            loss.backward()
 
-            accumulated_loss += loss.item()
+            # Backward pass with gradient scaling
+            if scaler:
+                scaler.scale(loss).backward()
+            else:
+                loss.backward()
+
+            accumulated_loss += loss.float().item()
             acc_steps += 1
 
             # Optimizer step
             if acc_steps >= gradient_accumulation:
+                if scaler:
+                    # Unscale gradients for clipping
+                    scaler.unscale_(optimizer)
+
                 # Check for NaN/Inf gradients BEFORE clipping
                 if not check_gradients_valid(trainable_params):
                     print(f"\n  Warning: NaN/Inf gradients detected, skipping update")
                     optimizer.zero_grad()
+                    if scaler:
+                        scaler.update()
                     accumulated_loss = 0.0
                     acc_steps = 0
                     nan_count += 1
@@ -394,18 +441,23 @@ def block_finetune(
                 # Gradient clipping
                 torch.nn.utils.clip_grad_norm_(trainable_params, max_grad_norm)
 
-                optimizer.step()
+                # Optimizer step with scaler
+                if scaler:
+                    scaler.step(optimizer)
+                    scaler.update()
+                else:
+                    optimizer.step()
+
                 scheduler.step()
                 optimizer.zero_grad()
 
                 global_step += 1
-                # accumulated_loss is already the average (sum of loss/grad_acc)
                 avg_batch_loss = accumulated_loss
                 epoch_loss += avg_batch_loss
                 num_batches += 1
 
                 pbar.set_postfix({
-                    'loss': f'{avg_batch_loss:.4f}',  # Show average, not sum!
+                    'loss': f'{avg_batch_loss:.4f}',
                     'lr': f'{scheduler.get_last_lr()[0]:.2e}'
                 })
 
@@ -477,6 +529,7 @@ def main(args):
         dataset_name=args.dataset,
         train_layernorm=args.train_layernorm,
         train_bias=args.train_bias,
+        use_amp=args.use_amp,
     )
 
     # Save model
@@ -551,6 +604,12 @@ if __name__ == "__main__":
                         help='Train bias parameters (default: True)')
     parser.add_argument('--no_train_bias', action='store_false', dest='train_bias',
                         help='Do not train bias parameters')
+
+    # AMP (Automatic Mixed Precision)
+    parser.add_argument('--use_amp', action='store_true', default=True,
+                        help='Use automatic mixed precision (default: True)')
+    parser.add_argument('--no_amp', action='store_false', dest='use_amp',
+                        help='Disable automatic mixed precision')
 
     # Data
     parser.add_argument('--dataset', type=str, default='wikitext2',
