@@ -299,11 +299,31 @@ def block_finetune(
     model.train()
     model = model.to(device)
 
+    # Evaluate initial loss before training
+    print("\nEvaluating initial loss...")
+    model.eval()
+    with torch.no_grad():
+        init_losses = []
+        for i, batch in enumerate(dataloader):
+            if i >= 5:  # Sample 5 batches
+                break
+            input_ids = batch['input_ids'].to(device)
+            attention_mask = batch['attention_mask'].to(device)
+            labels = batch['labels'].to(device)
+            outputs = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
+            if outputs.loss is not None:
+                init_losses.append(outputs.loss.item())
+        if init_losses:
+            init_loss = sum(init_losses) / len(init_losses)
+            print(f"  Initial loss (before training): {init_loss:.4f}")
+    model.train()
+
     global_step = 0
     accumulated_loss = 0.0
     acc_steps = 0
     nan_count = 0
     max_nan_batches = 10
+    best_loss = float('inf')
 
     for epoch in range(num_epochs):
         epoch_loss = 0.0
@@ -379,11 +399,13 @@ def block_finetune(
                 optimizer.zero_grad()
 
                 global_step += 1
-                epoch_loss += accumulated_loss * gradient_accumulation
+                # accumulated_loss is already the average (sum of loss/grad_acc)
+                avg_batch_loss = accumulated_loss
+                epoch_loss += avg_batch_loss
                 num_batches += 1
 
                 pbar.set_postfix({
-                    'loss': f'{accumulated_loss * gradient_accumulation:.4f}',
+                    'loss': f'{avg_batch_loss:.4f}',  # Show average, not sum!
                     'lr': f'{scheduler.get_last_lr()[0]:.2e}'
                 })
 
@@ -394,7 +416,10 @@ def block_finetune(
             break
 
         avg_loss = epoch_loss / max(num_batches, 1)
-        print(f"  Epoch {epoch+1} average loss: {avg_loss:.4f}")
+        improved = "✓" if avg_loss < best_loss else "✗"
+        if avg_loss < best_loss:
+            best_loss = avg_loss
+        print(f"  Epoch {epoch+1} average loss: {avg_loss:.4f} {improved} (best: {best_loss:.4f})")
 
     # Set model to eval mode after training
     model.eval()
