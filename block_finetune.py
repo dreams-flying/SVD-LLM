@@ -500,6 +500,22 @@ def main(args):
     model.eval()
     model = model.cpu()
 
+    # Convert FP32 trainable params back to original dtype (BF16/FP16) for saving
+    # Training used FP32 for gradient stability, but inference only needs BF16/FP16
+    save_dtype = torch.bfloat16  # default
+    for p in model.parameters():
+        if p.dtype in (torch.float16, torch.bfloat16):
+            save_dtype = p.dtype
+            break
+    fp32_converted = 0
+    for name, param in model.named_parameters():
+        if param.dtype == torch.float32 and ('blocks_T' in name
+                or 'layernorm' in name.lower() or 'norm' in name.lower()
+                or 'bias' in name.lower()):
+            param.data = param.data.to(save_dtype)
+            fp32_converted += 1
+    print(f"  Converted {fp32_converted} FP32 params back to {save_dtype} for saving")
+
     final_path = os.path.join(args.output_dir, "model_block_finetuned.pt")
     torch.save({'model': model, 'tokenizer': tokenizer}, final_path)
     print(f"  Saved to: {final_path}")
