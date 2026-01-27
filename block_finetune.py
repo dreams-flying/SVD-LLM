@@ -19,12 +19,13 @@ Usage:
     python block_finetune.py \
         --prune_model path/to/compressed_model.pt \
         --output_dir ./block_finetune_output \
-        --num_epochs 2 \
-        --learning_rate 1e-4
+        --num_epochs 5 \
+        --learning_rate 5e-4
 """
 
 import os
 import sys
+import math
 import argparse
 from typing import List, Optional, Dict
 
@@ -46,13 +47,7 @@ device = "cuda" if torch.cuda.is_available() else "cpu"
 def convert_blocks_to_trainable(model: nn.Module) -> int:
     """
     Convert block values from buffers to trainable parameters.
-    Convert trainable params to FP32 for stable gradients, keep model backbone in BF16/FP16.
-
-    Args:
-        model: The compressed model
-
-    Returns:
-        Number of trainable block parameters
+    Only blocks are converted to FP32; model backbone stays BF16/FP16.
     """
     total_block_params = 0
 
@@ -61,17 +56,13 @@ def convert_blocks_to_trainable(model: nn.Module) -> int:
             if module.num_groups == 0:
                 continue
 
-            # Convert each block group's values to parameters
             for gi in range(module.num_groups):
                 buffer_name = f"g{gi}_blocks_T"
                 if hasattr(module, buffer_name):
-                    # Get the buffer tensor
                     blocks_T = getattr(module, buffer_name)
-
-                    # Delete the buffer
                     delattr(module, buffer_name)
 
-                    # Convert to FP32 for stable training gradients
+                    # FP32 for stable gradients, keep original values
                     param = nn.Parameter(blocks_T.clone().detach().float())
                     module.register_parameter(buffer_name, param)
 
@@ -82,68 +73,31 @@ def convert_blocks_to_trainable(model: nn.Module) -> int:
 
 def freeze_non_block_params(model: nn.Module, train_layernorm: bool = True, train_bias: bool = True) -> None:
     """
-    Freeze most parameters, but keep trainable:
-    - Block values (g*_blocks_T)
-    - LayerNorm parameters (helps adapt to block changes)
-    - Bias terms (low cost, helps adaptation)
-
-    Trainable parameters are converted to FP32 for stable gradients.
-
-    Args:
-        model: The model to freeze
-        train_layernorm: Whether to train LayerNorm parameters
-        train_bias: Whether to train bias parameters
+    Freeze most parameters, unfreeze blocks + LayerNorm + bias.
+    Trainable params converted to FP32 for stable gradients.
     """
     for name, param in model.named_parameters():
-        # Always train block values (already converted to FP32 in convert_blocks_to_trainable)
         if 'blocks_T' in name:
             param.requires_grad = True
-        # Train LayerNorm (input_layernorm, post_attention_layernorm, norm)
         elif train_layernorm and ('layernorm' in name.lower() or 'norm' in name.lower()):
             param.requires_grad = True
-            param.data = param.data.float()  # Convert to FP32
-        # Train bias terms
+            param.data = param.data.float()
         elif train_bias and 'bias' in name.lower():
             param.requires_grad = True
-            param.data = param.data.float()  # Convert to FP32
+            param.data = param.data.float()
         else:
             param.requires_grad = False
 
 
 def get_trainable_params(model: nn.Module) -> List[nn.Parameter]:
-    """
-    Get all trainable parameters (blocks, LayerNorm, bias).
-
-    Args:
-        model: The model
-
-    Returns:
-        List of trainable parameters
-    """
-    params = []
-    for name, param in model.named_parameters():
-        if param.requires_grad:
-            params.append(param)
-    return params
+    """Get all trainable parameters."""
+    return [p for _, p in model.named_parameters() if p.requires_grad]
 
 
 def create_calib_dataloader(tokenizer, dataset_name: str = "wikitext2",
                             num_samples: int = 256, seq_len: int = 512,
                             batch_size: int = 4) -> DataLoader:
-    """
-    Create calibration data loader with proper attention masks.
-
-    Args:
-        tokenizer: The tokenizer
-        dataset_name: Dataset to use
-        num_samples: Number of samples
-        seq_len: Sequence length
-        batch_size: Batch size
-
-    Returns:
-        DataLoader
-    """
-    # Ensure tokenizer has pad token
+    """Create calibration data loader with attention masks."""
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
         tokenizer.pad_token_id = tokenizer.eos_token_id
@@ -162,20 +116,13 @@ def create_calib_dataloader(tokenizer, dataset_name: str = "wikitext2",
     else:
         raise ValueError(f"Unknown dataset: {dataset_name}")
 
-    # Tokenize
     tokens = tokenizer(text, return_tensors='pt').input_ids[0]
 
-    # Create samples with attention masks
     samples = []
     for i in range(min(num_samples, len(tokens) // seq_len)):
         start = i * seq_len
         input_ids = tokens[start:start + seq_len]
-
-        # Create attention mask (all 1s for non-padded sequences)
         attention_mask = torch.ones_like(input_ids)
-
-        # Labels: use -100 for positions we don't want to compute loss on
-        # For causal LM, we want to predict all tokens, so labels = input_ids
         labels = input_ids.clone()
 
         samples.append({
@@ -185,6 +132,25 @@ def create_calib_dataloader(tokenizer, dataset_name: str = "wikitext2",
         })
 
     return DataLoader(samples, batch_size=batch_size, shuffle=True)
+
+
+def verify_block_gradients(model: nn.Module) -> Dict[str, float]:
+    """
+    After first backward, verify blocks actually received gradients.
+    Returns dict of {param_name: grad_norm}.
+    """
+    grad_info = {}
+    has_grad = 0
+    no_grad = 0
+    for name, param in model.named_parameters():
+        if 'blocks_T' in name and param.requires_grad:
+            if param.grad is not None and param.grad.abs().sum() > 0:
+                grad_info[name] = param.grad.norm().item()
+                has_grad += 1
+            else:
+                grad_info[name] = 0.0
+                no_grad += 1
+    return grad_info, has_grad, no_grad
 
 
 def check_gradients_valid(params) -> bool:
@@ -201,53 +167,39 @@ def block_finetune(
     tokenizer,
     num_epochs: int = 5,
     learning_rate: float = 5e-4,
-    batch_size: int = 4,
+    batch_size: int = 2,
     seq_len: int = 512,
     num_samples: int = 256,
     warmup_ratio: float = 0.05,
-    gradient_accumulation: int = 2,
+    gradient_accumulation: int = 4,
     max_grad_norm: float = 1.0,
     dataset_name: str = "wikitext2",
     train_layernorm: bool = True,
     train_bias: bool = True,
     use_amp: bool = True,
-    use_gradient_checkpointing: bool = True,
 ) -> nn.Module:
     """
     Fine-tune residual blocks (and optionally LayerNorm/bias).
-    Uses AMP (Automatic Mixed Precision) for memory efficiency.
 
-    Args:
-        model: Compressed model with SVDLinearWithDenseBlocks
-        tokenizer: Tokenizer
-        num_epochs: Number of training epochs
-        learning_rate: Learning rate
-        batch_size: Batch size
-        seq_len: Sequence length
-        num_samples: Number of calibration samples
-        warmup_ratio: Warmup ratio (fraction of total steps)
-        gradient_accumulation: Gradient accumulation steps
-        max_grad_norm: Maximum gradient norm for clipping
-        dataset_name: Dataset name
-        train_layernorm: Whether to train LayerNorm parameters
-        train_bias: Whether to train bias parameters
-        use_amp: Whether to use automatic mixed precision
-        use_gradient_checkpointing: Whether to use gradient checkpointing
+    NOTE: Gradient checkpointing is NOT used because
+    SVDLinearWithDenseBlocks.forward uses in-place index_add_(),
+    which is incompatible with gradient checkpointing (causes
+    incorrect gradients when forward is re-executed during backward).
 
-    Returns:
-        Fine-tuned model
+    Memory is saved by: AMP + small batch_size + gradient_accumulation.
     """
-    print("="*60)
-    print("Block Fine-tuning (AMP enabled)" if use_amp else "Block Fine-tuning")
-    print("="*60)
+    print("=" * 60)
+    print("Block Fine-tuning (AMP)" if use_amp else "Block Fine-tuning")
+    print("=" * 60)
 
-    # Enable gradient checkpointing for memory efficiency
-    if use_gradient_checkpointing and hasattr(model, 'gradient_checkpointing_enable'):
-        model.gradient_checkpointing_enable()
-        print("  Gradient checkpointing: enabled")
+    # ---- WARNING: DO NOT enable gradient_checkpointing ----
+    # SVDLinearWithDenseBlocks.forward uses y2d.index_add_() (in-place op).
+    # gradient_checkpointing re-runs forward during backward,
+    # which corrupts gradients on in-place modified tensors.
+    # -------------------------------------------------------
 
-    # Step 1: Convert blocks to trainable parameters (keep original values!)
-    print("\nConverting blocks to trainable parameters...")
+    # Step 1: Convert blocks buffer -> trainable parameter (FP32)
+    print("\nStep 1: Converting blocks to trainable parameters...")
     num_block_params = convert_blocks_to_trainable(model)
     print(f"  Total block parameters: {num_block_params:,}")
 
@@ -255,31 +207,31 @@ def block_finetune(
         print("  No blocks found, skipping fine-tuning")
         return model
 
-    # Step 2: Freeze non-block parameters (but keep LayerNorm/bias trainable)
-    print("\nSetting up trainable parameters...")
+    # Step 2: Freeze non-block parameters
+    print("\nStep 2: Setting up trainable parameters...")
     print(f"  Train LayerNorm: {train_layernorm}, Train bias: {train_bias}")
     freeze_non_block_params(model, train_layernorm=train_layernorm, train_bias=train_bias)
 
     # Count trainable params by type
-    block_params_count = 0
-    ln_params_count = 0
-    bias_params_count = 0
+    block_cnt = 0
+    ln_cnt = 0
+    bias_cnt = 0
     for name, param in model.named_parameters():
         if param.requires_grad:
             if 'blocks_T' in name:
-                block_params_count += param.numel()
+                block_cnt += param.numel()
             elif 'layernorm' in name.lower() or 'norm' in name.lower():
-                ln_params_count += param.numel()
+                ln_cnt += param.numel()
             elif 'bias' in name.lower():
-                bias_params_count += param.numel()
+                bias_cnt += param.numel()
 
     trainable_total = sum(p.numel() for p in model.parameters() if p.requires_grad)
     total_params = sum(p.numel() for p in model.parameters())
-    print(f"  Blocks: {block_params_count:,}, LayerNorm: {ln_params_count:,}, Bias: {bias_params_count:,}")
-    print(f"  Trainable: {trainable_total:,} / {total_params:,} ({100*trainable_total/total_params:.2f}%)")
+    print(f"  Blocks: {block_cnt:,}, LayerNorm: {ln_cnt:,}, Bias: {bias_cnt:,}")
+    print(f"  Trainable: {trainable_total:,} / {total_params:,} ({100 * trainable_total / total_params:.2f}%)")
 
     # Step 3: Create data loader
-    print(f"\nCreating calibration data ({dataset_name})...")
+    print(f"\nStep 3: Creating calibration data ({dataset_name})...")
     dataloader = create_calib_dataloader(
         tokenizer, dataset_name, num_samples, seq_len, batch_size
     )
@@ -289,29 +241,23 @@ def block_finetune(
     trainable_params = get_trainable_params(model)
     optimizer = torch.optim.AdamW(trainable_params, lr=learning_rate, weight_decay=0.01, eps=1e-8)
 
-    # Learning rate scheduler with warmup (use ratio to avoid warmup > total_steps)
+    # Cosine annealing scheduler with warmup
     total_steps = max(1, len(dataloader) * num_epochs // gradient_accumulation)
-    warmup_steps = int(total_steps * warmup_ratio)
+    warmup_steps = max(1, int(total_steps * warmup_ratio))
     print(f"  Total steps: {total_steps}, Warmup steps: {warmup_steps}")
 
-    import math
     def lr_lambda(step):
         if step < warmup_steps:
-            return (step + 1) / max(1, warmup_steps)
-        # Cosine annealing after warmup (better than linear decay)
-        decay_steps = total_steps - warmup_steps
-        if decay_steps <= 0:
-            return 1.0
-        progress = (step - warmup_steps) / decay_steps
+            return (step + 1) / warmup_steps
+        progress = (step - warmup_steps) / max(1, total_steps - warmup_steps)
         return max(0.01, 0.5 * (1 + math.cos(math.pi * progress)))
 
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
-    # Step 5: Setup AMP (Automatic Mixed Precision)
-    # Keep model backbone in BF16/FP16, trainable params in FP32
+    # Step 5: Setup AMP
     use_cuda = device == "cuda" and torch.cuda.is_available()
     if use_amp and use_cuda:
-        # Detect model backbone dtype (skip FP32 trainable params)
+        # Detect backbone dtype (skip FP32 trainable params)
         model_dtype = torch.float32
         for p in model.parameters():
             if p.dtype in (torch.float16, torch.bfloat16):
@@ -319,41 +265,39 @@ def block_finetune(
                 break
         if model_dtype == torch.bfloat16:
             amp_dtype = torch.bfloat16
-            # BF16 doesn't need GradScaler
-            scaler = None
+            scaler = None  # BF16 doesn't need GradScaler
         else:
             amp_dtype = torch.float16
             scaler = torch.cuda.amp.GradScaler()
-        print(f"  AMP enabled: autocast={amp_dtype}, GradScaler={scaler is not None}")
+        print(f"  AMP: autocast={amp_dtype}, GradScaler={scaler is not None}")
     else:
         amp_dtype = torch.float32
         scaler = None
         if use_amp:
             print("  AMP disabled (no CUDA)")
 
-    # Step 6: Training loop
-    print(f"\nTraining for {num_epochs} epochs...")
+    # Step 6: Training
+    print(f"\nStep 6: Training for {num_epochs} epochs...")
     model.train()
     model = model.to(device)
 
-    # Evaluate initial loss before training
-    print("\nEvaluating initial loss...")
+    # Evaluate initial loss
+    print("\n  Evaluating initial loss...")
     model.eval()
     with torch.no_grad():
         init_losses = []
         for i, batch in enumerate(dataloader):
-            if i >= 5:  # Sample 5 batches
+            if i >= 5:
                 break
-            input_ids = batch['input_ids'].to(device)
-            attention_mask = batch['attention_mask'].to(device)
-            labels = batch['labels'].to(device)
+            ids = batch['input_ids'].to(device)
+            mask = batch['attention_mask'].to(device)
+            labs = batch['labels'].to(device)
             with torch.cuda.amp.autocast(enabled=use_amp and use_cuda, dtype=amp_dtype):
-                outputs = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
-            if outputs.loss is not None:
-                init_losses.append(outputs.loss.float().item())
+                out = model(input_ids=ids, attention_mask=mask, labels=labs, use_cache=False)
+            if out.loss is not None:
+                init_losses.append(out.loss.float().item())
         if init_losses:
-            init_loss = sum(init_losses) / len(init_losses)
-            print(f"  Initial loss (before training): {init_loss:.4f}")
+            print(f"  Initial loss: {sum(init_losses) / len(init_losses):.4f}")
     model.train()
 
     global_step = 0
@@ -362,32 +306,32 @@ def block_finetune(
     nan_count = 0
     max_nan_batches = 10
     best_loss = float('inf')
+    grad_verified = False
 
     for epoch in range(num_epochs):
         epoch_loss = 0.0
         num_batches = 0
 
-        pbar = tqdm(dataloader, desc=f"Epoch {epoch+1}/{num_epochs}")
+        pbar = tqdm(dataloader, desc=f"Epoch {epoch + 1}/{num_epochs}")
 
         for batch in pbar:
-            # Move to device
             input_ids = batch['input_ids'].to(device)
             attention_mask = batch['attention_mask'].to(device)
             labels = batch['labels'].to(device)
 
-            # Forward pass with AMP autocast
+            # Forward with AMP autocast, use_cache=False to save memory
             try:
                 with torch.cuda.amp.autocast(enabled=use_amp and use_cuda, dtype=amp_dtype):
                     outputs = model(
                         input_ids=input_ids,
                         attention_mask=attention_mask,
-                        labels=labels
+                        labels=labels,
+                        use_cache=False,
                     )
 
                     if outputs.loss is not None:
                         loss = outputs.loss
                     else:
-                        # Manual loss computation
                         logits = outputs.logits
                         shift_logits = logits[..., :-1, :].contiguous()
                         shift_labels = labels[..., 1:].contiguous()
@@ -402,22 +346,20 @@ def block_finetune(
                     scaler.update()
                 continue
 
-            # Check for NaN/Inf loss
+            # NaN/Inf check
             if torch.isnan(loss) or torch.isinf(loss):
                 nan_count += 1
-                print(f"\n  Warning: NaN/Inf loss detected (count: {nan_count})")
+                print(f"\n  Warning: NaN/Inf loss (count: {nan_count})")
                 optimizer.zero_grad()
                 if scaler:
                     scaler.update()
                 if nan_count >= max_nan_batches:
-                    print(f"\n  Error: Too many NaN batches ({nan_count}), stopping training")
+                    print(f"\n  Error: Too many NaN batches, stopping")
                     break
                 continue
 
-            # Scale loss for gradient accumulation
             loss = loss / gradient_accumulation
 
-            # Backward pass with gradient scaling
             if scaler:
                 scaler.scale(loss).backward()
             else:
@@ -426,15 +368,25 @@ def block_finetune(
             accumulated_loss += loss.float().item()
             acc_steps += 1
 
+            # Verify gradients on first backward
+            if not grad_verified:
+                grad_info, has_grad, no_grad = verify_block_gradients(model)
+                if has_grad > 0:
+                    sample_grads = list(grad_info.items())[:3]
+                    grad_strs = [f"{n.split('.')[-3]}.{n.split('.')[-1]}={v:.2e}" for n, v in sample_grads]
+                    print(f"\n  Gradient check: {has_grad} blocks have grad, {no_grad} blocks have no grad")
+                    print(f"  Sample grad norms: {', '.join(grad_strs)}")
+                else:
+                    print(f"\n  WARNING: No blocks received gradients! Training will have no effect.")
+                grad_verified = True
+
             # Optimizer step
             if acc_steps >= gradient_accumulation:
                 if scaler:
-                    # Unscale gradients for clipping
                     scaler.unscale_(optimizer)
 
-                # Check for NaN/Inf gradients BEFORE clipping
                 if not check_gradients_valid(trainable_params):
-                    print(f"\n  Warning: NaN/Inf gradients detected, skipping update")
+                    print(f"\n  Warning: NaN/Inf gradients, skipping update")
                     optimizer.zero_grad()
                     if scaler:
                         scaler.update()
@@ -442,14 +394,11 @@ def block_finetune(
                     acc_steps = 0
                     nan_count += 1
                     if nan_count >= max_nan_batches:
-                        print(f"\n  Error: Too many NaN batches ({nan_count}), stopping training")
                         break
                     continue
 
-                # Gradient clipping
                 torch.nn.utils.clip_grad_norm_(trainable_params, max_grad_norm)
 
-                # Optimizer step with scaler
                 if scaler:
                     scaler.step(optimizer)
                     scaler.update()
@@ -472,17 +421,23 @@ def block_finetune(
                 accumulated_loss = 0.0
                 acc_steps = 0
 
+            # Free memory
+            del outputs, loss
+            if use_cuda:
+                torch.cuda.empty_cache()
+
         if nan_count >= max_nan_batches:
             break
 
         avg_loss = epoch_loss / max(num_batches, 1)
-        improved = "✓" if avg_loss < best_loss else "✗"
+        mark = "improved" if avg_loss < best_loss else "no improvement"
         if avg_loss < best_loss:
             best_loss = avg_loss
-        print(f"  Epoch {epoch+1} average loss: {avg_loss:.4f} {improved} (best: {best_loss:.4f})")
+        print(f"  Epoch {epoch + 1} avg loss: {avg_loss:.4f} ({mark}, best: {best_loss:.4f})")
 
-    # Set model to eval mode after training
     model.eval()
+    if use_cuda:
+        torch.cuda.empty_cache()
 
     print("\nBlock fine-tuning completed!")
     return model
@@ -490,9 +445,9 @@ def block_finetune(
 
 def main(args):
     """Main function."""
-    print("="*60)
+    print("=" * 60)
     print("Block Fine-tuning for SVD-LLM")
-    print("="*60)
+    print("=" * 60)
     print(f"  Input model: {args.prune_model}")
     print(f"  Output dir: {args.output_dir}")
     print(f"  Learning rate: {args.learning_rate}")
@@ -504,7 +459,6 @@ def main(args):
     tokenizer = pruned_dict['tokenizer']
     model = pruned_dict['model']
 
-    # Ensure tokenizer has pad token
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
         tokenizer.pad_token_id = tokenizer.eos_token_id
@@ -520,7 +474,6 @@ def main(args):
         print("  No blocks found, nothing to fine-tune")
         return
 
-    # Create output directory
     os.makedirs(args.output_dir, exist_ok=True)
 
     # Fine-tune
@@ -538,14 +491,12 @@ def main(args):
         train_layernorm=args.train_layernorm,
         train_bias=args.train_bias,
         use_amp=args.use_amp,
-        use_gradient_checkpointing=args.gradient_checkpointing,
     )
 
     # Save model
-    print("\n" + "="*60)
+    print("\n" + "=" * 60)
     print("Saving fine-tuned model...")
 
-    # Ensure eval mode and move to CPU for saving
     model.eval()
     model = model.cpu()
 
@@ -553,12 +504,11 @@ def main(args):
     torch.save({'model': model, 'tokenizer': tokenizer}, final_path)
     print(f"  Saved to: {final_path}")
 
-    # Evaluate if requested
+    # Evaluate
     if args.evaluate:
         print("\nEvaluating fine-tuned model...")
         from evaluater import ppl_eval
 
-        # Ensure model is in eval mode
         model.eval()
         model = model.to(device)
 
@@ -572,72 +522,57 @@ def main(args):
             )
         except Exception as e:
             print(f"  Evaluation error: {e}")
-            print("  Model may need to be loaded fresh for evaluation")
 
-    print("\n" + "="*60)
+    print("\n" + "=" * 60)
     print("Block fine-tuning completed!")
-    print("="*60)
+    print("=" * 60)
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='Block Fine-tuning for SVD-LLM')
 
-    # Model paths
     parser.add_argument('--prune_model', type=str, required=True,
                         help='Path to compressed model (.pt file)')
     parser.add_argument('--output_dir', type=str, default='./block_finetune_output',
                         help='Output directory')
 
-    # Training hyperparameters
+    # Training
     parser.add_argument('--num_epochs', type=int, default=5,
                         help='Number of epochs (default: 5)')
     parser.add_argument('--learning_rate', type=float, default=5e-4,
                         help='Learning rate (default: 5e-4)')
-    parser.add_argument('--batch_size', type=int, default=4,
-                        help='Batch size')
+    parser.add_argument('--batch_size', type=int, default=2,
+                        help='Batch size (default: 2, keep small for memory)')
     parser.add_argument('--seq_len', type=int, default=512,
                         help='Sequence length')
     parser.add_argument('--num_samples', type=int, default=256,
                         help='Number of calibration samples')
     parser.add_argument('--warmup_ratio', type=float, default=0.05,
                         help='Warmup ratio (default: 0.05)')
-    parser.add_argument('--gradient_accumulation', type=int, default=2,
-                        help='Gradient accumulation steps (default: 2)')
+    parser.add_argument('--gradient_accumulation', type=int, default=4,
+                        help='Gradient accumulation steps (default: 4)')
 
     # What to train
     parser.add_argument('--train_layernorm', action='store_true', default=True,
                         help='Train LayerNorm parameters (default: True)')
-    parser.add_argument('--no_train_layernorm', action='store_false', dest='train_layernorm',
-                        help='Do not train LayerNorm parameters')
+    parser.add_argument('--no_train_layernorm', action='store_false', dest='train_layernorm')
     parser.add_argument('--train_bias', action='store_true', default=True,
                         help='Train bias parameters (default: True)')
-    parser.add_argument('--no_train_bias', action='store_false', dest='train_bias',
-                        help='Do not train bias parameters')
+    parser.add_argument('--no_train_bias', action='store_false', dest='train_bias')
 
-    # AMP (Automatic Mixed Precision)
+    # AMP
     parser.add_argument('--use_amp', action='store_true', default=True,
                         help='Use automatic mixed precision (default: True)')
-    parser.add_argument('--no_amp', action='store_false', dest='use_amp',
-                        help='Disable automatic mixed precision')
-
-    # Memory optimization
-    parser.add_argument('--gradient_checkpointing', action='store_true', default=True,
-                        help='Use gradient checkpointing (default: True)')
-    parser.add_argument('--no_gradient_checkpointing', action='store_false', dest='gradient_checkpointing',
-                        help='Disable gradient checkpointing')
+    parser.add_argument('--no_amp', action='store_false', dest='use_amp')
 
     # Data
     parser.add_argument('--dataset', type=str, default='wikitext2',
-                        choices=['wikitext2', 'c4'],
-                        help='Training dataset')
+                        choices=['wikitext2', 'c4'])
 
     # Evaluation
-    parser.add_argument('--evaluate', action='store_true',
-                        help='Evaluate after training')
-    parser.add_argument('--model_seq_len', type=int, default=2048,
-                        help='Model sequence length for evaluation')
-    parser.add_argument('--eval_batch_size', type=int, default=1,
-                        help='Evaluation batch size')
+    parser.add_argument('--evaluate', action='store_true')
+    parser.add_argument('--model_seq_len', type=int, default=2048)
+    parser.add_argument('--eval_batch_size', type=int, default=1)
 
     args = parser.parse_args()
     main(args)
