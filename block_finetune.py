@@ -26,8 +26,9 @@ Usage:
 import os
 import sys
 import math
+import random
 import argparse
-from typing import List, Optional, Dict
+from typing import List, Dict, Tuple
 
 import torch
 import torch.nn as nn
@@ -94,34 +95,74 @@ def get_trainable_params(model: nn.Module) -> List[nn.Parameter]:
     return [p for _, p in model.named_parameters() if p.requires_grad]
 
 
-def create_calib_dataloader(tokenizer, dataset_name: str = "wikitext2",
-                            num_samples: int = 256, seq_len: int = 512,
-                            batch_size: int = 4, split: str = 'train') -> DataLoader:
-    """Create calibration data loader with attention masks."""
+def create_dataloader(
+    tokenizer,
+    dataset_name: str = "wikitext2",
+    num_samples: int = 256,
+    seq_len: int = 512,
+    batch_size: int = 4,
+    split: str = 'train',
+    seed: int = 42,
+) -> DataLoader:
+    """
+    Create data loader with random sampling for better coverage.
+
+    Uses random starting positions instead of consecutive slices to:
+    1. Increase effective sample diversity
+    2. Better utilize available text data
+    """
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
         tokenizer.pad_token_id = tokenizer.eos_token_id
 
+    # Load dataset
     if dataset_name == "wikitext2":
+        # wikitext2 splits: 'train', 'validation', 'test'
         data = load_dataset('wikitext', 'wikitext-2-raw-v1', split=split)
         text = "\n\n".join(data['text'])
     elif dataset_name == "c4":
         data = load_dataset('allenai/c4', 'en', split=split, streaming=True)
         texts = []
         for i, item in enumerate(data):
-            if i >= num_samples:
+            if i >= num_samples * 2:  # Get more text for random sampling
                 break
             texts.append(item['text'])
         text = "\n\n".join(texts)
     else:
         raise ValueError(f"Unknown dataset: {dataset_name}")
 
+    # Tokenize
     tokens = tokenizer(text, return_tensors='pt').input_ids[0]
+    total_tokens = len(tokens)
 
+    if total_tokens < seq_len:
+        raise ValueError(f"Dataset too small: {total_tokens} tokens < seq_len {seq_len}")
+
+    # Random sampling: generate random start positions
+    max_start = total_tokens - seq_len
+    rng = random.Random(seed)
+
+    # For training: random positions; for validation: evenly spaced
+    if split == 'train':
+        # Random sampling with replacement if needed
+        start_positions = [rng.randint(0, max_start) for _ in range(num_samples)]
+    else:
+        # Evenly spaced for reproducible validation
+        actual_samples = min(num_samples, max_start // seq_len + 1)
+        if actual_samples < num_samples:
+            # If not enough unique positions, use what we have with some overlap
+            step = max(1, max_start // num_samples)
+            start_positions = [i * step for i in range(num_samples) if i * step <= max_start]
+        else:
+            step = max_start // num_samples
+            start_positions = [i * step for i in range(num_samples)]
+
+    # Create samples
     samples = []
-    for i in range(min(num_samples, len(tokens) // seq_len)):
-        start = i * seq_len
+    for start in start_positions:
         input_ids = tokens[start:start + seq_len]
+        if len(input_ids) < seq_len:
+            continue  # Skip incomplete sequences
         attention_mask = torch.ones_like(input_ids)
         labels = input_ids.clone()
 
@@ -131,11 +172,12 @@ def create_calib_dataloader(tokenizer, dataset_name: str = "wikitext2",
             'labels': labels
         })
 
+    print(f"    Created {len(samples)} samples from {total_tokens:,} tokens ({split})")
     return DataLoader(samples, batch_size=batch_size, shuffle=(split == 'train'))
 
 
 @torch.no_grad()
-def validate(model, dataloader, use_amp, amp_dtype, device) -> float:
+def validate(model, dataloader, use_amp: bool, amp_dtype, device: str) -> float:
     """Run validation and return average loss."""
     model.eval()
     total_loss = 0.0
@@ -159,14 +201,13 @@ def validate(model, dataloader, use_amp, amp_dtype, device) -> float:
         total_loss += loss.float().item()
         num_batches += 1
 
-    model.train()
     return total_loss / max(num_batches, 1)
 
 
-def verify_block_gradients(model: nn.Module) -> Dict[str, float]:
+def verify_block_gradients(model: nn.Module) -> Tuple[Dict[str, float], int, int]:
     """
     After first backward, verify blocks actually received gradients.
-    Returns dict of {param_name: grad_norm}.
+    Returns (grad_info, has_grad_count, no_grad_count).
     """
     grad_info = {}
     has_grad = 0
@@ -182,13 +223,30 @@ def verify_block_gradients(model: nn.Module) -> Dict[str, float]:
     return grad_info, has_grad, no_grad
 
 
-def check_gradients_valid(params) -> bool:
+def check_gradients_valid(params: List[nn.Parameter]) -> bool:
     """Check if gradients are valid (no NaN or Inf)."""
     for p in params:
         if p.grad is not None:
             if torch.isnan(p.grad).any() or torch.isinf(p.grad).any():
                 return False
     return True
+
+
+def get_cosine_schedule_with_warmup(optimizer, num_warmup_steps: int, num_training_steps: int):
+    """
+    Create a schedule with linear warmup and cosine decay.
+    More robust than lambda function with proper bounds checking.
+    """
+    def lr_lambda(current_step: int) -> float:
+        # Warmup phase
+        if current_step < num_warmup_steps:
+            return float(current_step + 1) / float(max(1, num_warmup_steps))
+        # Cosine decay phase
+        progress = float(current_step - num_warmup_steps) / float(max(1, num_training_steps - num_warmup_steps))
+        progress = min(1.0, progress)  # Clamp to [0, 1]
+        return max(0.0, 0.5 * (1.0 + math.cos(math.pi * progress)))
+
+    return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
 
 def block_finetune(
@@ -212,20 +270,13 @@ def block_finetune(
 
     NOTE: Gradient checkpointing is NOT used because
     SVDLinearWithDenseBlocks.forward uses in-place index_add_(),
-    which is incompatible with gradient checkpointing (causes
-    incorrect gradients when forward is re-executed during backward).
+    which is incompatible with gradient checkpointing.
 
     Memory is saved by: AMP + small batch_size + gradient_accumulation.
     """
     print("=" * 60)
     print("Block Fine-tuning (AMP)" if use_amp else "Block Fine-tuning")
     print("=" * 60)
-
-    # ---- WARNING: DO NOT enable gradient_checkpointing ----
-    # SVDLinearWithDenseBlocks.forward uses y2d.index_add_() (in-place op).
-    # gradient_checkpointing re-runs forward during backward,
-    # which corrupts gradients on in-place modified tensors.
-    # -------------------------------------------------------
 
     # Step 1: Convert blocks buffer -> trainable parameter (FP32)
     print("\nStep 1: Converting blocks to trainable parameters...")
@@ -259,32 +310,26 @@ def block_finetune(
     print(f"  Blocks: {block_cnt:,}, LayerNorm: {ln_cnt:,}, Bias: {bias_cnt:,}")
     print(f"  Trainable: {trainable_total:,} / {total_params:,} ({100 * trainable_total / total_params:.2f}%)")
 
-    # Step 3: Create data loaders (train + validation)
+    # Step 3: Create data loaders
     print(f"\nStep 3: Creating data loaders ({dataset_name})...")
-    dataloader = create_calib_dataloader(
-        tokenizer, dataset_name, num_samples, seq_len, batch_size, split='train'
+    train_loader = create_dataloader(
+        tokenizer, dataset_name, num_samples, seq_len, batch_size, split='train', seed=42
     )
-    val_dataloader = create_calib_dataloader(
-        tokenizer, dataset_name, num_samples=64, seq_len=seq_len, batch_size=batch_size, split='test'
+    # Use 'validation' split for validation (not 'test' - save that for final eval)
+    val_loader = create_dataloader(
+        tokenizer, dataset_name, num_samples=64, seq_len=seq_len, batch_size=batch_size, split='validation', seed=42
     )
-    print(f"  Train samples: {len(dataloader.dataset)}, Val samples: {len(val_dataloader.dataset)}")
+    print(f"  Train: {len(train_loader.dataset)} samples, Val: {len(val_loader.dataset)} samples")
 
-    # Step 4: Setup optimizer
+    # Step 4: Setup optimizer and scheduler
     trainable_params = get_trainable_params(model)
     optimizer = torch.optim.AdamW(trainable_params, lr=learning_rate, weight_decay=0.01, eps=1e-8)
 
-    # Cosine annealing scheduler with warmup
-    total_steps = max(1, len(dataloader) * num_epochs // gradient_accumulation)
-    warmup_steps = max(1, int(total_steps * warmup_ratio))
+    total_steps = len(train_loader) * num_epochs // gradient_accumulation
+    warmup_steps = int(total_steps * warmup_ratio)
     print(f"  Total steps: {total_steps}, Warmup steps: {warmup_steps}")
 
-    def lr_lambda(step):
-        if step < warmup_steps:
-            return (step + 1) / warmup_steps
-        progress = (step - warmup_steps) / max(1, total_steps - warmup_steps)
-        return max(0.01, 0.5 * (1 + math.cos(math.pi * progress)))
-
-    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+    scheduler = get_cosine_schedule_with_warmup(optimizer, warmup_steps, total_steps)
 
     # Step 5: Setup AMP
     use_cuda = device == "cuda" and torch.cuda.is_available()
@@ -313,9 +358,9 @@ def block_finetune(
     model.train()
     model = model.to(device)
 
-    # Evaluate initial loss on validation set
-    print("\n  Evaluating initial loss...")
-    init_val_loss = validate(model, val_dataloader, use_amp, amp_dtype, device)
+    # Initial validation
+    print("\n  Initial validation...")
+    init_val_loss = validate(model, val_loader, use_amp, amp_dtype, device)
     print(f"  Initial val_loss: {init_val_loss:.4f}")
     model.train()
 
@@ -324,21 +369,21 @@ def block_finetune(
     acc_steps = 0
     nan_count = 0
     max_nan_batches = 10
-    best_loss = float('inf')
+    best_val_loss = float('inf')
     grad_verified = False
 
     for epoch in range(num_epochs):
         epoch_loss = 0.0
         num_batches = 0
 
-        pbar = tqdm(dataloader, desc=f"Epoch {epoch + 1}/{num_epochs}")
+        pbar = tqdm(train_loader, desc=f"Epoch {epoch + 1}/{num_epochs}")
 
         for batch in pbar:
             input_ids = batch['input_ids'].to(device)
             attention_mask = batch['attention_mask'].to(device)
             labels = batch['labels'].to(device)
 
-            # Forward with AMP autocast, use_cache=False to save memory
+            # Forward with AMP autocast
             try:
                 with torch.cuda.amp.autocast(enabled=use_amp and use_cuda, dtype=amp_dtype):
                     outputs = model(
@@ -393,10 +438,10 @@ def block_finetune(
                 if has_grad > 0:
                     sample_grads = list(grad_info.items())[:3]
                     grad_strs = [f"{n.split('.')[-3]}.{n.split('.')[-1]}={v:.2e}" for n, v in sample_grads]
-                    print(f"\n  Gradient check: {has_grad} blocks have grad, {no_grad} blocks have no grad")
+                    print(f"\n  Gradient check: {has_grad} blocks have grad, {no_grad} blocks no grad")
                     print(f"  Sample grad norms: {', '.join(grad_strs)}")
                 else:
-                    print(f"\n  WARNING: No blocks received gradients! Training will have no effect.")
+                    print(f"\n  WARNING: No blocks received gradients!")
                 grad_verified = True
 
             # Optimizer step
@@ -440,36 +485,37 @@ def block_finetune(
                 accumulated_loss = 0.0
                 acc_steps = 0
 
-            # Free memory
+            # Clean up (don't call empty_cache every iteration!)
             del outputs, loss
-            if use_cuda:
-                torch.cuda.empty_cache()
 
         if nan_count >= max_nan_batches:
             break
 
-        # Compute train loss
+        # Epoch end: compute stats and validate
         avg_train_loss = epoch_loss / max(num_batches, 1)
 
-        # Validation step
-        val_loss = validate(model, val_dataloader, use_amp, amp_dtype, device)
+        # Validation
+        val_loss = validate(model, val_loader, use_amp, amp_dtype, device)
 
-        # Track best based on validation loss
-        improved = val_loss < best_loss
+        improved = val_loss < best_val_loss
         if improved:
-            best_loss = val_loss
+            best_val_loss = val_loss
 
         print(f"  Epoch {epoch + 1}: train_loss={avg_train_loss:.4f}, val_loss={val_loss:.4f} "
-              f"{'✓ improved' if improved else ''} (best: {best_loss:.4f})")
+              f"{'✓' if improved else ''} (best: {best_val_loss:.4f})")
 
         model.train()
+
+        # Clear cache once per epoch (not every iteration!)
+        if use_cuda:
+            torch.cuda.empty_cache()
 
     model.eval()
     if use_cuda:
         torch.cuda.empty_cache()
 
     print("\nBlock fine-tuning completed!")
-    print(f"  Best validation loss: {best_loss:.4f}")
+    print(f"  Best validation loss: {best_val_loss:.4f}")
     return model
 
 
@@ -530,9 +576,8 @@ def main(args):
     model.eval()
     model = model.cpu()
 
-    # Convert FP32 trainable params back to original dtype (BF16/FP16) for saving
-    # Training used FP32 for gradient stability, but inference only needs BF16/FP16
-    save_dtype = torch.bfloat16  # default
+    # Convert FP32 trainable params back to original dtype for saving
+    save_dtype = torch.bfloat16
     for p in model.parameters():
         if p.dtype in (torch.float16, torch.bfloat16):
             save_dtype = p.dtype
@@ -544,15 +589,15 @@ def main(args):
                 or 'bias' in name.lower()):
             param.data = param.data.to(save_dtype)
             fp32_converted += 1
-    print(f"  Converted {fp32_converted} FP32 params back to {save_dtype} for saving")
+    print(f"  Converted {fp32_converted} FP32 params back to {save_dtype}")
 
     final_path = os.path.join(args.output_dir, "model_block_finetuned.pt")
     torch.save({'model': model, 'tokenizer': tokenizer}, final_path)
     print(f"  Saved to: {final_path}")
 
-    # Evaluate
+    # Final evaluation on test set
     if args.evaluate:
-        print("\nEvaluating fine-tuned model...")
+        print("\nEvaluating on test set...")
         from evaluater import ppl_eval
 
         model.eval()
@@ -583,37 +628,26 @@ if __name__ == "__main__":
                         help='Output directory')
 
     # Training
-    parser.add_argument('--num_epochs', type=int, default=5,
-                        help='Number of epochs (default: 5)')
-    parser.add_argument('--learning_rate', type=float, default=5e-4,
-                        help='Learning rate (default: 5e-4)')
-    parser.add_argument('--batch_size', type=int, default=2,
-                        help='Batch size (default: 2, keep small for memory)')
-    parser.add_argument('--seq_len', type=int, default=512,
-                        help='Sequence length')
-    parser.add_argument('--num_samples', type=int, default=256,
-                        help='Number of calibration samples')
-    parser.add_argument('--warmup_ratio', type=float, default=0.05,
-                        help='Warmup ratio (default: 0.05)')
-    parser.add_argument('--gradient_accumulation', type=int, default=4,
-                        help='Gradient accumulation steps (default: 4)')
+    parser.add_argument('--num_epochs', type=int, default=5)
+    parser.add_argument('--learning_rate', type=float, default=5e-4)
+    parser.add_argument('--batch_size', type=int, default=2)
+    parser.add_argument('--seq_len', type=int, default=512)
+    parser.add_argument('--num_samples', type=int, default=256)
+    parser.add_argument('--warmup_ratio', type=float, default=0.05)
+    parser.add_argument('--gradient_accumulation', type=int, default=4)
 
     # What to train
-    parser.add_argument('--train_layernorm', action='store_true', default=True,
-                        help='Train LayerNorm parameters (default: True)')
+    parser.add_argument('--train_layernorm', action='store_true', default=True)
     parser.add_argument('--no_train_layernorm', action='store_false', dest='train_layernorm')
-    parser.add_argument('--train_bias', action='store_true', default=True,
-                        help='Train bias parameters (default: True)')
+    parser.add_argument('--train_bias', action='store_true', default=True)
     parser.add_argument('--no_train_bias', action='store_false', dest='train_bias')
 
     # AMP
-    parser.add_argument('--use_amp', action='store_true', default=True,
-                        help='Use automatic mixed precision (default: True)')
+    parser.add_argument('--use_amp', action='store_true', default=True)
     parser.add_argument('--no_amp', action='store_false', dest='use_amp')
 
     # Data
-    parser.add_argument('--dataset', type=str, default='wikitext2',
-                        choices=['wikitext2', 'c4'])
+    parser.add_argument('--dataset', type=str, default='wikitext2', choices=['wikitext2', 'c4'])
 
     # Evaluation
     parser.add_argument('--evaluate', action='store_true')
