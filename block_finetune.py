@@ -96,17 +96,17 @@ def get_trainable_params(model: nn.Module) -> List[nn.Parameter]:
 
 def create_calib_dataloader(tokenizer, dataset_name: str = "wikitext2",
                             num_samples: int = 256, seq_len: int = 512,
-                            batch_size: int = 4) -> DataLoader:
+                            batch_size: int = 4, split: str = 'train') -> DataLoader:
     """Create calibration data loader with attention masks."""
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
         tokenizer.pad_token_id = tokenizer.eos_token_id
 
     if dataset_name == "wikitext2":
-        data = load_dataset('wikitext', 'wikitext-2-raw-v1', split='train')
+        data = load_dataset('wikitext', 'wikitext-2-raw-v1', split=split)
         text = "\n\n".join(data['text'])
     elif dataset_name == "c4":
-        data = load_dataset('allenai/c4', 'en', split='train', streaming=True)
+        data = load_dataset('allenai/c4', 'en', split=split, streaming=True)
         texts = []
         for i, item in enumerate(data):
             if i >= num_samples:
@@ -131,7 +131,36 @@ def create_calib_dataloader(tokenizer, dataset_name: str = "wikitext2",
             'labels': labels
         })
 
-    return DataLoader(samples, batch_size=batch_size, shuffle=True)
+    return DataLoader(samples, batch_size=batch_size, shuffle=(split == 'train'))
+
+
+@torch.no_grad()
+def validate(model, dataloader, use_amp, amp_dtype, device) -> float:
+    """Run validation and return average loss."""
+    model.eval()
+    total_loss = 0.0
+    num_batches = 0
+    use_cuda = device == "cuda" and torch.cuda.is_available()
+
+    for batch in dataloader:
+        input_ids = batch['input_ids'].to(device)
+        attention_mask = batch['attention_mask'].to(device)
+        labels = batch['labels'].to(device)
+
+        with torch.cuda.amp.autocast(enabled=use_amp and use_cuda, dtype=amp_dtype):
+            outputs = model(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                labels=labels,
+                use_cache=False,
+            )
+            loss = outputs.loss if outputs.loss is not None else torch.tensor(0.0)
+
+        total_loss += loss.float().item()
+        num_batches += 1
+
+    model.train()
+    return total_loss / max(num_batches, 1)
 
 
 def verify_block_gradients(model: nn.Module) -> Dict[str, float]:
@@ -230,12 +259,15 @@ def block_finetune(
     print(f"  Blocks: {block_cnt:,}, LayerNorm: {ln_cnt:,}, Bias: {bias_cnt:,}")
     print(f"  Trainable: {trainable_total:,} / {total_params:,} ({100 * trainable_total / total_params:.2f}%)")
 
-    # Step 3: Create data loader
-    print(f"\nStep 3: Creating calibration data ({dataset_name})...")
+    # Step 3: Create data loaders (train + validation)
+    print(f"\nStep 3: Creating data loaders ({dataset_name})...")
     dataloader = create_calib_dataloader(
-        tokenizer, dataset_name, num_samples, seq_len, batch_size
+        tokenizer, dataset_name, num_samples, seq_len, batch_size, split='train'
     )
-    print(f"  Samples: {len(dataloader.dataset)}, Batch size: {batch_size}")
+    val_dataloader = create_calib_dataloader(
+        tokenizer, dataset_name, num_samples=64, seq_len=seq_len, batch_size=batch_size, split='test'
+    )
+    print(f"  Train samples: {len(dataloader.dataset)}, Val samples: {len(val_dataloader.dataset)}")
 
     # Step 4: Setup optimizer
     trainable_params = get_trainable_params(model)
@@ -281,23 +313,10 @@ def block_finetune(
     model.train()
     model = model.to(device)
 
-    # Evaluate initial loss
+    # Evaluate initial loss on validation set
     print("\n  Evaluating initial loss...")
-    model.eval()
-    with torch.no_grad():
-        init_losses = []
-        for i, batch in enumerate(dataloader):
-            if i >= 5:
-                break
-            ids = batch['input_ids'].to(device)
-            mask = batch['attention_mask'].to(device)
-            labs = batch['labels'].to(device)
-            with torch.cuda.amp.autocast(enabled=use_amp and use_cuda, dtype=amp_dtype):
-                out = model(input_ids=ids, attention_mask=mask, labels=labs, use_cache=False)
-            if out.loss is not None:
-                init_losses.append(out.loss.float().item())
-        if init_losses:
-            print(f"  Initial loss: {sum(init_losses) / len(init_losses):.4f}")
+    init_val_loss = validate(model, val_dataloader, use_amp, amp_dtype, device)
+    print(f"  Initial val_loss: {init_val_loss:.4f}")
     model.train()
 
     global_step = 0
@@ -429,17 +448,28 @@ def block_finetune(
         if nan_count >= max_nan_batches:
             break
 
-        avg_loss = epoch_loss / max(num_batches, 1)
-        mark = "improved" if avg_loss < best_loss else "no improvement"
-        if avg_loss < best_loss:
-            best_loss = avg_loss
-        print(f"  Epoch {epoch + 1} avg loss: {avg_loss:.4f} ({mark}, best: {best_loss:.4f})")
+        # Compute train loss
+        avg_train_loss = epoch_loss / max(num_batches, 1)
+
+        # Validation step
+        val_loss = validate(model, val_dataloader, use_amp, amp_dtype, device)
+
+        # Track best based on validation loss
+        improved = val_loss < best_loss
+        if improved:
+            best_loss = val_loss
+
+        print(f"  Epoch {epoch + 1}: train_loss={avg_train_loss:.4f}, val_loss={val_loss:.4f} "
+              f"{'✓ improved' if improved else ''} (best: {best_loss:.4f})")
+
+        model.train()
 
     model.eval()
     if use_cuda:
         torch.cuda.empty_cache()
 
     print("\nBlock fine-tuning completed!")
+    print(f"  Best validation loss: {best_loss:.4f}")
     return model
 
 
