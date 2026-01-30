@@ -496,7 +496,6 @@ def block_finetune(
     model.train()
 
     global_step = 0
-    accumulated_loss = 0.0
     acc_steps = 0
     nan_count = 0
     max_nan_batches = 10
@@ -535,11 +534,20 @@ def block_finetune(
                     logits = outputs.logits
                     shift_logits = logits[..., :-1, :].contiguous()
                     shift_labels = labels[..., 1:].contiguous()
-                    loss = F.cross_entropy(
+
+                    # Loss for backward (with label_smoothing for regularization)
+                    loss_for_backward = F.cross_entropy(
                         shift_logits.view(-1, shift_logits.size(-1)),
                         shift_labels.view(-1),
                         label_smoothing=label_smoothing,
                     )
+
+                    # Loss for logging (without label_smoothing, consistent with val_loss)
+                    with torch.no_grad():
+                        loss_for_logging = F.cross_entropy(
+                            shift_logits.view(-1, shift_logits.size(-1)),
+                            shift_labels.view(-1),
+                        )
             except Exception as e:
                 print(f"\n  Warning: Forward pass error: {e}")
                 optimizer.zero_grad()
@@ -548,7 +556,7 @@ def block_finetune(
                 continue
 
             # NaN/Inf check
-            if torch.isnan(loss) or torch.isinf(loss):
+            if torch.isnan(loss_for_backward) or torch.isinf(loss_for_backward):
                 nan_count += 1
                 print(f"\n  Warning: NaN/Inf loss (count: {nan_count})")
                 optimizer.zero_grad()
@@ -559,14 +567,17 @@ def block_finetune(
                     break
                 continue
 
-            loss = loss / gradient_accumulation
+            # Scale loss for gradient accumulation
+            scaled_loss = loss_for_backward / gradient_accumulation
 
             if scaler:
-                scaler.scale(loss).backward()
+                scaler.scale(scaled_loss).backward()
             else:
-                loss.backward()
+                scaled_loss.backward()
 
-            accumulated_loss += loss.float().item()
+            # Accumulate unsmoothed loss for logging (same as val_loss calculation)
+            epoch_loss += loss_for_logging.float().item()
+            num_batches += 1
             acc_steps += 1
 
             # Verify gradients on first backward
@@ -581,6 +592,12 @@ def block_finetune(
                     print(f"\n  WARNING: No blocks received gradients!")
                 grad_verified = True
 
+            # Update progress bar with current batch loss
+            pbar.set_postfix({
+                'loss': f'{loss_for_logging.item():.4f}',
+                'lr': f'{scheduler.get_last_lr()[0]:.2e}'
+            })
+
             # Optimizer step
             if acc_steps >= gradient_accumulation:
                 if scaler:
@@ -591,7 +608,6 @@ def block_finetune(
                     optimizer.zero_grad()
                     if scaler:
                         scaler.update()
-                    accumulated_loss = 0.0
                     acc_steps = 0
                     nan_count += 1
                     if nan_count >= max_nan_batches:
@@ -610,20 +626,10 @@ def block_finetune(
                 optimizer.zero_grad()
 
                 global_step += 1
-                avg_batch_loss = accumulated_loss
-                epoch_loss += avg_batch_loss
-                num_batches += 1
-
-                pbar.set_postfix({
-                    'loss': f'{avg_batch_loss:.4f}',
-                    'lr': f'{scheduler.get_last_lr()[0]:.2e}'
-                })
-
-                accumulated_loss = 0.0
                 acc_steps = 0
 
-            # Clean up (don't call empty_cache every iteration!)
-            del outputs, loss
+            # Clean up
+            del outputs, loss_for_backward, loss_for_logging
 
         if nan_count >= max_nan_batches:
             break
