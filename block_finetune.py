@@ -275,14 +275,16 @@ def block_finetune(
     warmup_ratio: float = 0.05,
     gradient_accumulation: int = 4,
     max_grad_norm: float = 1.0,
-    weight_decay: float = 0.01,
+    weight_decay: float = 0.0,
     block_weight_decay: float = 0.0,
+    ln_weight_decay: float = 0.0,
     dataset_name: str = "wikitext2",
     train_layernorm: bool = True,
     train_bias: bool = True,
     use_amp: bool = True,
     scheduler_type: str = "cosine",
     min_lr_ratio: float = 0.1,
+    label_smoothing: float = 0.0,
 ) -> nn.Module:
     """
     Fine-tune residual blocks (and optionally LayerNorm/bias).
@@ -290,8 +292,11 @@ def block_finetune(
     Key parameters for better training:
     - block_lr_multiplier: Scale blocks LR relative to base LR (default 1.0)
     - block_weight_decay: Weight decay for blocks (default 0.0 - blocks shouldn't be regularized)
+    - ln_weight_decay: Weight decay for LayerNorm (default 0.0 - LN shouldn't be regularized)
+    - weight_decay: Weight decay for bias (default 0.0)
     - scheduler_type: "cosine" or "constant" (constant often works better for fine-tuning)
     - min_lr_ratio: For cosine, minimum LR as ratio of initial (default 0.1 = don't decay to 0)
+    - label_smoothing: Label smoothing for cross-entropy (default 0.0, try 0.1 for better generalization)
 
     NOTE: Gradient checkpointing is NOT used because
     SVDLinearWithDenseBlocks.forward uses in-place index_add_(),
@@ -347,16 +352,20 @@ def block_finetune(
     print(f"  Train: {len(train_loader.dataset)} samples, Val: {len(val_loader.dataset)} samples")
 
     # Step 4: Setup optimizer with separate param groups
-    # Blocks: potentially different LR and lower weight_decay (they compensate for SVD error)
-    # LayerNorm/bias: standard LR and weight_decay
+    # - Blocks: compensate SVD error, no weight decay
+    # - LayerNorm: scale/shift, typically no weight decay
+    # - Bias: typically no weight decay
     block_params = []
-    other_params = []
+    ln_params = []
+    bias_params = []
     for name, param in model.named_parameters():
         if param.requires_grad:
             if 'blocks_T' in name:
                 block_params.append(param)
+            elif 'layernorm' in name.lower() or 'norm' in name.lower():
+                ln_params.append(param)
             else:
-                other_params.append(param)
+                bias_params.append(param)
 
     param_groups = []
     if block_params:
@@ -366,19 +375,27 @@ def block_finetune(
             'weight_decay': block_weight_decay,
             'name': 'blocks'
         })
-    if other_params:
+    if ln_params:
         param_groups.append({
-            'params': other_params,
+            'params': ln_params,
+            'lr': learning_rate,
+            'weight_decay': ln_weight_decay,
+            'name': 'layernorm'
+        })
+    if bias_params:
+        param_groups.append({
+            'params': bias_params,
             'lr': learning_rate,
             'weight_decay': weight_decay,
-            'name': 'layernorm_bias'
+            'name': 'bias'
         })
 
     optimizer = torch.optim.AdamW(param_groups, eps=1e-8)
-    trainable_params = block_params + other_params  # For gradient clipping and validation
+    trainable_params = block_params + ln_params + bias_params  # For gradient clipping and validation
     print(f"\nStep 4: Optimizer setup...")
     print(f"  Block params: {len(block_params)}, LR={learning_rate * block_lr_multiplier:.2e}, WD={block_weight_decay}")
-    print(f"  Other params: {len(other_params)}, LR={learning_rate:.2e}, WD={weight_decay}")
+    print(f"  LayerNorm params: {len(ln_params)}, LR={learning_rate:.2e}, WD={ln_weight_decay}")
+    print(f"  Bias params: {len(bias_params)}, LR={learning_rate:.2e}, WD={weight_decay}")
 
     total_steps = len(train_loader) * num_epochs // gradient_accumulation
     warmup_steps = int(total_steps * warmup_ratio)
@@ -448,20 +465,19 @@ def block_finetune(
                     outputs = model(
                         input_ids=input_ids,
                         attention_mask=attention_mask,
-                        labels=labels,
+                        labels=None,  # Compute loss ourselves for label smoothing
                         use_cache=False,
                     )
 
-                    if outputs.loss is not None:
-                        loss = outputs.loss
-                    else:
-                        logits = outputs.logits
-                        shift_logits = logits[..., :-1, :].contiguous()
-                        shift_labels = labels[..., 1:].contiguous()
-                        loss = F.cross_entropy(
-                            shift_logits.view(-1, shift_logits.size(-1)),
-                            shift_labels.view(-1)
-                        )
+                    logits = outputs.logits
+                    shift_logits = logits[..., :-1, :].contiguous()
+                    shift_labels = labels[..., 1:].contiguous()
+                    loss = F.cross_entropy(
+                        shift_logits.view(-1, shift_logits.size(-1)),
+                        shift_labels.view(-1),
+                        label_smoothing=label_smoothing,
+                        ignore_index=-100,
+                    )
             except Exception as e:
                 print(f"\n  Warning: Forward pass error: {e}")
                 optimizer.zero_grad()
@@ -626,12 +642,14 @@ def main(args):
         max_grad_norm=args.max_grad_norm,
         weight_decay=args.weight_decay,
         block_weight_decay=args.block_weight_decay,
+        ln_weight_decay=args.ln_weight_decay,
         dataset_name=args.dataset,
         train_layernorm=args.train_layernorm,
         train_bias=args.train_bias,
         use_amp=args.use_amp,
         scheduler_type=args.scheduler,
         min_lr_ratio=args.min_lr_ratio,
+        label_smoothing=args.label_smoothing,
     )
 
     # Save model
@@ -703,10 +721,14 @@ if __name__ == "__main__":
     parser.add_argument('--warmup_ratio', type=float, default=0.05)
     parser.add_argument('--gradient_accumulation', type=int, default=4)
     parser.add_argument('--max_grad_norm', type=float, default=1.0)
-    parser.add_argument('--weight_decay', type=float, default=0.01,
-                        help='Weight decay for LayerNorm/bias')
+    parser.add_argument('--weight_decay', type=float, default=0.0,
+                        help='Weight decay for bias params (0 recommended)')
     parser.add_argument('--block_weight_decay', type=float, default=0.0,
                         help='Weight decay for blocks (0 recommended - blocks compensate SVD error)')
+    parser.add_argument('--ln_weight_decay', type=float, default=0.0,
+                        help='Weight decay for LayerNorm (0 recommended)')
+    parser.add_argument('--label_smoothing', type=float, default=0.0,
+                        help='Label smoothing for cross-entropy (try 0.1 for better generalization)')
 
     # Scheduler
     parser.add_argument('--scheduler', type=str, default='cosine', choices=['cosine', 'constant'],
