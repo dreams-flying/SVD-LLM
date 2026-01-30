@@ -95,6 +95,90 @@ def get_trainable_params(model: nn.Module) -> List[nn.Parameter]:
     return [p for _, p in model.named_parameters() if p.requires_grad]
 
 
+def load_and_tokenize_dataset(
+    tokenizer,
+    dataset_name: str = "wikitext2",
+    split: str = 'train',
+    max_docs: int = 10000,
+) -> torch.Tensor:
+    """
+    Load dataset and return tokenized tensor.
+    Separate from sampling to allow epoch-wise resampling.
+    """
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+        tokenizer.pad_token_id = tokenizer.eos_token_id
+
+    # Load dataset with proper split handling
+    if dataset_name == "wikitext2":
+        # wikitext2 splits: 'train', 'validation', 'test'
+        data = load_dataset('wikitext', 'wikitext-2-raw-v1', split=split)
+        text = "\n\n".join(data['text'])
+    elif dataset_name == "c4":
+        # C4 splits: 'train', 'validation'
+        c4_split = 'validation' if split in ('validation', 'val', 'test') else 'train'
+        data = load_dataset('allenai/c4', 'en', split=c4_split, streaming=True)
+        texts = []
+        for i, item in enumerate(data):
+            if i >= max_docs:
+                break
+            texts.append(item['text'])
+        text = "\n\n".join(texts)
+    else:
+        raise ValueError(f"Unknown dataset: {dataset_name}")
+
+    # Tokenize
+    tokens = tokenizer(text, return_tensors='pt').input_ids[0]
+    return tokens
+
+
+def sample_from_tokens(
+    tokens: torch.Tensor,
+    num_samples: int,
+    seq_len: int,
+    seed: int,
+    is_train: bool = True,
+) -> List[Dict[str, torch.Tensor]]:
+    """
+    Sample sequences from tokenized text.
+    Can be called multiple times with different seeds for epoch-wise resampling.
+    """
+    total_tokens = len(tokens)
+    if total_tokens < seq_len:
+        raise ValueError(f"Dataset too small: {total_tokens} tokens < seq_len {seq_len}")
+
+    max_start = total_tokens - seq_len
+    max_non_overlap = max_start // seq_len + 1
+    rng = random.Random(seed)
+
+    if is_train:
+        # Training: random sampling allows overlap for more diversity
+        start_positions = [rng.randint(0, max_start) for _ in range(num_samples)]
+    else:
+        # Validation: evenly spaced, non-overlapping if possible
+        if num_samples <= max_non_overlap:
+            step = max_start // num_samples if num_samples > 1 else 0
+            start_positions = [i * step for i in range(num_samples)]
+        else:
+            step = seq_len
+            start_positions = [i * step for i in range(max_non_overlap)]
+
+    samples = []
+    for start in start_positions:
+        input_ids = tokens[start:start + seq_len]
+        if len(input_ids) < seq_len:
+            continue
+        attention_mask = torch.ones_like(input_ids)
+        labels = input_ids.clone()
+        samples.append({
+            'input_ids': input_ids,
+            'attention_mask': attention_mask,
+            'labels': labels
+        })
+
+    return samples
+
+
 def create_dataloader(
     tokenizer,
     dataset_name: str = "wikitext2",
@@ -106,74 +190,21 @@ def create_dataloader(
 ) -> DataLoader:
     """
     Create data loader with random sampling for better coverage.
-
-    Uses random starting positions instead of consecutive slices to:
-    1. Increase effective sample diversity
-    2. Better utilize available text data
+    For simple usage - loads, tokenizes, samples, and creates DataLoader.
     """
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
-        tokenizer.pad_token_id = tokenizer.eos_token_id
+    tokens = load_and_tokenize_dataset(tokenizer, dataset_name, split)
+    is_train = (split == 'train')
+    samples = sample_from_tokens(tokens, num_samples, seq_len, seed, is_train)
 
-    # Load dataset
-    if dataset_name == "wikitext2":
-        # wikitext2 splits: 'train', 'validation', 'test'
-        data = load_dataset('wikitext', 'wikitext-2-raw-v1', split=split)
-        text = "\n\n".join(data['text'])
-    elif dataset_name == "c4":
-        data = load_dataset('allenai/c4', 'en', split=split, streaming=True)
-        texts = []
-        for i, item in enumerate(data):
-            if i >= num_samples * 2:  # Get more text for random sampling
-                break
-            texts.append(item['text'])
-        text = "\n\n".join(texts)
-    else:
-        raise ValueError(f"Unknown dataset: {dataset_name}")
-
-    # Tokenize
-    tokens = tokenizer(text, return_tensors='pt').input_ids[0]
-    total_tokens = len(tokens)
-
-    if total_tokens < seq_len:
-        raise ValueError(f"Dataset too small: {total_tokens} tokens < seq_len {seq_len}")
-
-    # Random sampling: generate random start positions
-    max_start = total_tokens - seq_len
-    rng = random.Random(seed)
-
-    # For training: random positions; for validation: evenly spaced
-    if split == 'train':
-        # Random sampling with replacement if needed
-        start_positions = [rng.randint(0, max_start) for _ in range(num_samples)]
-    else:
-        # Evenly spaced for reproducible validation
-        actual_samples = min(num_samples, max_start // seq_len + 1)
-        if actual_samples < num_samples:
-            # If not enough unique positions, use what we have with some overlap
-            step = max(1, max_start // num_samples)
-            start_positions = [i * step for i in range(num_samples) if i * step <= max_start]
+    if len(samples) < num_samples:
+        max_non_overlap = (len(tokens) - seq_len) // seq_len + 1
+        if is_train:
+            print(f"    Warning: Only created {len(samples)}/{num_samples} samples")
         else:
-            step = max_start // num_samples
-            start_positions = [i * step for i in range(num_samples)]
+            print(f"    Note: Created {len(samples)} val samples (max non-overlapping: {max_non_overlap})")
 
-    # Create samples
-    samples = []
-    for start in start_positions:
-        input_ids = tokens[start:start + seq_len]
-        if len(input_ids) < seq_len:
-            continue  # Skip incomplete sequences
-        attention_mask = torch.ones_like(input_ids)
-        labels = input_ids.clone()
-
-        samples.append({
-            'input_ids': input_ids,
-            'attention_mask': attention_mask,
-            'labels': labels
-        })
-
-    print(f"    Created {len(samples)} samples from {total_tokens:,} tokens ({split})")
-    return DataLoader(samples, batch_size=batch_size, shuffle=(split == 'train'))
+    print(f"    Created {len(samples)} samples from {len(tokens):,} tokens ({split})")
+    return DataLoader(samples, batch_size=batch_size, shuffle=is_train)
 
 
 @torch.no_grad()
@@ -340,16 +371,16 @@ def block_finetune(
     print(f"  Blocks: {block_cnt:,}, LayerNorm: {ln_cnt:,}, Bias: {bias_cnt:,}")
     print(f"  Trainable: {trainable_total:,} / {total_params:,} ({100 * trainable_total / total_params:.2f}%)")
 
-    # Step 3: Create data loaders
-    print(f"\nStep 3: Creating data loaders ({dataset_name})...")
-    train_loader = create_dataloader(
-        tokenizer, dataset_name, num_samples, seq_len, batch_size, split='train', seed=42
-    )
-    # Use 'validation' split for validation (not 'test' - save that for final eval)
-    val_loader = create_dataloader(
-        tokenizer, dataset_name, num_samples=64, seq_len=seq_len, batch_size=batch_size, split='validation', seed=42
-    )
-    print(f"  Train: {len(train_loader.dataset)} samples, Val: {len(val_loader.dataset)} samples")
+    # Step 3: Load and tokenize datasets (once), sampling done per-epoch
+    print(f"\nStep 3: Loading datasets ({dataset_name})...")
+    train_tokens = load_and_tokenize_dataset(tokenizer, dataset_name, split='train')
+    val_tokens = load_and_tokenize_dataset(tokenizer, dataset_name, split='validation')
+    print(f"  Train tokens: {len(train_tokens):,}, Val tokens: {len(val_tokens):,}")
+
+    # Create validation loader (fixed samples for consistent evaluation)
+    val_samples = sample_from_tokens(val_tokens, num_samples=128, seq_len=seq_len, seed=42, is_train=False)
+    val_loader = DataLoader(val_samples, batch_size=batch_size, shuffle=False)
+    print(f"  Val samples: {len(val_samples)} (fixed for consistent evaluation)")
 
     # Step 4: Setup optimizer with separate param groups
     # - Blocks: compensate SVD error, no weight decay
@@ -397,7 +428,9 @@ def block_finetune(
     print(f"  LayerNorm params: {len(ln_params)}, LR={learning_rate:.2e}, WD={ln_weight_decay}")
     print(f"  Bias params: {len(bias_params)}, LR={learning_rate:.2e}, WD={weight_decay}")
 
-    total_steps = len(train_loader) * num_epochs // gradient_accumulation
+    # Calculate total steps based on num_samples
+    batches_per_epoch = (num_samples + batch_size - 1) // batch_size
+    total_steps = batches_per_epoch * num_epochs // gradient_accumulation
     warmup_steps = int(total_steps * warmup_ratio)
     print(f"  Total steps: {total_steps}, Warmup steps: {warmup_steps}")
     print(f"  Scheduler: {scheduler_type}, min_lr_ratio: {min_lr_ratio}")
@@ -451,6 +484,11 @@ def block_finetune(
     for epoch in range(num_epochs):
         epoch_loss = 0.0
         num_batches = 0
+
+        # Resample training data each epoch for better coverage
+        epoch_seed = 42 + epoch  # Different seed each epoch
+        train_samples = sample_from_tokens(train_tokens, num_samples, seq_len, epoch_seed, is_train=True)
+        train_loader = DataLoader(train_samples, batch_size=batch_size, shuffle=True)
 
         pbar = tqdm(train_loader, desc=f"Epoch {epoch + 1}/{num_epochs}")
 
