@@ -375,6 +375,7 @@ def block_finetune(
         })
 
     optimizer = torch.optim.AdamW(param_groups, eps=1e-8)
+    trainable_params = block_params + other_params  # For gradient clipping and validation
     print(f"\nStep 4: Optimizer setup...")
     print(f"  Block params: {len(block_params)}, LR={learning_rate * block_lr_multiplier:.2e}, WD={block_weight_decay}")
     print(f"  Other params: {len(other_params)}, LR={learning_rate:.2e}, WD={weight_decay}")
