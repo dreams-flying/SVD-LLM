@@ -232,20 +232,34 @@ def check_gradients_valid(params: List[nn.Parameter]) -> bool:
     return True
 
 
-def get_cosine_schedule_with_warmup(optimizer, num_warmup_steps: int, num_training_steps: int):
+def get_cosine_schedule_with_warmup(optimizer, num_warmup_steps: int, num_training_steps: int, min_lr_ratio: float = 0.1):
     """
     Create a schedule with linear warmup and cosine decay.
-    More robust than lambda function with proper bounds checking.
+
+    Args:
+        min_lr_ratio: Minimum LR as ratio of initial LR (default 0.1 = 10% of initial LR)
+                      This prevents LR from decaying to 0.
     """
     def lr_lambda(current_step: int) -> float:
         # Warmup phase
         if current_step < num_warmup_steps:
             return float(current_step + 1) / float(max(1, num_warmup_steps))
-        # Cosine decay phase
+        # Cosine decay phase with minimum LR
         progress = float(current_step - num_warmup_steps) / float(max(1, num_training_steps - num_warmup_steps))
         progress = min(1.0, progress)  # Clamp to [0, 1]
-        return max(0.0, 0.5 * (1.0 + math.cos(math.pi * progress)))
+        # Decay from 1.0 to min_lr_ratio (not to 0)
+        cosine_decay = 0.5 * (1.0 + math.cos(math.pi * progress))
+        return min_lr_ratio + (1.0 - min_lr_ratio) * cosine_decay
 
+    return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+
+
+def get_constant_schedule_with_warmup(optimizer, num_warmup_steps: int):
+    """Constant LR after warmup - often works better for fine-tuning."""
+    def lr_lambda(current_step: int) -> float:
+        if current_step < num_warmup_steps:
+            return float(current_step + 1) / float(max(1, num_warmup_steps))
+        return 1.0
     return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
 
@@ -254,19 +268,30 @@ def block_finetune(
     tokenizer,
     num_epochs: int = 5,
     learning_rate: float = 5e-4,
+    block_lr_multiplier: float = 1.0,
     batch_size: int = 2,
     seq_len: int = 512,
     num_samples: int = 256,
     warmup_ratio: float = 0.05,
     gradient_accumulation: int = 4,
     max_grad_norm: float = 1.0,
+    weight_decay: float = 0.01,
+    block_weight_decay: float = 0.0,
     dataset_name: str = "wikitext2",
     train_layernorm: bool = True,
     train_bias: bool = True,
     use_amp: bool = True,
+    scheduler_type: str = "cosine",
+    min_lr_ratio: float = 0.1,
 ) -> nn.Module:
     """
     Fine-tune residual blocks (and optionally LayerNorm/bias).
+
+    Key parameters for better training:
+    - block_lr_multiplier: Scale blocks LR relative to base LR (default 1.0)
+    - block_weight_decay: Weight decay for blocks (default 0.0 - blocks shouldn't be regularized)
+    - scheduler_type: "cosine" or "constant" (constant often works better for fine-tuning)
+    - min_lr_ratio: For cosine, minimum LR as ratio of initial (default 0.1 = don't decay to 0)
 
     NOTE: Gradient checkpointing is NOT used because
     SVDLinearWithDenseBlocks.forward uses in-place index_add_(),
@@ -321,15 +346,48 @@ def block_finetune(
     )
     print(f"  Train: {len(train_loader.dataset)} samples, Val: {len(val_loader.dataset)} samples")
 
-    # Step 4: Setup optimizer and scheduler
-    trainable_params = get_trainable_params(model)
-    optimizer = torch.optim.AdamW(trainable_params, lr=learning_rate, weight_decay=0.01, eps=1e-8)
+    # Step 4: Setup optimizer with separate param groups
+    # Blocks: potentially different LR and lower weight_decay (they compensate for SVD error)
+    # LayerNorm/bias: standard LR and weight_decay
+    block_params = []
+    other_params = []
+    for name, param in model.named_parameters():
+        if param.requires_grad:
+            if 'blocks_T' in name:
+                block_params.append(param)
+            else:
+                other_params.append(param)
+
+    param_groups = []
+    if block_params:
+        param_groups.append({
+            'params': block_params,
+            'lr': learning_rate * block_lr_multiplier,
+            'weight_decay': block_weight_decay,
+            'name': 'blocks'
+        })
+    if other_params:
+        param_groups.append({
+            'params': other_params,
+            'lr': learning_rate,
+            'weight_decay': weight_decay,
+            'name': 'layernorm_bias'
+        })
+
+    optimizer = torch.optim.AdamW(param_groups, eps=1e-8)
+    print(f"\nStep 4: Optimizer setup...")
+    print(f"  Block params: {len(block_params)}, LR={learning_rate * block_lr_multiplier:.2e}, WD={block_weight_decay}")
+    print(f"  Other params: {len(other_params)}, LR={learning_rate:.2e}, WD={weight_decay}")
 
     total_steps = len(train_loader) * num_epochs // gradient_accumulation
     warmup_steps = int(total_steps * warmup_ratio)
     print(f"  Total steps: {total_steps}, Warmup steps: {warmup_steps}")
+    print(f"  Scheduler: {scheduler_type}, min_lr_ratio: {min_lr_ratio}")
 
-    scheduler = get_cosine_schedule_with_warmup(optimizer, warmup_steps, total_steps)
+    if scheduler_type == "constant":
+        scheduler = get_constant_schedule_with_warmup(optimizer, warmup_steps)
+    else:
+        scheduler = get_cosine_schedule_with_warmup(optimizer, warmup_steps, total_steps, min_lr_ratio)
 
     # Step 5: Setup AMP
     use_cuda = device == "cuda" and torch.cuda.is_available()
@@ -558,15 +616,21 @@ def main(args):
         tokenizer=tokenizer,
         num_epochs=args.num_epochs,
         learning_rate=args.learning_rate,
+        block_lr_multiplier=args.block_lr_multiplier,
         batch_size=args.batch_size,
         seq_len=args.seq_len,
         num_samples=args.num_samples,
         warmup_ratio=args.warmup_ratio,
         gradient_accumulation=args.gradient_accumulation,
+        max_grad_norm=args.max_grad_norm,
+        weight_decay=args.weight_decay,
+        block_weight_decay=args.block_weight_decay,
         dataset_name=args.dataset,
         train_layernorm=args.train_layernorm,
         train_bias=args.train_bias,
         use_amp=args.use_amp,
+        scheduler_type=args.scheduler,
+        min_lr_ratio=args.min_lr_ratio,
     )
 
     # Save model
@@ -630,11 +694,24 @@ if __name__ == "__main__":
     # Training
     parser.add_argument('--num_epochs', type=int, default=5)
     parser.add_argument('--learning_rate', type=float, default=5e-4)
+    parser.add_argument('--block_lr_multiplier', type=float, default=1.0,
+                        help='Scale blocks LR relative to base LR')
     parser.add_argument('--batch_size', type=int, default=2)
     parser.add_argument('--seq_len', type=int, default=512)
     parser.add_argument('--num_samples', type=int, default=256)
     parser.add_argument('--warmup_ratio', type=float, default=0.05)
     parser.add_argument('--gradient_accumulation', type=int, default=4)
+    parser.add_argument('--max_grad_norm', type=float, default=1.0)
+    parser.add_argument('--weight_decay', type=float, default=0.01,
+                        help='Weight decay for LayerNorm/bias')
+    parser.add_argument('--block_weight_decay', type=float, default=0.0,
+                        help='Weight decay for blocks (0 recommended - blocks compensate SVD error)')
+
+    # Scheduler
+    parser.add_argument('--scheduler', type=str, default='cosine', choices=['cosine', 'constant'],
+                        help='LR scheduler type (constant often better for fine-tuning)')
+    parser.add_argument('--min_lr_ratio', type=float, default=0.1,
+                        help='For cosine scheduler, minimum LR as ratio of initial (prevents decay to 0)')
 
     # What to train
     parser.add_argument('--train_layernorm', action='store_true', default=True)
