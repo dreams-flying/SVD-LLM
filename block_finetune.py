@@ -187,6 +187,8 @@ def create_dataloader(
     batch_size: int = 4,
     split: str = 'train',
     seed: int = 42,
+    num_workers: int = 0,
+    pin_memory: bool = True,
 ) -> DataLoader:
     """
     Create data loader with random sampling for better coverage.
@@ -204,12 +206,22 @@ def create_dataloader(
             print(f"    Note: Created {len(samples)} val samples (max non-overlapping: {max_non_overlap})")
 
     print(f"    Created {len(samples)} samples from {len(tokens):,} tokens ({split})")
-    return DataLoader(samples, batch_size=batch_size, shuffle=is_train)
+    return DataLoader(
+        samples,
+        batch_size=batch_size,
+        shuffle=is_train,
+        num_workers=num_workers,
+        pin_memory=pin_memory and torch.cuda.is_available(),
+    )
 
 
 @torch.no_grad()
 def validate(model, dataloader, use_amp: bool, amp_dtype, device: str) -> float:
-    """Run validation and return average loss."""
+    """
+    Run validation and return average loss.
+    Uses same loss calculation as training (manual cross_entropy) for consistency,
+    but WITHOUT label_smoothing to get true loss.
+    """
     model.eval()
     total_loss = 0.0
     num_batches = 0
@@ -224,10 +236,17 @@ def validate(model, dataloader, use_amp: bool, amp_dtype, device: str) -> float:
             outputs = model(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
-                labels=labels,
+                labels=None,  # Compute loss manually for consistency with training
                 use_cache=False,
             )
-            loss = outputs.loss if outputs.loss is not None else torch.tensor(0.0)
+            # Same calculation as training, but no label_smoothing
+            logits = outputs.logits
+            shift_logits = logits[..., :-1, :].contiguous()
+            shift_labels = labels[..., 1:].contiguous()
+            loss = F.cross_entropy(
+                shift_logits.view(-1, shift_logits.size(-1)),
+                shift_labels.view(-1),
+            )
 
         total_loss += loss.float().item()
         num_batches += 1
@@ -379,7 +398,10 @@ def block_finetune(
 
     # Create validation loader (fixed samples for consistent evaluation)
     val_samples = sample_from_tokens(val_tokens, num_samples=128, seq_len=seq_len, seed=42, is_train=False)
-    val_loader = DataLoader(val_samples, batch_size=batch_size, shuffle=False)
+    val_loader = DataLoader(
+        val_samples, batch_size=batch_size, shuffle=False,
+        pin_memory=torch.cuda.is_available(), num_workers=0,
+    )
     print(f"  Val samples: {len(val_samples)} (fixed for consistent evaluation)")
 
     # Step 4: Setup optimizer with separate param groups
@@ -488,7 +510,10 @@ def block_finetune(
         # Resample training data each epoch for better coverage
         epoch_seed = 42 + epoch  # Different seed each epoch
         train_samples = sample_from_tokens(train_tokens, num_samples, seq_len, epoch_seed, is_train=True)
-        train_loader = DataLoader(train_samples, batch_size=batch_size, shuffle=True)
+        train_loader = DataLoader(
+            train_samples, batch_size=batch_size, shuffle=True,
+            pin_memory=use_cuda, num_workers=0,
+        )
 
         pbar = tqdm(train_loader, desc=f"Epoch {epoch + 1}/{num_epochs}")
 
@@ -514,7 +539,6 @@ def block_finetune(
                         shift_logits.view(-1, shift_logits.size(-1)),
                         shift_labels.view(-1),
                         label_smoothing=label_smoothing,
-                        ignore_index=-100,
                     )
             except Exception as e:
                 print(f"\n  Warning: Forward pass error: {e}")
