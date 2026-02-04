@@ -72,14 +72,37 @@ def convert_blocks_to_trainable(model: nn.Module) -> int:
     return total_block_params
 
 
-def freeze_non_block_params(model: nn.Module, train_layernorm: bool = True, train_bias: bool = True) -> None:
+def freeze_non_block_params(
+    model: nn.Module,
+    train_layernorm: bool = True,
+    train_bias: bool = True,
+    train_v_proj: bool = False,
+    train_u_proj: bool = False,
+) -> None:
     """
-    Freeze most parameters, unfreeze blocks + LayerNorm + bias.
+    Freeze most parameters, selectively unfreeze components.
+
+    Args:
+        model: The model to modify
+        train_layernorm: Unfreeze LayerNorm parameters
+        train_bias: Unfreeze bias parameters
+        train_v_proj: Unfreeze v_proj in SVDLinearWithDenseBlocks (input projection)
+        train_u_proj: Unfreeze u_proj in SVDLinearWithDenseBlocks (output projection)
+
     Trainable params converted to FP32 for stable gradients.
     """
     for name, param in model.named_parameters():
         if 'blocks_T' in name:
+            # Always train blocks
             param.requires_grad = True
+        elif train_v_proj and 'v_proj' in name:
+            # Train V projection (SVD input side)
+            param.requires_grad = True
+            param.data = param.data.float()
+        elif train_u_proj and 'u_proj' in name:
+            # Train U projection (SVD output side)
+            param.requires_grad = True
+            param.data = param.data.float()
         elif train_layernorm and ('layernorm' in name.lower() or 'norm' in name.lower()):
             param.requires_grad = True
             param.data = param.data.float()
@@ -319,6 +342,7 @@ def block_finetune(
     num_epochs: int = 5,
     learning_rate: float = 5e-4,
     block_lr_multiplier: float = 1.0,
+    svd_lr_multiplier: float = 0.1,
     batch_size: int = 2,
     seq_len: int = 512,
     num_samples: int = 256,
@@ -328,29 +352,34 @@ def block_finetune(
     weight_decay: float = 0.0,
     block_weight_decay: float = 0.0,
     ln_weight_decay: float = 0.0,
+    svd_weight_decay: float = 0.01,
     dataset_name: str = "wikitext2",
     train_layernorm: bool = True,
     train_bias: bool = True,
+    train_v_proj: bool = False,
+    train_u_proj: bool = False,
     use_amp: bool = True,
     scheduler_type: str = "cosine",
     min_lr_ratio: float = 0.1,
     label_smoothing: float = 0.0,
 ) -> nn.Module:
     """
-    Fine-tune residual blocks (and optionally LayerNorm/bias).
+    Fine-tune residual blocks and optionally SVD components (v_proj/u_proj).
 
     Key parameters for better training:
     - block_lr_multiplier: Scale blocks LR relative to base LR (default 1.0)
+    - svd_lr_multiplier: Scale v_proj/u_proj LR relative to base LR (default 0.1, lower is safer)
     - block_weight_decay: Weight decay for blocks (default 0.0 - blocks shouldn't be regularized)
-    - ln_weight_decay: Weight decay for LayerNorm (default 0.0 - LN shouldn't be regularized)
-    - weight_decay: Weight decay for bias (default 0.0)
+    - svd_weight_decay: Weight decay for v_proj/u_proj (default 0.01)
+    - train_v_proj: Unfreeze v_proj (SVD input projection) for more capacity
+    - train_u_proj: Unfreeze u_proj (SVD output projection) for more capacity
     - scheduler_type: "cosine" or "constant" (constant often works better for fine-tuning)
     - min_lr_ratio: For cosine, minimum LR as ratio of initial (default 0.1 = don't decay to 0)
     - label_smoothing: Label smoothing for cross-entropy (default 0.0, try 0.1 for better generalization)
 
-    NOTE: Gradient checkpointing is NOT used because
-    SVDLinearWithDenseBlocks.forward uses in-place index_add_(),
-    which is incompatible with gradient checkpointing.
+    NOTE: Training v_proj/u_proj can significantly improve accuracy but requires:
+    - Lower learning rate (svd_lr_multiplier=0.1 recommended)
+    - More careful regularization (svd_weight_decay=0.01)
 
     Memory is saved by: AMP + small batch_size + gradient_accumulation.
     """
@@ -370,16 +399,29 @@ def block_finetune(
     # Step 2: Freeze non-block parameters
     print("\nStep 2: Setting up trainable parameters...")
     print(f"  Train LayerNorm: {train_layernorm}, Train bias: {train_bias}")
-    freeze_non_block_params(model, train_layernorm=train_layernorm, train_bias=train_bias)
+    print(f"  Train v_proj: {train_v_proj}, Train u_proj: {train_u_proj}")
+    freeze_non_block_params(
+        model,
+        train_layernorm=train_layernorm,
+        train_bias=train_bias,
+        train_v_proj=train_v_proj,
+        train_u_proj=train_u_proj,
+    )
 
     # Count trainable params by type
     block_cnt = 0
     ln_cnt = 0
     bias_cnt = 0
+    v_proj_cnt = 0
+    u_proj_cnt = 0
     for name, param in model.named_parameters():
         if param.requires_grad:
             if 'blocks_T' in name:
                 block_cnt += param.numel()
+            elif 'v_proj' in name:
+                v_proj_cnt += param.numel()
+            elif 'u_proj' in name:
+                u_proj_cnt += param.numel()
             elif 'layernorm' in name.lower() or 'norm' in name.lower():
                 ln_cnt += param.numel()
             elif 'bias' in name.lower():
@@ -388,6 +430,8 @@ def block_finetune(
     trainable_total = sum(p.numel() for p in model.parameters() if p.requires_grad)
     total_params = sum(p.numel() for p in model.parameters())
     print(f"  Blocks: {block_cnt:,}, LayerNorm: {ln_cnt:,}, Bias: {bias_cnt:,}")
+    if v_proj_cnt > 0 or u_proj_cnt > 0:
+        print(f"  v_proj: {v_proj_cnt:,}, u_proj: {u_proj_cnt:,}")
     print(f"  Trainable: {trainable_total:,} / {total_params:,} ({100 * trainable_total / total_params:.2f}%)")
 
     # Step 3: Load and tokenize datasets (once), sampling done per-epoch
@@ -406,15 +450,22 @@ def block_finetune(
 
     # Step 4: Setup optimizer with separate param groups
     # - Blocks: compensate SVD error, no weight decay
+    # - v_proj/u_proj: SVD components, lower LR and some weight decay
     # - LayerNorm: scale/shift, typically no weight decay
     # - Bias: typically no weight decay
     block_params = []
+    v_proj_params = []
+    u_proj_params = []
     ln_params = []
     bias_params = []
     for name, param in model.named_parameters():
         if param.requires_grad:
             if 'blocks_T' in name:
                 block_params.append(param)
+            elif 'v_proj' in name:
+                v_proj_params.append(param)
+            elif 'u_proj' in name:
+                u_proj_params.append(param)
             elif 'layernorm' in name.lower() or 'norm' in name.lower():
                 ln_params.append(param)
             else:
@@ -427,6 +478,20 @@ def block_finetune(
             'lr': learning_rate * block_lr_multiplier,
             'weight_decay': block_weight_decay,
             'name': 'blocks'
+        })
+    if v_proj_params:
+        param_groups.append({
+            'params': v_proj_params,
+            'lr': learning_rate * svd_lr_multiplier,
+            'weight_decay': svd_weight_decay,
+            'name': 'v_proj'
+        })
+    if u_proj_params:
+        param_groups.append({
+            'params': u_proj_params,
+            'lr': learning_rate * svd_lr_multiplier,
+            'weight_decay': svd_weight_decay,
+            'name': 'u_proj'
         })
     if ln_params:
         param_groups.append({
@@ -444,9 +509,13 @@ def block_finetune(
         })
 
     optimizer = torch.optim.AdamW(param_groups, eps=1e-8)
-    trainable_params = block_params + ln_params + bias_params  # For gradient clipping and validation
+    trainable_params = block_params + v_proj_params + u_proj_params + ln_params + bias_params
     print(f"\nStep 4: Optimizer setup...")
     print(f"  Block params: {len(block_params)}, LR={learning_rate * block_lr_multiplier:.2e}, WD={block_weight_decay}")
+    if v_proj_params:
+        print(f"  v_proj params: {len(v_proj_params)}, LR={learning_rate * svd_lr_multiplier:.2e}, WD={svd_weight_decay}")
+    if u_proj_params:
+        print(f"  u_proj params: {len(u_proj_params)}, LR={learning_rate * svd_lr_multiplier:.2e}, WD={svd_weight_decay}")
     print(f"  LayerNorm params: {len(ln_params)}, LR={learning_rate:.2e}, WD={ln_weight_decay}")
     print(f"  Bias params: {len(bias_params)}, LR={learning_rate:.2e}, WD={weight_decay}")
 
@@ -702,6 +771,7 @@ def main(args):
         num_epochs=args.num_epochs,
         learning_rate=args.learning_rate,
         block_lr_multiplier=args.block_lr_multiplier,
+        svd_lr_multiplier=args.svd_lr_multiplier,
         batch_size=args.batch_size,
         seq_len=args.seq_len,
         num_samples=args.num_samples,
@@ -711,9 +781,12 @@ def main(args):
         weight_decay=args.weight_decay,
         block_weight_decay=args.block_weight_decay,
         ln_weight_decay=args.ln_weight_decay,
+        svd_weight_decay=args.svd_weight_decay,
         dataset_name=args.dataset,
         train_layernorm=args.train_layernorm,
         train_bias=args.train_bias,
+        train_v_proj=args.train_v_proj,
+        train_u_proj=args.train_u_proj,
         use_amp=args.use_amp,
         scheduler_type=args.scheduler,
         min_lr_ratio=args.min_lr_ratio,
@@ -736,6 +809,7 @@ def main(args):
     fp32_converted = 0
     for name, param in model.named_parameters():
         if param.dtype == torch.float32 and ('blocks_T' in name
+                or 'v_proj' in name or 'u_proj' in name
                 or 'layernorm' in name.lower() or 'norm' in name.lower()
                 or 'bias' in name.lower()):
             param.data = param.data.to(save_dtype)
@@ -809,6 +883,16 @@ if __name__ == "__main__":
     parser.add_argument('--no_train_layernorm', action='store_false', dest='train_layernorm')
     parser.add_argument('--train_bias', action='store_true', default=True)
     parser.add_argument('--no_train_bias', action='store_false', dest='train_bias')
+
+    # SVD component training (for better accuracy at cost of more params)
+    parser.add_argument('--train_v_proj', action='store_true', default=False,
+                        help='Train v_proj (SVD input projection) for more capacity')
+    parser.add_argument('--train_u_proj', action='store_true', default=False,
+                        help='Train u_proj (SVD output projection) for more capacity')
+    parser.add_argument('--svd_lr_multiplier', type=float, default=0.1,
+                        help='Scale v_proj/u_proj LR relative to base LR (0.1 recommended)')
+    parser.add_argument('--svd_weight_decay', type=float, default=0.01,
+                        help='Weight decay for v_proj/u_proj (some regularization recommended)')
 
     # AMP
     parser.add_argument('--use_amp', action='store_true', default=True)
