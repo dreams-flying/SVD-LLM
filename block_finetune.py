@@ -88,6 +88,89 @@ class LoRALayer(nn.Module):
         return original + lora_out
 
 
+def merge_lora_weights(model: nn.Module) -> int:
+    """
+    Merge LoRA adapters back into wrapped modules and remove LoRA wrappers.
+
+    For nn.Linear: W_new = W_old + scaling * lora_B.weight @ lora_A.weight
+    For SVDLinearWithDenseBlocks: expand SVD rank by r to absorb LoRA.
+
+    Returns number of merged LoRA layers.
+    """
+    merged = 0
+
+    for parent_name, parent_module in model.named_modules():
+        for attr_name, child_module in list(parent_module.named_children()):
+            if not isinstance(child_module, LoRALayer):
+                continue
+
+            lora = child_module
+            wrapped = lora.wrapped
+            scaling = lora.scaling
+
+            # Compute LoRA delta: [out_features, in_features]
+            # lora_B.weight: [out_features, r], lora_A.weight: [r, in_features]
+            with torch.no_grad():
+                delta = (lora.lora_B.weight @ lora.lora_A.weight) * scaling
+
+            if isinstance(wrapped, nn.Linear):
+                # Simple merge: add delta to weight
+                wrapped.weight.data.add_(delta.to(wrapped.weight.dtype))
+                setattr(parent_module, attr_name, wrapped)
+                merged += 1
+
+            elif isinstance(wrapped, (SVDLinear, SVDLinearWithDenseBlocks)):
+                # Expand SVD rank to absorb LoRA:
+                # Original: y = u_proj(v_proj(x)) [+ blocks]
+                # LoRA:     y += scaling * lora_B @ lora_A @ x
+                # Merged:   y = [u_proj | scaling*lora_B] @ [v_proj; lora_A] @ x [+ blocks]
+                #
+                # New v_proj: rank+r input->output, new u_proj: rank+r input->output
+                old_v = wrapped.v_proj
+                old_u = wrapped.u_proj
+                dtype = old_v.weight.dtype
+                r = lora.r
+
+                # New v_proj: [rank+r, in_features]
+                new_v_weight = torch.cat([
+                    old_v.weight.data,
+                    lora.lora_A.weight.data.to(dtype),
+                ], dim=0)  # [rank+r, in_features]
+
+                # New u_proj: [out_features, rank+r]
+                new_u_weight = torch.cat([
+                    old_u.weight.data,
+                    (lora.lora_B.weight.data * scaling).to(dtype),
+                ], dim=1)  # [out_features, rank+r]
+
+                new_rank = old_v.weight.shape[0] + r
+
+                # Create new Linear layers
+                new_v = nn.Linear(old_v.in_features, new_rank, bias=old_v.bias is not None)
+                new_u = nn.Linear(new_rank, old_u.out_features, bias=old_u.bias is not None)
+                new_v.weight = nn.Parameter(new_v_weight)
+                new_u.weight = nn.Parameter(new_u_weight)
+                if old_v.bias is not None:
+                    # Extend v bias with zeros for new dimensions
+                    new_v.bias = nn.Parameter(torch.cat([
+                        old_v.bias.data,
+                        torch.zeros(r, dtype=dtype, device=old_v.bias.device),
+                    ]))
+                if old_u.bias is not None:
+                    new_u.bias = old_u.bias
+
+                wrapped.v_proj = new_v
+                wrapped.u_proj = new_u
+
+                setattr(parent_module, attr_name, wrapped)
+                merged += 1
+
+            full_name = f"{parent_name}.{attr_name}" if parent_name else attr_name
+            print(f"    Merged LoRA -> {full_name}")
+
+    return merged
+
+
 def convert_blocks_to_trainable(model: nn.Module) -> int:
     """
     Convert block values from buffers to trainable parameters.
@@ -408,7 +491,16 @@ def apply_lora(
     lora_total_params = 0
 
     # Walk the module tree and wrap matching modules
+    # IMPORTANT: Skip children of SVD modules and LoRALayer to avoid name collision.
+    # SVDLinearWithDenseBlocks has internal v_proj/u_proj which are SVD components,
+    # NOT the attention projections we want to apply LoRA to.
+    skip_types = (SVDLinear, SVDLinearWithDenseBlocks, LoRALayer)
+
     for parent_name, parent_module in model.named_modules():
+        # Don't apply LoRA inside SVD modules or existing LoRA wrappers
+        if isinstance(parent_module, skip_types):
+            continue
+
         for attr_name, child_module in list(parent_module.named_children()):
             if attr_name not in target_set:
                 continue
@@ -444,12 +536,14 @@ def apply_lora(
 
     if lora_count == 0:
         print(f"    WARNING: No modules matched target_modules={lora_target_modules}")
-        print(f"    Available modules:")
+        print(f"    Available top-level modules (excluding SVD internals):")
         for n, m in model.named_modules():
-            if isinstance(m, (nn.Linear, SVDLinear, SVDLinearWithDenseBlocks)):
-                short = n.split('.')[-1]
-                if short:
-                    print(f"      {n} ({type(m).__name__})")
+            if isinstance(m, skip_types):
+                continue
+            for cn, cm in m.named_children():
+                if isinstance(cm, (nn.Linear, SVDLinear, SVDLinearWithDenseBlocks)):
+                    full = f"{n}.{cn}" if n else cn
+                    print(f"      {full} ({type(cm).__name__})")
     else:
         print(f"    Total: {lora_count} LoRA adapters, {lora_total_params:,} parameters")
 
@@ -921,6 +1015,15 @@ def main(args):
     model.eval()
     model = model.cpu()
 
+    # Merge LoRA weights into original modules before saving.
+    # This removes LoRALayer wrappers so the saved model has no dependency
+    # on LoRALayer class and can be loaded by any script.
+    # For nn.Linear: W += scaling * B @ A
+    # For SVDLinearWithDenseBlocks: expand SVD rank by r
+    lora_merged = merge_lora_weights(model)
+    if lora_merged > 0:
+        print(f"  Merged {lora_merged} LoRA adapters into model weights")
+
     # Convert FP32 trainable params back to original dtype for saving
     save_dtype = torch.bfloat16
     for p in model.parameters():
@@ -930,7 +1033,6 @@ def main(args):
     fp32_converted = 0
     for name, param in model.named_parameters():
         if param.dtype == torch.float32 and ('blocks_T' in name
-                or 'lora_' in name
                 or 'layernorm' in name.lower() or 'norm' in name.lower()
                 or 'bias' in name.lower()):
             param.data = param.data.to(save_dtype)
