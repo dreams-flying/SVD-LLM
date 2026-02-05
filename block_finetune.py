@@ -342,7 +342,7 @@ def block_finetune(
     num_epochs: int = 5,
     learning_rate: float = 5e-4,
     block_lr_multiplier: float = 1.0,
-    svd_lr_multiplier: float = 0.1,
+    svd_lr_multiplier: float = 0.01,
     batch_size: int = 2,
     seq_len: int = 512,
     num_samples: int = 256,
@@ -352,7 +352,7 @@ def block_finetune(
     weight_decay: float = 0.0,
     block_weight_decay: float = 0.0,
     ln_weight_decay: float = 0.0,
-    svd_weight_decay: float = 0.01,
+    svd_weight_decay: float = 0.0,
     dataset_name: str = "wikitext2",
     train_layernorm: bool = True,
     train_bias: bool = True,
@@ -377,9 +377,9 @@ def block_finetune(
     - min_lr_ratio: For cosine, minimum LR as ratio of initial (default 0.1 = don't decay to 0)
     - label_smoothing: Label smoothing for cross-entropy (default 0.0, try 0.1 for better generalization)
 
-    NOTE: Training v_proj/u_proj can significantly improve accuracy but requires:
-    - Lower learning rate (svd_lr_multiplier=0.1 recommended)
-    - More careful regularization (svd_weight_decay=0.01)
+    NOTE: Training v_proj/u_proj is EXPERIMENTAL and may destabilize training!
+    These SVD core components have massive parameter counts (40%+ of model).
+    If used: svd_lr_multiplier=0.01 or lower, svd_weight_decay=0.0 recommended.
 
     Memory is saved by: AMP + small batch_size + gradient_accumulation.
     """
@@ -400,6 +400,14 @@ def block_finetune(
     print("\nStep 2: Setting up trainable parameters...")
     print(f"  Train LayerNorm: {train_layernorm}, Train bias: {train_bias}")
     print(f"  Train v_proj: {train_v_proj}, Train u_proj: {train_u_proj}")
+
+    # Warning for SVD component training
+    if train_v_proj or train_u_proj:
+        print("\n  ⚠️  WARNING: Training v_proj/u_proj is EXPERIMENTAL!")
+        print("  These are SVD core components with huge parameter count.")
+        print("  Recommended: use svd_lr_multiplier=0.01 or lower, and svd_weight_decay=0.0")
+        print("  If training becomes unstable, disable v_proj/u_proj training.\n")
+
     freeze_non_block_params(
         model,
         train_layernorm=train_layernorm,
@@ -884,15 +892,15 @@ if __name__ == "__main__":
     parser.add_argument('--train_bias', action='store_true', default=True)
     parser.add_argument('--no_train_bias', action='store_false', dest='train_bias')
 
-    # SVD component training (for better accuracy at cost of more params)
+    # SVD component training (EXPERIMENTAL - use with caution!)
     parser.add_argument('--train_v_proj', action='store_true', default=False,
-                        help='Train v_proj (SVD input projection) for more capacity')
+                        help='[EXPERIMENTAL] Train v_proj - may destabilize training!')
     parser.add_argument('--train_u_proj', action='store_true', default=False,
-                        help='Train u_proj (SVD output projection) for more capacity')
-    parser.add_argument('--svd_lr_multiplier', type=float, default=0.1,
-                        help='Scale v_proj/u_proj LR relative to base LR (0.1 recommended)')
-    parser.add_argument('--svd_weight_decay', type=float, default=0.01,
-                        help='Weight decay for v_proj/u_proj (some regularization recommended)')
+                        help='[EXPERIMENTAL] Train u_proj - may destabilize training!')
+    parser.add_argument('--svd_lr_multiplier', type=float, default=0.01,
+                        help='Scale v_proj/u_proj LR (0.01 or lower recommended)')
+    parser.add_argument('--svd_weight_decay', type=float, default=0.0,
+                        help='Weight decay for v_proj/u_proj (0.0 recommended)')
 
     # AMP
     parser.add_argument('--use_amp', action='store_true', default=True)
