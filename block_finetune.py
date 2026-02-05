@@ -37,19 +37,55 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 from datasets import load_dataset
 
-# LoRA support (optional)
-try:
-    from peft import LoraConfig, get_peft_model, TaskType
-    PEFT_AVAILABLE = True
-except ImportError:
-    PEFT_AVAILABLE = False
-
 parent_path = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.append(parent_path)
 
 from fisher_svd import SVDLinear, SVDLinearWithDenseBlocks
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
+
+
+# ---------------------------------------------------------------------------
+# Custom LoRA implementation (works with both nn.Linear and SVDLinear*)
+# ---------------------------------------------------------------------------
+
+class LoRALayer(nn.Module):
+    """
+    LoRA adapter that wraps any module and adds a parallel low-rank path.
+
+    Output = wrapped(x) + lora_B(lora_A(dropout(x))) * scaling
+
+    Works with nn.Linear, SVDLinear, SVDLinearWithDenseBlocks, etc.
+    """
+
+    def __init__(
+        self,
+        wrapped: nn.Module,
+        in_features: int,
+        out_features: int,
+        r: int = 16,
+        alpha: int = 32,
+        dropout: float = 0.05,
+    ):
+        super().__init__()
+        self.wrapped = wrapped
+        self.r = r
+        self.alpha = alpha
+        self.scaling = alpha / r
+
+        # LoRA matrices (FP32 for stable gradients)
+        self.lora_A = nn.Linear(in_features, r, bias=False)
+        self.lora_B = nn.Linear(r, out_features, bias=False)
+        self.lora_dropout = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
+
+        # Initialize: A with kaiming, B with zeros (initial output = original)
+        nn.init.kaiming_uniform_(self.lora_A.weight, a=math.sqrt(5))
+        nn.init.zeros_(self.lora_B.weight)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        original = self.wrapped(x)
+        lora_out = self.lora_B(self.lora_A(self.lora_dropout(x))) * self.scaling
+        return original + lora_out
 
 
 def convert_blocks_to_trainable(model: nn.Module) -> int:
@@ -92,7 +128,7 @@ def freeze_non_block_params(
         train_layernorm: Unfreeze LayerNorm parameters
         train_bias: Unfreeze bias parameters
 
-    Note: LoRA parameters (if any) are handled separately by peft library.
+    Note: LoRA parameters (if any) are handled by LoRALayer wrapper.
     Trainable params converted to FP32 for stable gradients.
     """
     for name, param in model.named_parameters():
@@ -100,7 +136,7 @@ def freeze_non_block_params(
             # Always train blocks
             param.requires_grad = True
         elif 'lora_' in name:
-            # LoRA parameters are trained (handled by peft)
+            # LoRA parameters are always trained
             param.requires_grad = True
             # Keep LoRA params in their original dtype
         elif train_layernorm and ('layernorm' in name.lower() or 'norm' in name.lower()):
@@ -344,45 +380,78 @@ def apply_lora(
     lora_target_modules: List[str] = None,
 ) -> nn.Module:
     """
-    Apply LoRA adapters to the model using peft library.
+    Apply LoRA adapters to target modules in the model.
+
+    Supports both nn.Linear and SVDLinearWithDenseBlocks (custom SVD modules).
+    For each target module name, finds matching modules and wraps them with LoRALayer.
 
     Args:
         model: Base model
         lora_r: LoRA rank (higher = more capacity, more params)
         lora_alpha: LoRA scaling factor (alpha/r is the scaling)
         lora_dropout: Dropout for LoRA layers
-        lora_target_modules: Modules to apply LoRA to (default: q_proj, v_proj)
+        lora_target_modules: Module names to apply LoRA (default: ["q_proj", "v_proj"])
 
     Returns:
-        Model wrapped with LoRA adapters
+        Model with LoRA adapters applied (in-place modification)
     """
-    if not PEFT_AVAILABLE:
-        raise ImportError(
-            "peft library not installed. Install with: pip install peft\n"
-            "Or disable LoRA with --no_lora"
-        )
-
     if lora_target_modules is None:
         lora_target_modules = ["q_proj", "v_proj"]
 
-    lora_config = LoraConfig(
-        r=lora_r,
-        lora_alpha=lora_alpha,
-        lora_dropout=lora_dropout,
-        target_modules=lora_target_modules,
-        bias="none",  # Don't add bias, we already train biases separately
-        task_type=TaskType.CAUSAL_LM,
-    )
+    target_set = set(lora_target_modules)
 
     print(f"\n  Applying LoRA adapters...")
     print(f"    r={lora_r}, alpha={lora_alpha}, dropout={lora_dropout}")
     print(f"    target_modules={lora_target_modules}")
 
-    model = get_peft_model(model, lora_config)
+    lora_count = 0
+    lora_total_params = 0
 
-    # Count LoRA parameters
-    lora_params = sum(p.numel() for n, p in model.named_parameters() if 'lora_' in n)
-    print(f"    LoRA parameters: {lora_params:,}")
+    # Walk the module tree and wrap matching modules
+    for parent_name, parent_module in model.named_modules():
+        for attr_name, child_module in list(parent_module.named_children()):
+            if attr_name not in target_set:
+                continue
+
+            # Determine in/out features
+            if isinstance(child_module, nn.Linear):
+                in_f = child_module.in_features
+                out_f = child_module.out_features
+            elif isinstance(child_module, (SVDLinear, SVDLinearWithDenseBlocks)):
+                in_f = child_module.v_proj.in_features
+                out_f = child_module.u_proj.out_features
+            else:
+                continue
+
+            # Wrap with LoRA
+            lora_module = LoRALayer(
+                wrapped=child_module,
+                in_features=in_f,
+                out_features=out_f,
+                r=lora_r,
+                alpha=lora_alpha,
+                dropout=lora_dropout,
+            )
+            setattr(parent_module, attr_name, lora_module)
+
+            params = lora_r * (in_f + out_f)
+            lora_total_params += params
+            lora_count += 1
+
+            full_name = f"{parent_name}.{attr_name}" if parent_name else attr_name
+            print(f"    LoRA -> {full_name} ({type(child_module).__name__}, "
+                  f"in={in_f}, out={out_f}, +{params:,} params)")
+
+    if lora_count == 0:
+        print(f"    WARNING: No modules matched target_modules={lora_target_modules}")
+        print(f"    Available modules:")
+        for n, m in model.named_modules():
+            if isinstance(m, (nn.Linear, SVDLinear, SVDLinearWithDenseBlocks)):
+                short = n.split('.')[-1]
+                if short:
+                    print(f"      {n} ({type(m).__name__})")
+    else:
+        print(f"    Total: {lora_count} LoRA adapters, {lora_total_params:,} parameters")
 
     return model
 
@@ -938,7 +1007,7 @@ if __name__ == "__main__":
 
     # LoRA (Low-Rank Adaptation) for additional capacity
     parser.add_argument('--use_lora', action='store_true', default=False,
-                        help='Enable LoRA adapters for additional capacity (requires peft library)')
+                        help='Enable LoRA adapters for additional capacity')
     parser.add_argument('--no_lora', action='store_false', dest='use_lora')
     parser.add_argument('--lora_r', type=int, default=16,
                         help='LoRA rank (higher = more capacity, more params)')
