@@ -37,6 +37,13 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 from datasets import load_dataset
 
+# LoRA support (optional)
+try:
+    from peft import LoraConfig, get_peft_model, TaskType
+    PEFT_AVAILABLE = True
+except ImportError:
+    PEFT_AVAILABLE = False
+
 parent_path = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.append(parent_path)
 
@@ -76,8 +83,6 @@ def freeze_non_block_params(
     model: nn.Module,
     train_layernorm: bool = True,
     train_bias: bool = True,
-    train_v_proj: bool = False,
-    train_u_proj: bool = False,
 ) -> None:
     """
     Freeze most parameters, selectively unfreeze components.
@@ -86,23 +91,18 @@ def freeze_non_block_params(
         model: The model to modify
         train_layernorm: Unfreeze LayerNorm parameters
         train_bias: Unfreeze bias parameters
-        train_v_proj: Unfreeze v_proj in SVDLinearWithDenseBlocks (input projection)
-        train_u_proj: Unfreeze u_proj in SVDLinearWithDenseBlocks (output projection)
 
+    Note: LoRA parameters (if any) are handled separately by peft library.
     Trainable params converted to FP32 for stable gradients.
     """
     for name, param in model.named_parameters():
         if 'blocks_T' in name:
             # Always train blocks
             param.requires_grad = True
-        elif train_v_proj and 'v_proj' in name:
-            # Train V projection (SVD input side)
+        elif 'lora_' in name:
+            # LoRA parameters are trained (handled by peft)
             param.requires_grad = True
-            param.data = param.data.float()
-        elif train_u_proj and 'u_proj' in name:
-            # Train U projection (SVD output side)
-            param.requires_grad = True
-            param.data = param.data.float()
+            # Keep LoRA params in their original dtype
         elif train_layernorm and ('layernorm' in name.lower() or 'norm' in name.lower()):
             param.requires_grad = True
             param.data = param.data.float()
@@ -336,13 +336,64 @@ def get_constant_schedule_with_warmup(optimizer, num_warmup_steps: int):
     return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
 
+def apply_lora(
+    model: nn.Module,
+    lora_r: int = 16,
+    lora_alpha: int = 32,
+    lora_dropout: float = 0.05,
+    lora_target_modules: List[str] = None,
+) -> nn.Module:
+    """
+    Apply LoRA adapters to the model using peft library.
+
+    Args:
+        model: Base model
+        lora_r: LoRA rank (higher = more capacity, more params)
+        lora_alpha: LoRA scaling factor (alpha/r is the scaling)
+        lora_dropout: Dropout for LoRA layers
+        lora_target_modules: Modules to apply LoRA to (default: q_proj, v_proj)
+
+    Returns:
+        Model wrapped with LoRA adapters
+    """
+    if not PEFT_AVAILABLE:
+        raise ImportError(
+            "peft library not installed. Install with: pip install peft\n"
+            "Or disable LoRA with --no_lora"
+        )
+
+    if lora_target_modules is None:
+        lora_target_modules = ["q_proj", "v_proj"]
+
+    lora_config = LoraConfig(
+        r=lora_r,
+        lora_alpha=lora_alpha,
+        lora_dropout=lora_dropout,
+        target_modules=lora_target_modules,
+        bias="none",  # Don't add bias, we already train biases separately
+        task_type=TaskType.CAUSAL_LM,
+    )
+
+    print(f"\n  Applying LoRA adapters...")
+    print(f"    r={lora_r}, alpha={lora_alpha}, dropout={lora_dropout}")
+    print(f"    target_modules={lora_target_modules}")
+
+    model = get_peft_model(model, lora_config)
+
+    # Count LoRA parameters
+    lora_params = sum(p.numel() for n, p in model.named_parameters() if 'lora_' in n)
+    print(f"    LoRA parameters: {lora_params:,}")
+
+    return model
+
+
 def block_finetune(
     model: nn.Module,
     tokenizer,
     num_epochs: int = 5,
     learning_rate: float = 5e-4,
     block_lr_multiplier: float = 1.0,
-    svd_lr_multiplier: float = 0.01,
+    lora_lr_multiplier: float = 1.0,
     batch_size: int = 2,
     seq_len: int = 512,
     num_samples: int = 256,
@@ -352,34 +403,38 @@ def block_finetune(
     weight_decay: float = 0.0,
     block_weight_decay: float = 0.0,
     ln_weight_decay: float = 0.0,
-    svd_weight_decay: float = 0.0,
+    lora_weight_decay: float = 0.0,
     dataset_name: str = "wikitext2",
     train_layernorm: bool = True,
     train_bias: bool = True,
-    train_v_proj: bool = False,
-    train_u_proj: bool = False,
+    # LoRA parameters
+    use_lora: bool = False,
+    lora_r: int = 16,
+    lora_alpha: int = 32,
+    lora_dropout: float = 0.05,
+    lora_target_modules: List[str] = None,
     use_amp: bool = True,
     scheduler_type: str = "cosine",
     min_lr_ratio: float = 0.1,
     label_smoothing: float = 0.0,
 ) -> nn.Module:
     """
-    Fine-tune residual blocks and optionally SVD components (v_proj/u_proj).
+    Fine-tune residual blocks and optionally LoRA adapters.
 
     Key parameters for better training:
     - block_lr_multiplier: Scale blocks LR relative to base LR (default 1.0)
-    - svd_lr_multiplier: Scale v_proj/u_proj LR relative to base LR (default 0.1, lower is safer)
+    - lora_lr_multiplier: Scale LoRA LR relative to base LR (default 1.0)
     - block_weight_decay: Weight decay for blocks (default 0.0 - blocks shouldn't be regularized)
-    - svd_weight_decay: Weight decay for v_proj/u_proj (default 0.01)
-    - train_v_proj: Unfreeze v_proj (SVD input projection) for more capacity
-    - train_u_proj: Unfreeze u_proj (SVD output projection) for more capacity
+    - lora_weight_decay: Weight decay for LoRA params (default 0.0)
     - scheduler_type: "cosine" or "constant" (constant often works better for fine-tuning)
     - min_lr_ratio: For cosine, minimum LR as ratio of initial (default 0.1 = don't decay to 0)
     - label_smoothing: Label smoothing for cross-entropy (default 0.0, try 0.1 for better generalization)
 
-    NOTE: Training v_proj/u_proj is EXPERIMENTAL and may destabilize training!
-    These SVD core components have massive parameter counts (40%+ of model).
-    If used: svd_lr_multiplier=0.01 or lower, svd_weight_decay=0.0 recommended.
+    LoRA parameters (use_lora=True to enable):
+    - lora_r: LoRA rank (default 16, higher = more capacity)
+    - lora_alpha: LoRA scaling factor (default 32)
+    - lora_dropout: LoRA dropout (default 0.05)
+    - lora_target_modules: Modules to apply LoRA (default: ["q_proj", "v_proj"])
 
     Memory is saved by: AMP + small batch_size + gradient_accumulation.
     """
@@ -392,44 +447,42 @@ def block_finetune(
     num_block_params = convert_blocks_to_trainable(model)
     print(f"  Total block parameters: {num_block_params:,}")
 
-    if num_block_params == 0:
-        print("  No blocks found, skipping fine-tuning")
+    if num_block_params == 0 and not use_lora:
+        print("  No blocks found and LoRA disabled, skipping fine-tuning")
         return model
+
+    # Step 1.5: Apply LoRA adapters (before freezing)
+    if use_lora:
+        model = apply_lora(
+            model,
+            lora_r=lora_r,
+            lora_alpha=lora_alpha,
+            lora_dropout=lora_dropout,
+            lora_target_modules=lora_target_modules,
+        )
 
     # Step 2: Freeze non-block parameters
     print("\nStep 2: Setting up trainable parameters...")
     print(f"  Train LayerNorm: {train_layernorm}, Train bias: {train_bias}")
-    print(f"  Train v_proj: {train_v_proj}, Train u_proj: {train_u_proj}")
-
-    # Warning for SVD component training
-    if train_v_proj or train_u_proj:
-        print("\n  ⚠️  WARNING: Training v_proj/u_proj is EXPERIMENTAL!")
-        print("  These are SVD core components with huge parameter count.")
-        print("  Recommended: use svd_lr_multiplier=0.01 or lower, and svd_weight_decay=0.0")
-        print("  If training becomes unstable, disable v_proj/u_proj training.\n")
+    print(f"  Use LoRA: {use_lora}")
 
     freeze_non_block_params(
         model,
         train_layernorm=train_layernorm,
         train_bias=train_bias,
-        train_v_proj=train_v_proj,
-        train_u_proj=train_u_proj,
     )
 
     # Count trainable params by type
     block_cnt = 0
     ln_cnt = 0
     bias_cnt = 0
-    v_proj_cnt = 0
-    u_proj_cnt = 0
+    lora_cnt = 0
     for name, param in model.named_parameters():
         if param.requires_grad:
             if 'blocks_T' in name:
                 block_cnt += param.numel()
-            elif 'v_proj' in name:
-                v_proj_cnt += param.numel()
-            elif 'u_proj' in name:
-                u_proj_cnt += param.numel()
+            elif 'lora_' in name:
+                lora_cnt += param.numel()
             elif 'layernorm' in name.lower() or 'norm' in name.lower():
                 ln_cnt += param.numel()
             elif 'bias' in name.lower():
@@ -438,8 +491,8 @@ def block_finetune(
     trainable_total = sum(p.numel() for p in model.parameters() if p.requires_grad)
     total_params = sum(p.numel() for p in model.parameters())
     print(f"  Blocks: {block_cnt:,}, LayerNorm: {ln_cnt:,}, Bias: {bias_cnt:,}")
-    if v_proj_cnt > 0 or u_proj_cnt > 0:
-        print(f"  v_proj: {v_proj_cnt:,}, u_proj: {u_proj_cnt:,}")
+    if lora_cnt > 0:
+        print(f"  LoRA: {lora_cnt:,}")
     print(f"  Trainable: {trainable_total:,} / {total_params:,} ({100 * trainable_total / total_params:.2f}%)")
 
     # Step 3: Load and tokenize datasets (once), sampling done per-epoch
@@ -458,22 +511,19 @@ def block_finetune(
 
     # Step 4: Setup optimizer with separate param groups
     # - Blocks: compensate SVD error, no weight decay
-    # - v_proj/u_proj: SVD components, lower LR and some weight decay
+    # - LoRA: low-rank adapters, same LR or slightly different
     # - LayerNorm: scale/shift, typically no weight decay
     # - Bias: typically no weight decay
     block_params = []
-    v_proj_params = []
-    u_proj_params = []
+    lora_params = []
     ln_params = []
     bias_params = []
     for name, param in model.named_parameters():
         if param.requires_grad:
             if 'blocks_T' in name:
                 block_params.append(param)
-            elif 'v_proj' in name:
-                v_proj_params.append(param)
-            elif 'u_proj' in name:
-                u_proj_params.append(param)
+            elif 'lora_' in name:
+                lora_params.append(param)
             elif 'layernorm' in name.lower() or 'norm' in name.lower():
                 ln_params.append(param)
             else:
@@ -487,19 +537,12 @@ def block_finetune(
             'weight_decay': block_weight_decay,
             'name': 'blocks'
         })
-    if v_proj_params:
+    if lora_params:
         param_groups.append({
-            'params': v_proj_params,
-            'lr': learning_rate * svd_lr_multiplier,
-            'weight_decay': svd_weight_decay,
-            'name': 'v_proj'
-        })
-    if u_proj_params:
-        param_groups.append({
-            'params': u_proj_params,
-            'lr': learning_rate * svd_lr_multiplier,
-            'weight_decay': svd_weight_decay,
-            'name': 'u_proj'
+            'params': lora_params,
+            'lr': learning_rate * lora_lr_multiplier,
+            'weight_decay': lora_weight_decay,
+            'name': 'lora'
         })
     if ln_params:
         param_groups.append({
@@ -517,13 +560,11 @@ def block_finetune(
         })
 
     optimizer = torch.optim.AdamW(param_groups, eps=1e-8)
-    trainable_params = block_params + v_proj_params + u_proj_params + ln_params + bias_params
+    trainable_params = block_params + lora_params + ln_params + bias_params
     print(f"\nStep 4: Optimizer setup...")
     print(f"  Block params: {len(block_params)}, LR={learning_rate * block_lr_multiplier:.2e}, WD={block_weight_decay}")
-    if v_proj_params:
-        print(f"  v_proj params: {len(v_proj_params)}, LR={learning_rate * svd_lr_multiplier:.2e}, WD={svd_weight_decay}")
-    if u_proj_params:
-        print(f"  u_proj params: {len(u_proj_params)}, LR={learning_rate * svd_lr_multiplier:.2e}, WD={svd_weight_decay}")
+    if lora_params:
+        print(f"  LoRA params: {len(lora_params)}, LR={learning_rate * lora_lr_multiplier:.2e}, WD={lora_weight_decay}")
     print(f"  LayerNorm params: {len(ln_params)}, LR={learning_rate:.2e}, WD={ln_weight_decay}")
     print(f"  Bias params: {len(bias_params)}, LR={learning_rate:.2e}, WD={weight_decay}")
 
@@ -779,7 +820,7 @@ def main(args):
         num_epochs=args.num_epochs,
         learning_rate=args.learning_rate,
         block_lr_multiplier=args.block_lr_multiplier,
-        svd_lr_multiplier=args.svd_lr_multiplier,
+        lora_lr_multiplier=args.lora_lr_multiplier,
         batch_size=args.batch_size,
         seq_len=args.seq_len,
         num_samples=args.num_samples,
@@ -789,12 +830,15 @@ def main(args):
         weight_decay=args.weight_decay,
         block_weight_decay=args.block_weight_decay,
         ln_weight_decay=args.ln_weight_decay,
-        svd_weight_decay=args.svd_weight_decay,
+        lora_weight_decay=args.lora_weight_decay,
         dataset_name=args.dataset,
         train_layernorm=args.train_layernorm,
         train_bias=args.train_bias,
-        train_v_proj=args.train_v_proj,
-        train_u_proj=args.train_u_proj,
+        use_lora=args.use_lora,
+        lora_r=args.lora_r,
+        lora_alpha=args.lora_alpha,
+        lora_dropout=args.lora_dropout,
+        lora_target_modules=args.lora_target_modules,
         use_amp=args.use_amp,
         scheduler_type=args.scheduler,
         min_lr_ratio=args.min_lr_ratio,
@@ -817,7 +861,7 @@ def main(args):
     fp32_converted = 0
     for name, param in model.named_parameters():
         if param.dtype == torch.float32 and ('blocks_T' in name
-                or 'v_proj' in name or 'u_proj' in name
+                or 'lora_' in name
                 or 'layernorm' in name.lower() or 'norm' in name.lower()
                 or 'bias' in name.lower()):
             param.data = param.data.to(save_dtype)
@@ -892,15 +936,23 @@ if __name__ == "__main__":
     parser.add_argument('--train_bias', action='store_true', default=True)
     parser.add_argument('--no_train_bias', action='store_false', dest='train_bias')
 
-    # SVD component training (EXPERIMENTAL - use with caution!)
-    parser.add_argument('--train_v_proj', action='store_true', default=False,
-                        help='[EXPERIMENTAL] Train v_proj - may destabilize training!')
-    parser.add_argument('--train_u_proj', action='store_true', default=False,
-                        help='[EXPERIMENTAL] Train u_proj - may destabilize training!')
-    parser.add_argument('--svd_lr_multiplier', type=float, default=0.01,
-                        help='Scale v_proj/u_proj LR (0.01 or lower recommended)')
-    parser.add_argument('--svd_weight_decay', type=float, default=0.0,
-                        help='Weight decay for v_proj/u_proj (0.0 recommended)')
+    # LoRA (Low-Rank Adaptation) for additional capacity
+    parser.add_argument('--use_lora', action='store_true', default=False,
+                        help='Enable LoRA adapters for additional capacity (requires peft library)')
+    parser.add_argument('--no_lora', action='store_false', dest='use_lora')
+    parser.add_argument('--lora_r', type=int, default=16,
+                        help='LoRA rank (higher = more capacity, more params)')
+    parser.add_argument('--lora_alpha', type=int, default=32,
+                        help='LoRA alpha scaling factor')
+    parser.add_argument('--lora_dropout', type=float, default=0.05,
+                        help='LoRA dropout rate')
+    parser.add_argument('--lora_target_modules', type=str, nargs='+',
+                        default=['q_proj', 'v_proj'],
+                        help='Modules to apply LoRA to (default: q_proj v_proj)')
+    parser.add_argument('--lora_lr_multiplier', type=float, default=1.0,
+                        help='Scale LoRA LR relative to base LR')
+    parser.add_argument('--lora_weight_decay', type=float, default=0.0,
+                        help='Weight decay for LoRA params (0.0 recommended)')
 
     # AMP
     parser.add_argument('--use_amp', action='store_true', default=True)
