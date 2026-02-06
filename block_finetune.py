@@ -124,43 +124,40 @@ def merge_lora_weights(model: nn.Module) -> int:
                 # Original: y = u_proj(v_proj(x)) [+ blocks]
                 # LoRA:     y += scaling * lora_B @ lora_A @ x
                 # Merged:   y = [u_proj | scaling*lora_B] @ [v_proj; lora_A] @ x [+ blocks]
-                #
-                # New v_proj: rank+r input->output, new u_proj: rank+r input->output
                 old_v = wrapped.v_proj
                 old_u = wrapped.u_proj
                 dtype = old_v.weight.dtype
+                device = old_v.weight.device
                 r = lora.r
 
-                # New v_proj: [rank+r, in_features]
+                # New v_proj weight: [rank+r, in_features]
                 new_v_weight = torch.cat([
                     old_v.weight.data,
-                    lora.lora_A.weight.data.to(dtype),
-                ], dim=0)  # [rank+r, in_features]
+                    lora.lora_A.weight.data.to(dtype=dtype, device=device),
+                ], dim=0)
 
-                # New u_proj: [out_features, rank+r]
+                # New u_proj weight: [out_features, rank+r]
                 new_u_weight = torch.cat([
                     old_u.weight.data,
-                    (lora.lora_B.weight.data * scaling).to(dtype),
-                ], dim=1)  # [out_features, rank+r]
+                    (lora.lora_B.weight.data * scaling).to(dtype=dtype, device=device),
+                ], dim=1)
 
-                new_rank = old_v.weight.shape[0] + r
+                # Directly replace weight data instead of creating new Linear
+                # This preserves the original device and avoids FP32 initialization
+                old_v.weight = nn.Parameter(new_v_weight)
+                old_u.weight = nn.Parameter(new_u_weight)
 
-                # Create new Linear layers
-                new_v = nn.Linear(old_v.in_features, new_rank, bias=old_v.bias is not None)
-                new_u = nn.Linear(new_rank, old_u.out_features, bias=old_u.bias is not None)
-                new_v.weight = nn.Parameter(new_v_weight)
-                new_u.weight = nn.Parameter(new_u_weight)
+                # Update in_features/out_features for the Linear modules
+                old_v.out_features = new_v_weight.shape[0]
+                old_u.in_features = new_u_weight.shape[1]
+
+                # Handle bias if exists
                 if old_v.bias is not None:
-                    # Extend v bias with zeros for new dimensions
-                    new_v.bias = nn.Parameter(torch.cat([
+                    new_v_bias = torch.cat([
                         old_v.bias.data,
-                        torch.zeros(r, dtype=dtype, device=old_v.bias.device),
-                    ]))
-                if old_u.bias is not None:
-                    new_u.bias = old_u.bias
-
-                wrapped.v_proj = new_v
-                wrapped.u_proj = new_u
+                        torch.zeros(r, dtype=dtype, device=device),
+                    ])
+                    old_v.bias = nn.Parameter(new_v_bias)
 
                 setattr(parent_module, attr_name, wrapped)
                 merged += 1
@@ -256,6 +253,7 @@ def load_and_tokenize_dataset(
         # wikitext2 splits: 'train', 'validation', 'test'
         data = load_dataset('wikitext', 'wikitext-2-raw-v1', split=split)
         text = "\n\n".join(data['text'])
+        print(f"    Loaded wikitext2 {split}: {len(data)} docs, {len(text):,} chars")
     elif dataset_name == "c4":
         # C4 splits: 'train', 'validation'
         c4_split = 'validation' if split in ('validation', 'val', 'test') else 'train'
@@ -266,11 +264,13 @@ def load_and_tokenize_dataset(
                 break
             texts.append(item['text'])
         text = "\n\n".join(texts)
+        print(f"    Loaded c4 {c4_split}: {len(texts)} docs, {len(text):,} chars")
     else:
         raise ValueError(f"Unknown dataset: {dataset_name}")
 
-    # Tokenize
-    tokens = tokenizer(text, return_tensors='pt').input_ids[0]
+    # Tokenize (no truncation - use full text)
+    tokens = tokenizer(text, return_tensors='pt', truncation=False, add_special_tokens=False).input_ids[0]
+    print(f"    Tokenized {split}: {len(tokens):,} tokens")
     return tokens
 
 
