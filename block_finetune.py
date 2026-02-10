@@ -239,10 +239,14 @@ def load_and_tokenize_dataset(
     dataset_name: str = "wikitext2",
     split: str = 'train',
     max_docs: int = 10000,
+    force_download: bool = False,
 ) -> torch.Tensor:
     """
     Load dataset and return tokenized tensor.
     Separate from sampling to allow epoch-wise resampling.
+
+    Args:
+        force_download: If True, ignore cache and re-download dataset
     """
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
@@ -251,9 +255,21 @@ def load_and_tokenize_dataset(
     # Load dataset with proper split handling
     if dataset_name == "wikitext2":
         # wikitext2 splits: 'train', 'validation', 'test'
-        data = load_dataset('wikitext', 'wikitext-2-raw-v1', split=split)
+        # Expected sizes: train ~36718, validation ~3760, test ~4358
+        download_mode = "force_redownload" if force_download else None
+        data = load_dataset('wikitext', 'wikitext-2-raw-v1', split=split,
+                           download_mode=download_mode)
         text = "\n\n".join(data['text'])
         print(f"    Loaded wikitext2 {split}: {len(data)} docs, {len(text):,} chars")
+
+        # Validate expected dataset sizes (detect cache corruption)
+        expected_sizes = {'train': (35000, 38000), 'validation': (3500, 4000), 'test': (4000, 4500)}
+        if split in expected_sizes:
+            min_size, max_size = expected_sizes[split]
+            if not (min_size <= len(data) <= max_size):
+                print(f"    WARNING: {split} has unexpected size {len(data)} (expected {min_size}-{max_size})")
+                print(f"    This may indicate HuggingFace cache corruption.")
+                print(f"    Try: rm -rf ~/.cache/huggingface/datasets/wikitext")
     elif dataset_name == "c4":
         # C4 splits: 'train', 'validation'
         c4_split = 'validation' if split in ('validation', 'val', 'test') else 'train'
@@ -568,6 +584,7 @@ def block_finetune(
     ln_weight_decay: float = 0.0,
     lora_weight_decay: float = 0.0,
     dataset_name: str = "wikitext2",
+    force_download: bool = False,
     train_layernorm: bool = True,
     train_bias: bool = True,
     # LoRA parameters
@@ -600,6 +617,38 @@ def block_finetune(
     - lora_target_modules: Modules to apply LoRA (default: ["q_proj", "v_proj"])
 
     Memory is saved by: AMP + small batch_size + gradient_accumulation.
+
+    ===== PPL IMPROVEMENT TIPS =====
+    Current baseline: PPL ~11.29 with default settings.
+
+    To improve PPL further, try these strategies (in order of impact):
+
+    1. MORE LoRA CAPACITY (biggest impact):
+       --lora_r 32 or --lora_r 64 (more rank = more capacity)
+       --lora_target_modules q_proj k_proj v_proj o_proj gate_proj up_proj down_proj
+
+    2. MORE TRAINING:
+       --num_epochs 5 or 10 (more epochs)
+       --num_samples 512 or 1024 (more samples per epoch)
+
+    3. LEARNING RATE TUNING:
+       --learning_rate 1e-4 (lower for stability)
+       --learning_rate 1e-3 (higher for faster convergence)
+       --scheduler constant (often better for fine-tuning)
+
+    4. REGULARIZATION:
+       --label_smoothing 0.1 (helps generalization)
+       --lora_dropout 0.1 (more dropout for regularization)
+
+    5. LONGER SEQUENCES (if GPU memory allows):
+       --seq_len 1024 or 2048 (captures longer dependencies)
+
+    Example command for best PPL:
+        python block_finetune.py --prune_model model.pt --output_dir output \\
+            --use_lora --lora_r 32 \\
+            --lora_target_modules q_proj k_proj v_proj o_proj \\
+            --num_epochs 5 --num_samples 512 \\
+            --learning_rate 2e-4 --label_smoothing 0.1
     """
     print("=" * 60)
     print("Block Fine-tuning (AMP)" if use_amp else "Block Fine-tuning")
@@ -660,9 +709,21 @@ def block_finetune(
 
     # Step 3: Load and tokenize datasets (once), sampling done per-epoch
     print(f"\nStep 3: Loading datasets ({dataset_name})...")
-    train_tokens = load_and_tokenize_dataset(tokenizer, dataset_name, split='train')
-    val_tokens = load_and_tokenize_dataset(tokenizer, dataset_name, split='validation')
+    train_tokens = load_and_tokenize_dataset(tokenizer, dataset_name, split='train',
+                                              force_download=force_download)
+    val_tokens = load_and_tokenize_dataset(tokenizer, dataset_name, split='validation',
+                                            force_download=force_download)
     print(f"  Train tokens: {len(train_tokens):,}, Val tokens: {len(val_tokens):,}")
+
+    # CRITICAL: Validate train and val are different datasets
+    if len(train_tokens) == len(val_tokens):
+        # Check if tokens are actually identical
+        if torch.equal(train_tokens[:1000], val_tokens[:1000]):
+            print("\n  ERROR: Train and validation tokens are IDENTICAL!")
+            print("  This indicates HuggingFace datasets cache corruption.")
+            print("  Please run: rm -rf ~/.cache/huggingface/datasets/wikitext")
+            print("  Then re-run the training script.\n")
+            raise ValueError("Train and validation datasets are identical - cache corruption detected")
 
     # Create validation loader (fixed samples for consistent evaluation)
     val_samples = sample_from_tokens(val_tokens, num_samples=128, seq_len=seq_len, seed=42, is_train=False)
@@ -790,9 +851,10 @@ def block_finetune(
         # Resample training data each epoch for better coverage
         epoch_seed = 42 + epoch  # Different seed each epoch
         train_samples = sample_from_tokens(train_tokens, num_samples, seq_len, epoch_seed, is_train=True)
+        # Use 2 workers for data loading (more can cause issues with small datasets)
         train_loader = DataLoader(
             train_samples, batch_size=batch_size, shuffle=True,
-            pin_memory=use_cuda, num_workers=0,
+            pin_memory=use_cuda, num_workers=2, persistent_workers=True,
         )
 
         pbar = tqdm(train_loader, desc=f"Epoch {epoch + 1}/{num_epochs}")
@@ -995,6 +1057,7 @@ def main(args):
         ln_weight_decay=args.ln_weight_decay,
         lora_weight_decay=args.lora_weight_decay,
         dataset_name=args.dataset,
+        force_download=args.force_download,
         train_layernorm=args.train_layernorm,
         train_bias=args.train_bias,
         use_lora=args.use_lora,
@@ -1131,6 +1194,8 @@ if __name__ == "__main__":
 
     # Data
     parser.add_argument('--dataset', type=str, default='wikitext2', choices=['wikitext2', 'c4'])
+    parser.add_argument('--force_download', action='store_true',
+                        help='Force re-download dataset (use if cache is corrupted)')
 
     # Evaluation
     parser.add_argument('--evaluate', action='store_true')
